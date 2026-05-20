@@ -1,0 +1,35 @@
+[project]
+name = "skill-advisor"
+version = "0.1.0"
+description = "Silent UserPromptSubmit-hook advisor that picks the best Claude Code skill, subagent, or command for every prompt."
+readme = "README.md"
+authors = [
+    { name = "Jannik Henke", email = "dev@deep-content.io" }
+]
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+    "fastembed>=0.4.0",
+    "numpy>=1.26",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+
+[project.scripts]
+skill-advisor = "skill_advisor.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.9.24,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+filterwarnings = [
+    "ignore::DeprecationWarning:fastembed.*",
+]

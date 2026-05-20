@@ -1,0 +1,10 @@
+{"prompt": "refactor the checkout module to use JWT instead of sessions"}
+{"prompt": "there's a bug in the tax calculation when the cart is empty"}
+{"prompt": "plan a migration from mongodb to postgres for the user service"}
+{"prompt": "write unit tests for the password reset flow"}
+{"prompt": "review this PR for security issues"}
+{"prompt": "thanks"}
+{"prompt": "/help"}
+{"prompt": "explain how the cache layer works"}
+{"prompt": "brainstorm a new onboarding flow for power users"}
+{"prompt": "fix segfault in the image processing worker"}

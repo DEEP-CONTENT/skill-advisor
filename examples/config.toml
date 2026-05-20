@@ -1,0 +1,75 @@
+# skill-advisor config — edit to taste; re-run `skill-advisor build` after changes.
+
+[matcher]
+# Enable the `claude -p` judge for re-ranking the embedding shortlist.
+# Trade-off:
+#   false (default) — embedding top-K is the final ranking. ~50-200 ms per prompt.
+#   true            — claude -p (Haiku) re-ranks for higher precision. Adds 5-15 s
+#                     of overhead due to Claude Code session startup costs
+#                     (skills list + session hooks). Only enable if you need the
+#                     higher accuracy and can tolerate the latency.
+use_judge = false
+
+# Judge model (only used when use_judge = true).
+model = "claude-haiku-4-5-20251001"
+
+# Embedding-shortlist size — also the candidate list sent to the judge when enabled.
+max_candidates = 15
+
+# Max picks surfaced in additionalContext.
+max_picks = 3
+
+# Total hook budget in seconds. Hook exits silent if exceeded — your prompt
+# always goes through, even when the advisor can't answer in time.
+# Bump to ~15.0 if you enable use_judge = true.
+budget_seconds = 4.0
+
+# Minimum cosine score to surface a pick in embedding-only mode.
+# Range 0-1; 0.35 filters out weak matches on unrelated prompts.
+min_embedding_score = 0.35
+
+[catalog]
+# Additional directories to scan for SKILL.md files (e.g. team-internal skills).
+# extra_roots = ["/Users/me/work/team-skills"]
+extra_roots = []
+
+# Catalog names to suppress from the picker.
+# exclude_names = ["overly-chatty-skill"]
+exclude_names = []
+
+[triage]
+# Prompts shorter than this (in words) are skipped unless they contain
+# technical keywords (bug, refactor, auth, test, …).
+skip_if_shorter_than = 6
+
+# Extra regex patterns (case-insensitive) that cause the advisor to skip.
+# extra_skip_patterns = ["^wip:", "^\\s*draft:"]
+extra_skip_patterns = []
+
+[lifecycle]
+# Master toggle. Set to false to disable lifecycle mode entirely — the advisor
+# stays stateless and never injects a phase banner.
+enabled = true
+
+# Max correction cycles before the advisor forces `complete`.
+max_correction_cycles = 3
+
+# Extra regexes (case-insensitive) that should be treated as lifecycle triggers
+# in addition to the built-in verbs (build / implement / refactor / add / migrate / …).
+# extra_trigger_patterns = ["\\bstand\\s+up\\b", "\\bport\\s+over\\b"]
+extra_trigger_patterns = []
+
+# Extra regexes that suppress triggering even when a built-in verb matches.
+# Use these to carve out prompts you don't want escalated into a multi-step lifecycle.
+# extra_disable_patterns = ["^prototype:", "^spike:"]
+extra_disable_patterns = []
+
+# Per-phase skill/agent preferences. Entries use "kind:name"; kind is one of
+# skill / subagent / command.
+#
+# phase_candidates REPLACES the built-in preference list for a phase.
+# phase_additions PREPENDS to the built-in list (team picks take priority).
+#
+# [lifecycle.phase_additions]
+# implementation = ["skill:team-implementation-checklist"]
+# review = ["subagent:feature-dev:code-reviewer", "skill:team-review-checklist"]

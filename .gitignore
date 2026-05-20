@@ -1,0 +1,29 @@
+# ── Python build & install artifacts ────────────────────────────────────────
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.venv
+
+# ── Test & coverage ────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# ── Local caches (fastembed / huggingface when running from a checkout) ────
+.cache/
+
+# ── Project-specific ───────────────────────────────────────────────────────
+# Isolated feature-work checkouts created by `using-git-worktrees`.
+.worktrees/
+
+# Skill library — bring your own. The advisor matches against ~/.claude/skills/
+# at runtime; a local `skills/` directory is supported for maintainer mirrors
+# and as a `skill-advisor sync-skills` source, but is never committed.
+/skills/
+
+# Per-project Claude Code local settings (machine-specific permissions, etc.).
+.claude/settings.local.json

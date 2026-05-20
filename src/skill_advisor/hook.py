@@ -1,0 +1,321 @@
+"""UserPromptSubmit hook entry point.
+
+Never fails the user's prompt submission. On any error or budget overrun,
+exits 0 silently and logs the reason to ~/.cache/skill-advisor/advisor.log.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import signal
+import sys
+import time
+from typing import Any
+
+from . import inject, lifecycle, matcher, paths, telemetry, triage
+from .config import load as load_config
+
+
+class _BudgetExceeded(Exception):
+    pass
+
+
+def _alarm_handler(signum, frame):  # pragma: no cover - signal path
+    raise _BudgetExceeded()
+
+
+def _setup_logging() -> None:
+    paths.ensure_dirs()
+    logging.basicConfig(
+        filename=str(paths.log_file()),
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+
+def _read_input() -> dict[str, Any]:
+    raw = sys.stdin.read()
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _emit(text: str) -> None:
+    envelope = {
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": text,
+        }
+    }
+    sys.stdout.write(json.dumps(envelope))
+
+
+def _extract_todo_titles(tool_input: dict) -> list[str]:
+    """Pull the `content` string from each todo in a TodoWrite tool_input.
+
+    Returns [] when the payload is malformed; caller decides what that means.
+    """
+    todos = tool_input.get("todos")
+    if not isinstance(todos, list):
+        return []
+    out: list[str] = []
+    for item in todos:
+        if isinstance(item, dict):
+            content = item.get("content")
+            if isinstance(content, str) and content.strip():
+                out.append(content.strip())
+    return out
+
+
+def run() -> int:
+    _setup_logging()
+    log = logging.getLogger("skill_advisor.hook")
+
+    started = time.monotonic()
+    event = _read_input()
+    prompt = str(event.get("prompt") or "").strip()
+    session_id = str(event.get("session_id") or "").strip() or None
+    if not prompt:
+        return 0
+
+    cfg = load_config()
+    budget = max(int(cfg.matcher.budget_seconds + 0.5), 1)
+    signal.signal(signal.SIGALRM, _alarm_handler)
+    signal.alarm(budget)
+
+    try:
+        result = matcher.pick(prompt, cfg, session_id=session_id)
+    except _BudgetExceeded:
+        log.info("budget exceeded after %.2fs; falling back silent", time.monotonic() - started)
+        return 0
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("hook exception: %s", exc, exc_info=True)
+        return 0
+    finally:
+        signal.alarm(0)
+
+    duration = time.monotonic() - started
+    phase = result.state.phase if (result and result.state) else "none"
+    picks = result.picks if result else []
+
+    if result is None or not result.picks:
+        log.debug("no picks for prompt (%.2fs)", duration)
+    else:
+        try:
+            _emit(inject.format(result))
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("emit failed: %s", exc, exc_info=True)
+            return 0
+        log.info(
+            "picks=%s phase=%s duration=%.2fs",
+            [p.entry.name for p in result.picks],
+            phase,
+            duration,
+        )
+
+    # Telemetry: opt-in structured log. Never fails the hook.
+    if cfg.telemetry.events_enabled:
+        try:
+            telemetry.record(
+                prompt=prompt,
+                session_id=session_id,
+                picks=picks,
+                phase=phase,
+                phase_source="user",
+                judge_used=cfg.matcher.use_judge,
+                triage_skipped=triage.should_skip(prompt, cfg),
+                duration_ms=int(duration * 1000),
+                config=cfg.telemetry,
+            )
+        except Exception as exc:
+            log.debug("telemetry record failed: %s", exc, exc_info=True)
+    return 0
+
+
+def main() -> None:
+    sys.exit(run())
+
+
+# ---------------------------------------------------------------------------
+# PostToolUse + Stop handlers — drive lifecycle auto-advance
+# ---------------------------------------------------------------------------
+
+
+# Double-advance guard window. If the lifecycle state was updated within this
+# many seconds, the Stop handler defers — the user probably just sent a
+# continuation prompt that already advanced the phase.
+_STOP_ADVANCE_MIN_GAP_SECONDS = 1.0
+
+
+def run_posttooluse() -> int:
+    """Record tool usage into per-turn state. Never fails."""
+    _setup_logging()
+    log = logging.getLogger("skill_advisor.posttooluse")
+
+    event = _read_input()
+    session_id = str(event.get("session_id") or "").strip()
+    tool_name = str(event.get("tool_name") or "").strip()
+    if not session_id or not tool_name:
+        return 0
+
+    subagent_type = None
+    tool_input = event.get("tool_input") or {}
+    if isinstance(tool_input, dict):
+        raw_subagent = tool_input.get("subagent_type")
+        if raw_subagent is not None:
+            subagent_type = str(raw_subagent).strip() or None
+
+    try:
+        lifecycle.record_tool(session_id, tool_name, subagent_type=subagent_type)
+    except Exception as exc:  # pragma: no cover - defensive
+        log.debug("posttooluse record failed: %s", exc, exc_info=True)
+
+    # The Claude Code task tool family has evolved: pre-2026 builds emitted a
+    # single batched `TodoWrite` (tool_input.todos = [{content,...}, ...]);
+    # current builds emit per-call `TaskCreate` (tool_input.subject = "..."),
+    # one call per task. Watch both — TodoWrite stays last-write-wins, while
+    # TaskCreate appends incrementally into the same turn-state slot.
+    if tool_name in ("TodoWrite", "TaskCreate") and isinstance(tool_input, dict):
+        try:
+            cfg = load_config()
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("posttooluse config load failed: %s", exc, exc_info=True)
+            return 0
+        if not cfg.parallelization.enabled:
+            return 0
+        try:
+            if tool_name == "TodoWrite":
+                titles = _extract_todo_titles(tool_input)
+                if titles:
+                    lifecycle.record_todo_write(session_id, titles)
+            else:  # TaskCreate
+                subject = tool_input.get("subject")
+                if isinstance(subject, str) and subject.strip():
+                    lifecycle.append_todo_title(session_id, subject)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("posttooluse todo capture failed: %s", exc, exc_info=True)
+    return 0
+
+
+def run_stop() -> int:
+    """Apply auto-advance rules based on the current turn's tool usage."""
+    _setup_logging()
+    log = logging.getLogger("skill_advisor.stop")
+
+    event = _read_input()
+    session_id = str(event.get("session_id") or "").strip()
+    if not session_id:
+        return 0
+
+    # Whatever happens below, the turn file is per-turn — always clear it.
+    try:
+        turn = lifecycle.load_turn(session_id)
+        lifecycle.delete_turn(session_id)
+    except Exception as exc:  # pragma: no cover - defensive
+        log.debug("stop turn cleanup failed: %s", exc, exc_info=True)
+        return 0
+
+    if turn is None:
+        return 0
+
+    try:
+        cfg = load_config()
+    except Exception as exc:  # pragma: no cover - defensive
+        log.debug("stop config load failed: %s", exc, exc_info=True)
+        return 0
+
+    # Stop-event telemetry runs regardless of lifecycle config — it's how the
+    # report correlates picks with downstream Skill invocations to compute
+    # ingestion rate. Lifecycle auto-advance is a separate concern below.
+    if cfg.telemetry.events_enabled:
+        try:
+            telemetry.record_stop(
+                session_id=session_id,
+                tools=turn.tool_names,
+                subagents=turn.subagents_invoked,
+                config=cfg.telemetry,
+            )
+        except Exception as exc:
+            log.debug("stop telemetry record failed: %s", exc, exc_info=True)
+
+    if not cfg.lifecycle.enabled or not cfg.lifecycle.auto_advance.enabled:
+        return 0
+
+    try:
+        state = lifecycle.load(session_id)
+    except Exception as exc:  # pragma: no cover - defensive
+        log.debug("stop state load failed: %s", exc, exc_info=True)
+        return 0
+
+    if state is None or not state.is_active():
+        return 0
+
+    # Double-advance guard (decision 2). User's prompt may have just advanced
+    # the state; ignore the Stop event if it arrives in the same breath.
+    if time.time() - state.updated_at < _STOP_ADVANCE_MIN_GAP_SECONDS:
+        log.info(
+            "stop: auto-advance skipped (updated %.2fs ago < %.2fs)",
+            time.time() - state.updated_at,
+            _STOP_ADVANCE_MIN_GAP_SECONDS,
+        )
+        return 0
+
+    advance_cfg = cfg.lifecycle.auto_advance
+    phase = state.phase
+    advanced = False
+
+    try:
+        if (
+            phase == lifecycle.PLANNING
+            and cfg.parallelization.enabled
+            and turn.todo_write is not None
+            and int(turn.todo_write.get("count") or 0) >= cfg.parallelization.min_tasks
+        ):
+            titles = list(turn.todo_write.get("titles") or [])
+            lifecycle.enter_parallelization_check(
+                state,
+                titles,
+                note=f"auto: TodoWrite with {len(titles)} tasks",
+                source="auto",
+            )
+            advanced = True
+        elif phase == lifecycle.PLANNING and advance_cfg.on_plan_subagent_done:
+            if any(name in {"Plan", "writing-plans"} for name in turn.subagents_invoked):
+                lifecycle.advance(
+                    state,
+                    note="auto: Plan subagent completed",
+                    source="auto",
+                    config=cfg.lifecycle,
+                )
+                advanced = True
+        elif phase == lifecycle.IMPLEMENTATION and advance_cfg.on_edit_stop:
+            # Decision 3: skip advance when no mutating tool ran this turn.
+            if turn.has_mutating_tool():
+                lifecycle.advance(
+                    state,
+                    note=f"auto: Stop after mutating tools ({','.join(sorted(set(turn.tool_names)))})",
+                    source="auto",
+                    config=cfg.lifecycle,
+                )
+                advanced = True
+        # REVIEW/CORRECTION/PARALLELIZATION_CHECK/terminal phases: handled elsewhere.
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("stop: advance failed: %s", exc, exc_info=True)
+        return 0
+
+    log.info(
+        "stop: phase=%s advanced=%s tools=%s subagents=%s",
+        phase,
+        advanced,
+        turn.tool_names,
+        turn.subagents_invoked,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    main()

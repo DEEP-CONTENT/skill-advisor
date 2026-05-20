@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{SKILL_ADVISOR_BIN}} hook",
+            "timeout": 3000
+          }
+        ]
+      }
+    ]
+  }
+}

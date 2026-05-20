@@ -1,0 +1,157 @@
+"""`claude -p` judge — ranks the embedding prefilter's shortlist.
+
+Uses `--output-format json` to get a structured envelope. Validates the model's
+inner JSON against a tiny schema and rejects names that weren't in the candidate
+list (hallucination guard — known `claude -p` rough edge).
+"""
+from __future__ import annotations
+
+import json
+import logging
+import shutil
+import subprocess
+from dataclasses import dataclass
+
+from .catalog import CatalogEntry
+from .config import Config
+
+log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class Pick:
+    name: str
+    reason: str
+
+
+_JUDGE_TEMPLATE = """You are a skill router for Claude Code. Given the user's message and a candidate list, pick 0-3 catalog entries that best apply. Return ONLY JSON matching this schema (no prose, no code fences):
+
+{{"picks": [{{"name": "<exact catalog name>", "reason": "<<=12 words>"}}], "skip": <bool>}}
+
+Rules:
+- Use exact names from the candidate list. Do not invent or rename.
+- If nothing is a strong fit, return {{"picks": [], "skip": true}}.
+- Prefer skills over subagents when both match; prefer subagents for heavy exploration/planning work.
+
+User message:
+<<<
+{prompt}
+>>>
+
+Candidates:
+{candidates}
+"""
+
+
+def _render_candidates(candidates: list[CatalogEntry]) -> str:
+    lines = []
+    for e in candidates:
+        # Clip description so the prompt doesn't explode on verbose skills.
+        desc = e.description.replace("\n", " ").strip()
+        if len(desc) > 220:
+            desc = desc[:217] + "..."
+        lines.append(f"- {e.name} ({e.kind}) — {desc}")
+    return "\n".join(lines)
+
+
+def rank(prompt: str, candidates: list[CatalogEntry], config: Config, timeout: float | None = None) -> list[Pick] | None:
+    if not candidates:
+        return None
+    if shutil.which("claude") is None:
+        log.warning("claude CLI not on PATH; judge skipped")
+        return None
+
+    judge_prompt = _JUDGE_TEMPLATE.format(
+        prompt=prompt.strip(),
+        candidates=_render_candidates(candidates),
+    )
+    budget = timeout if timeout is not None else max(config.matcher.budget_seconds - 0.5, 0.5)
+
+    try:
+        completed = subprocess.run(
+            ["claude", "-p", "--model", config.matcher.model, "--output-format", "json"],
+            input=judge_prompt,
+            capture_output=True,
+            text=True,
+            timeout=budget,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        log.info("judge timed out after %.2fs", budget)
+        return None
+    except (OSError, ValueError) as exc:
+        log.warning("judge subprocess failed: %s", exc)
+        return None
+
+    if completed.returncode != 0:
+        log.warning("judge exit %s: %s", completed.returncode, completed.stderr[:200])
+        return None
+
+    return _parse_judge_reply(completed.stdout, candidates)
+
+
+def _parse_judge_reply(stdout: str, candidates: list[CatalogEntry]) -> list[Pick] | None:
+    stdout = stdout.strip()
+    if not stdout:
+        return None
+    try:
+        envelope = json.loads(stdout)
+    except json.JSONDecodeError:
+        log.warning("judge returned non-JSON envelope: %r", stdout[:200])
+        return None
+
+    # `claude -p --output-format json` puts the assistant message in `result`.
+    inner_text = envelope.get("result") if isinstance(envelope, dict) else None
+    if not isinstance(inner_text, str):
+        log.warning("judge envelope missing string 'result'")
+        return None
+
+    inner = _extract_json_object(inner_text)
+    if inner is None:
+        return None
+
+    picks_raw = inner.get("picks")
+    if not isinstance(picks_raw, list):
+        return None
+    skip = bool(inner.get("skip", False))
+    if skip and not picks_raw:
+        return []
+
+    valid_names = {e.name for e in candidates}
+    picks: list[Pick] = []
+    for item in picks_raw:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        reason = item.get("reason", "")
+        if not isinstance(name, str) or not isinstance(reason, str):
+            continue
+        if name not in valid_names:
+            log.info("rejected hallucinated pick: %r", name)
+            continue
+        picks.append(Pick(name=name.strip(), reason=reason.strip()))
+    return picks
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """Best-effort extraction of the first JSON object in a model reply."""
+    text = text.strip()
+    # Strip code fences if the model wrapped the JSON.
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:]
+        text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # Fallback: find the first {...} block.
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        return json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return None
