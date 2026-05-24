@@ -26,6 +26,10 @@ class MatcherConfig:
 class CatalogConfig:
     extra_roots: tuple[str, ...] = ()
     exclude_names: tuple[str, ...] = ()
+    # Optional path to a curated catalog manifest (JSON). Empty → no manifest;
+    # the catalog behaves exactly as before. When set, the manifest is the
+    # structural source of truth for exclusions (see manifest.py).
+    catalog_manifest: str = ""
 
 
 @dataclass(frozen=True)
@@ -176,6 +180,7 @@ def load(path: Path | None = None) -> Config:
         catalog=CatalogConfig(
             extra_roots=_as_tuple(catalog.get("extra_roots")),
             exclude_names=_as_tuple(catalog.get("exclude_names")),
+            catalog_manifest=str(catalog.get("catalog_manifest", CatalogConfig.catalog_manifest)),
         ),
         triage=TriageConfig(
             skip_if_shorter_than=int(triage.get("skip_if_shorter_than", TriageConfig.skip_if_shorter_than)),

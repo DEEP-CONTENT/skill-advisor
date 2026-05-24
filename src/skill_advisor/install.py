@@ -185,6 +185,13 @@ min_embedding_score = 0.35
 extra_roots = []
 # Catalog names to suppress (noisy or irrelevant skills).
 exclude_names = []
+# Optional path to a curated catalog manifest (JSON). Leave empty to keep the
+# default behaviour — the catalog scans everything and only exclude_names applies.
+# When set, the manifest is the structural source of truth for exclusions
+# (excluded sub-skills/sub-agents, plugin whitelist); exclude_names stays additive.
+# A missing or malformed manifest never breaks the advisor (fail-soft).
+# catalog_manifest = "~/.claude/skill-advisor-manifest.json"
+catalog_manifest = ""
 
 [triage]
 # Prompts shorter than this (in words) are skipped unless they contain technical keywords.
