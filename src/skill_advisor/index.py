@@ -26,7 +26,13 @@ class Index:
 def _embed_model():
     # Lazy import — fastembed import is slow (~500 ms) and we don't want it on triage-skip paths.
     from fastembed import TextEmbedding
-    return TextEmbedding(model_name=_MODEL_NAME)
+
+    # Pin the model weights to our XDG cache (FE-VERIFY-001 confirmed the kwarg on
+    # fastembed 0.8.0) so the ~15 MB BGE-small ONNX survives temp cleanup instead
+    # of re-downloading on every cold start. fastembed creates the dir on demand.
+    cache_dir = paths.fastembed_cache_dir()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return TextEmbedding(model_name=_MODEL_NAME, cache_dir=str(cache_dir))
 
 
 def _normalise(vecs: np.ndarray) -> np.ndarray:
