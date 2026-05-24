@@ -738,8 +738,9 @@ hook failure.
 
 ### Safety rails
 
-- **`signal.alarm(budget_seconds + 0.5)`** — hard wall-clock budget; any overrun exits 0
-  silent via a `_BudgetExceeded` exception caught in `hook.run()`.
+- **`threading.Thread(daemon=True)` + `join(timeout=budget)`** — cross-platform hard
+  wall-clock budget (works on Windows; `signal.SIGALRM` is POSIX-only). On overrun the
+  daemon worker is left running and `hook.run()` exits 0 silent.
 - **Broad try/except in `hook.run()`** — any unexpected error exits 0 silent and logs
   to `advisor.log`.
 - **Hallucination guard in `judge._parse_judge_reply()`** — LLM-returned names are

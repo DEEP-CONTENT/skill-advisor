@@ -7,21 +7,13 @@ from __future__ import annotations
 
 import json
 import logging
-import signal
 import sys
+import threading
 import time
 from typing import Any
 
 from . import inject, lifecycle, matcher, paths, telemetry, triage
 from .config import load as load_config
-
-
-class _BudgetExceeded(Exception):
-    pass
-
-
-def _alarm_handler(signum, frame):  # pragma: no cover - signal path
-    raise _BudgetExceeded()
 
 
 def _setup_logging() -> None:
@@ -83,20 +75,33 @@ def run() -> int:
         return 0
 
     cfg = load_config()
-    budget = max(int(cfg.matcher.budget_seconds + 0.5), 1)
-    signal.signal(signal.SIGALRM, _alarm_handler)
-    signal.alarm(budget)
+    # Cross-platform wall-clock budget: run matcher.pick in a daemon thread and
+    # join with a timeout. Works on Windows too (signal.SIGALRM is POSIX-only).
+    # The daemon thread is never joined on overrun, so the process exits promptly
+    # even if the matcher keeps computing in the background.
+    budget = max(cfg.matcher.budget_seconds, 0.5)
 
-    try:
-        result = matcher.pick(prompt, cfg, session_id=session_id)
-    except _BudgetExceeded:
+    container: dict[str, Any] = {}
+
+    def _worker(out: dict[str, Any]) -> None:
+        try:
+            out["result"] = matcher.pick(prompt, cfg, session_id=session_id)
+        except Exception as exc:  # pragma: no cover - defensive (re-raised path below)
+            out["error"] = exc
+
+    worker = threading.Thread(target=_worker, args=(container,), daemon=True)
+    worker.start()
+    worker.join(timeout=budget)
+
+    if worker.is_alive():
         log.info("budget exceeded after %.2fs; falling back silent", time.monotonic() - started)
         return 0
-    except Exception as exc:  # pragma: no cover - defensive
-        log.warning("hook exception: %s", exc, exc_info=True)
+
+    if "error" in container:  # pragma: no cover - defensive
+        log.warning("hook exception: %s", container["error"], exc_info=container["error"])
         return 0
-    finally:
-        signal.alarm(0)
+
+    result = container.get("result")
 
     duration = time.monotonic() - started
     phase = result.state.phase if (result and result.state) else "none"
