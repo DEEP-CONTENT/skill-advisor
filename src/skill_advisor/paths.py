@@ -53,6 +53,42 @@ def skill_roots() -> list[Path]:
     return roots
 
 
+def _dual_roots(*subparts: str) -> list[Path]:
+    """Primary-home roots with `~/.claude` fallback appended when they differ.
+
+    Mirrors `skill_roots()`'s fallback contract for any subdir under the Claude
+    home: the primary home (honouring `CLAUDE_CONFIG_DIR`) is listed first; when
+    that's different from `$HOME/.claude` the default location is appended so the
+    scan isn't blind to it. Never emits duplicates.
+    """
+    primary = claude_home()
+    default = _home() / ".claude"
+    roots = [primary.joinpath(*subparts)]
+    if primary.resolve() != default.resolve():
+        extra = default.joinpath(*subparts)
+        if extra not in roots:
+            roots.append(extra)
+    return roots
+
+
+def agent_roots() -> list[Path]:
+    """Roots scanned for subagent definition files (`agents/*.md`).
+
+    Same primary/default-fallback logic as `skill_roots()`: the active Claude
+    home's `agents/` first, then `~/.claude/agents` as fallback when the primary
+    home differs (e.g. under a work `CLAUDE_CONFIG_DIR`).
+    """
+    return _dual_roots("agents")
+
+
+def command_roots() -> list[Path]:
+    """Roots scanned for slash-command definition files (`commands/*.md`).
+
+    Same primary/default-fallback logic as `agent_roots()`.
+    """
+    return _dual_roots("commands")
+
+
 def config_dir() -> Path:
     override = os.environ.get("SKILL_ADVISOR_CONFIG_HOME")
     if override:

@@ -68,6 +68,45 @@ def test_skill_roots_no_duplicate_when_primary_equals_default(monkeypatch, tmp_p
     assert roots == [home / ".claude" / "skills", home / ".claude" / "plugins" / "marketplaces"]
 
 
+def test_agent_and_command_roots_relative_to_claude_home(isolated_paths):
+    agents = paths.agent_roots()
+    commands = paths.command_roots()
+    assert isinstance(agents, list)
+    assert isinstance(commands, list)
+    assert all(isinstance(p, Path) for p in agents)
+    assert all(isinstance(p, Path) for p in commands)
+    assert agents[0] == isolated_paths["claude_home"] / "agents"
+    assert commands[0] == isolated_paths["claude_home"] / "commands"
+
+
+def test_agent_command_roots_include_default_fallback_when_primary_differs(monkeypatch, tmp_path):
+    primary = tmp_path / "work"
+    primary.mkdir()
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.delenv("CLAUDE_HOME", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(primary))
+    monkeypatch.setenv("HOME", str(home))
+
+    agents = paths.agent_roots()
+    assert agents[0] == primary / "agents"
+    assert (home / ".claude" / "agents") in agents
+
+    commands = paths.command_roots()
+    assert commands[0] == primary / "commands"
+    assert (home / ".claude" / "commands") in commands
+
+
+def test_agent_command_roots_no_duplicate_when_primary_equals_default(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.delenv("CLAUDE_HOME", raising=False)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    assert paths.agent_roots() == [home / ".claude" / "agents"]
+    assert paths.command_roots() == [home / ".claude" / "commands"]
+
+
 def test_xdg_fallback_without_override(monkeypatch, tmp_path):
     home = tmp_path / "fallback-home"
     home.mkdir()
