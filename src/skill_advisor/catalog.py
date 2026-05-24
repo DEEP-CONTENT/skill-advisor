@@ -16,6 +16,13 @@ from .config import Config, load as load_config
 
 _FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
+# Subdirectory under agent roots whose files are helper definitions, not
+# standalone subagents (e.g. `agents/reviewers/*.md`). Hardcoded here as the
+# default; MAN-003 will let a manifest override it via
+# `excluded_subagents.path` (the structural SSoT). Until then this constant
+# *is* the SSoT for the reviewers exclusion.
+_REVIEWERS_SUBDIR = "reviewers"
+
 
 @dataclass(frozen=True)
 class CatalogEntry:
@@ -68,6 +75,79 @@ def _entries_from_skill_file(skill_md: Path, namespace: str) -> CatalogEntry | N
         description=str(description).strip(),
         path=str(skill_md),
     )
+
+
+def _entry_from_md_file(
+    path: Path,
+    kind: str,
+    namespace: str,
+    *,
+    name_from_stem: bool = False,
+) -> CatalogEntry | None:
+    """Build a catalog entry from a single Markdown definition file.
+
+    `description` is mandatory (missing → entry rejected). The name is taken
+    from frontmatter `name` with a stem fallback for agents; when
+    `name_from_stem` is set (commands) the name is the slash-prefixed file stem
+    `/{stem}` for consistency with the built-in command names (`/loop` etc.).
+    """
+    fm = parse_frontmatter(path)
+    if not fm:
+        return None
+    description = fm.get("description")
+    if not description:
+        return None
+    if name_from_stem:
+        name = f"/{path.stem}"
+    else:
+        raw_name = fm.get("name")
+        name = str(raw_name).strip() if raw_name else path.stem
+    name = str(name).strip()
+    if not name or name == "/":
+        return None
+    return CatalogEntry(
+        kind=kind,
+        name=name,
+        namespace=namespace,
+        description=str(description).strip(),
+        path=str(path),
+    )
+
+
+def _symlink_escapes(path: Path, root: Path) -> bool:
+    """True if `path` is a symlink resolving outside `root` (SEC-MIT-005).
+
+    Non-symlinks are always safe. A symlink is only accepted when its target
+    stays within the scanned root; anything pointing elsewhere (or unresolvable)
+    is treated as an escape and skipped by the caller.
+    """
+    if not path.is_symlink():
+        return False
+    try:
+        resolved = path.resolve()
+        root_resolved = root.resolve()
+    except OSError:
+        return True
+    return not (resolved == root_resolved or root_resolved in resolved.parents)
+
+
+def _scan_md_agents(root: Path) -> Iterable[CatalogEntry]:
+    """Scan a `agents/` root for subagent definitions.
+
+    Uses `rglob('*.md')` so namespaced agents (`agents/sub/x.md`) are found,
+    but skips the `reviewers/` helper subtree and symlinks that escape the root.
+    """
+    if not root.is_dir():
+        return
+    for md in sorted(root.rglob("*.md")):
+        rel = md.relative_to(root)
+        if _REVIEWERS_SUBDIR in rel.parts:
+            continue
+        if _symlink_escapes(md, root):
+            continue
+        entry = _entry_from_md_file(md, kind="subagent", namespace="user")
+        if entry:
+            yield entry
 
 
 def _scan_user_skills(root: Path) -> Iterable[CatalogEntry]:
@@ -145,6 +225,10 @@ def scan(config: Config | None = None) -> list[CatalogEntry]:
         elif root.name == "marketplaces":
             for entry in _scan_plugin_skills(root):
                 _accept(entry)
+
+    for root in paths.agent_roots():
+        for entry in _scan_md_agents(root):
+            _accept(entry)
 
     for extra in cfg.catalog.extra_roots:
         for entry in _scan_extra_root(Path(extra).expanduser()):

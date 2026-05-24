@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from skill_advisor import catalog
 from skill_advisor.config import CatalogConfig, Config
 
@@ -80,3 +82,66 @@ def test_parse_frontmatter_returns_none_without_frontmatter(tmp_path):
     f = tmp_path / "plain.md"
     f.write_text("# No frontmatter here\n", encoding="utf-8")
     assert catalog.parse_frontmatter(f) is None
+
+
+def _write_agent_md(path, name, description=None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frontmatter = f"---\nname: {name}\n"
+    if description is not None:
+        frontmatter += f"description: {description}\n"
+    path.write_text(frontmatter + "---\n", encoding="utf-8")
+
+
+def test_scan_finds_user_agents(isolated_paths):
+    agents_dir = isolated_paths["claude_home"] / "agents"
+    _write_agent_md(agents_dir / "x.md", "agent-x", "User agent X.")
+
+    entries = catalog.scan()
+    names = {entry.name: entry for entry in entries}
+
+    assert "agent-x" in names
+    assert names["agent-x"].kind == "subagent"
+    assert names["agent-x"].namespace == "user"
+
+
+def test_namespaced_agents_scanned(isolated_paths):
+    agents_dir = isolated_paths["claude_home"] / "agents"
+    _write_agent_md(agents_dir / "sub" / "z.md", "agent-z", "Nested user agent Z.")
+
+    entries = catalog.scan()
+
+    assert any(entry.name == "agent-z" for entry in entries)
+
+
+def test_reviewers_subdir_excluded_from_agents(isolated_paths):
+    agents_dir = isolated_paths["claude_home"] / "agents"
+    _write_agent_md(agents_dir / "reviewers" / "y.md", "reviewer-y", "Reviewer agent Y.")
+
+    entries = catalog.scan()
+
+    assert all(entry.name != "reviewer-y" for entry in entries)
+
+
+def test_agents_without_description_dropped(isolated_paths):
+    agents_dir = isolated_paths["claude_home"] / "agents"
+    _write_agent_md(agents_dir / "nodesc.md", "agent-nodesc")
+
+    entries = catalog.scan()
+
+    assert all(entry.name != "agent-nodesc" for entry in entries)
+
+
+def test_symlink_agents_outside_home_skipped(isolated_paths, tmp_path):
+    agents_dir = isolated_paths["claude_home"] / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside-agent.md"
+    _write_agent_md(outside, "outside-agent", "Agent outside Claude home.")
+    link = agents_dir / "outside.md"
+    try:
+        link.symlink_to(outside)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    entries = catalog.scan()
+
+    assert all(entry.name != "outside-agent" for entry in entries)
