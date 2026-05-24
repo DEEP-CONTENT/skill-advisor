@@ -132,15 +132,39 @@ def _advisor_command() -> str:
 
 
 _ADVISOR_SUBCOMMANDS = ("hook", "posttooluse", "stop")
+_ADVISOR_BASENAMES = {"skill-advisor", "skill-advisor.exe"}
+
+
+def _advisor_basename(binary: str) -> str:
+    """Separator-agnostic, lowercased basename of a binary path.
+
+    Splits on both `/` and `\\` so a Windows path (`C:\\Tools\\skill-advisor.exe`)
+    resolves identically on POSIX test hosts, then strips any surrounding quotes
+    left over from a quoted command string.
+    """
+    binary = binary.strip()
+    if len(binary) >= 2 and binary[0] == binary[-1] and binary[0] in ("'", '"'):
+        binary = binary[1:-1]
+    return binary.replace("\\", "/").rsplit("/", 1)[-1].lower()
 
 
 def _is_advisor_command(command: str, subcommand: str) -> bool:
-    """True if `command` ends with `<path>/skill-advisor <subcommand>` or bare form."""
-    parts = (command or "").split()
-    if len(parts) < 2 or parts[-1] != subcommand:
+    """True if `command` is `<path>/skill-advisor <subcommand>` (or the bare form).
+
+    Platform-neutral: a Windows `skill-advisor.exe` with backslash separators and
+    a path containing spaces (quoted or not) is recognised the same as a POSIX
+    `/usr/bin/skill-advisor`. Detection works off the trailing subcommand token
+    plus the basename of everything before it, so it never naively `split()`s a
+    path that contains spaces.
+    """
+    command = (command or "").strip()
+    suffix = " " + subcommand
+    if subcommand not in _ADVISOR_SUBCOMMANDS or not command.endswith(suffix):
         return False
-    binary = parts[-2]
-    return binary == "skill-advisor" or binary.endswith("/skill-advisor")
+    binary = command[: -len(suffix)].strip()
+    if not binary:
+        return False
+    return _advisor_basename(binary) in _ADVISOR_BASENAMES
 
 
 def _merge_hook_entry(

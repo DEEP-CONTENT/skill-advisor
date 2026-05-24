@@ -272,3 +272,52 @@ def test_detect_shell_rejects_newline_path(isolated_paths, monkeypatch):
     monkeypatch.setattr(install_mod.paths, "settings_file", lambda: "/tmp/a" + chr(10) + "b.json")
     with pytest.raises(install_mod.AliasQuotingError):
         install_mod.detect_shell()
+
+
+# --- INST-002: platform-neutral, idempotent advisor-command detection ---
+
+def test_is_advisor_command_recognizes_windows_exe():
+    """A Windows `.exe` with backslash separators is an advisor command."""
+    assert install_mod._is_advisor_command(r"C:\Tools\skill-advisor.exe hook", "hook")
+
+
+def test_is_advisor_command_recognizes_windows_exe_path_with_spaces():
+    """Backslash path containing spaces (quoted or bare) is still recognised."""
+    assert install_mod._is_advisor_command(
+        r'"C:\Program Files\skill-advisor\skill-advisor.exe" stop', "stop"
+    )
+    assert install_mod._is_advisor_command(
+        r"C:\Program Files\skill-advisor.exe posttooluse", "posttooluse"
+    )
+
+
+def test_is_advisor_command_posix_still_matches():
+    """Regression: POSIX `/path/skill-advisor` and the bare form keep matching."""
+    assert install_mod._is_advisor_command("/usr/local/bin/skill-advisor hook", "hook")
+    assert install_mod._is_advisor_command("skill-advisor stop", "stop")
+
+
+def test_is_advisor_command_rejects_foreign_and_mismatched():
+    assert not install_mod._is_advisor_command("/usr/bin/other-tool hook", "hook")
+    assert not install_mod._is_advisor_command(r"C:\Tools\skill-advisor.exe hook", "stop")
+    assert not install_mod._is_advisor_command("", "hook")
+    assert not install_mod._is_advisor_command("hook", "hook")
+
+
+def test_render_settings_idempotent_on_windows_exe_path(isolated_paths, monkeypatch):
+    """2x render on a Windows .exe path -> exactly one advisor hook (no duplicate)."""
+    win_exe = r"C:\Tools\skill-advisor.exe"
+    monkeypatch.setattr("skill_advisor.install.shutil.which", lambda name: win_exe)
+
+    install_mod.render_settings()
+    install_mod.render_settings()
+
+    data = json.loads(paths.settings_file().read_text(encoding="utf-8"))
+    for event, sub in (
+        ("UserPromptSubmit", "hook"),
+        ("PostToolUse", "posttooluse"),
+        ("Stop", "stop"),
+    ):
+        hooks = [h for block in data["hooks"][event] for h in block.get("hooks", [])]
+        advisor_cmds = [h["command"] for h in hooks if "skill-advisor" in h["command"]]
+        assert advisor_cmds == [f"{win_exe} {sub}"]
