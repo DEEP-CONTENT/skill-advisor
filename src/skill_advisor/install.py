@@ -13,38 +13,111 @@ ALIAS_BEGIN = "# >>> skill-advisor alias >>>"
 ALIAS_END = "# <<< skill-advisor alias <<<"
 
 
+class AliasQuotingError(ValueError):
+    """A settings path can't be safely embedded in a shell alias/function (SEC-MIT-001)."""
+
+
+def _reject_newline(value: str) -> None:
+    if "\n" in value or "\r" in value:
+        raise AliasQuotingError(
+            "settings path contains a newline and cannot be safely quoted into a "
+            "shell alias/function"
+        )
+
+
+def ps_single_quote(value: str) -> str:
+    """Quote `value` as a PowerShell single-quoted string literal (SEC-MIT-001).
+
+    PowerShell single-quoted strings are fully literal — the only metacharacter is
+    the single quote itself, escaped by doubling it (`'` → `''`). A single-line
+    statement can't carry a newline, so such a path is rejected rather than written
+    as a broken function body.
+    """
+    _reject_newline(value)
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _posix_double_quote(value: str) -> str:
+    """Quote `value` for the inner double-quoted argument of a POSIX command.
+
+    Escapes the four characters that stay special inside double quotes so a path
+    with spaces, quotes, `$` or backticks survives intact at runtime.
+    """
+    for ch in ("\\", '"', "$", "`"):
+        value = value.replace(ch, "\\" + ch)
+    return '"' + value + '"'
+
+
+def _posix_single_quote(value: str) -> str:
+    """Wrap `value` in POSIX single quotes (bash/zsh): close, escaped quote, reopen."""
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def _fish_single_quote(value: str) -> str:
+    """Wrap `value` in fish single quotes — only `\\` and `'` are special inside."""
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
 @dataclass(frozen=True)
 class ShellTarget:
-    name: str           # "bash" | "zsh" | "fish"
+    name: str           # "bash" | "zsh" | "fish" | "powershell"
     rc_file: Path
     alias_line: str
+    # PowerShell (and any non-alias target) carries its block body here instead of
+    # `alias_line`; `install_alias` writes `snippet` verbatim when it's non-empty.
+    snippet: str = ""
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _powershell_profile_path() -> Path:
+    """Deterministic pwsh 7 profile path: `$USERPROFILE/Documents/PowerShell/...`."""
+    userprofile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    return Path(userprofile) / "Documents" / "PowerShell" / "Microsoft.PowerShell_profile.ps1"
 
 
 def detect_shell() -> ShellTarget | None:
     home = Path(os.environ.get("HOME") or os.path.expanduser("~"))
     shell = (os.environ.get("SHELL") or "").split("/")[-1]
-    settings_path = paths.settings_file()
+    settings_path = str(paths.settings_file())
+    _reject_newline(settings_path)
 
     if shell == "fish":
+        body = "claude --settings " + _posix_double_quote(settings_path)
         return ShellTarget(
             name="fish",
             rc_file=home / ".config" / "fish" / "config.fish",
-            alias_line=f'alias claudeskill "claude --settings \\"{settings_path}\\""',
+            alias_line="alias claudeskill " + _fish_single_quote(body),
         )
     if shell == "zsh":
+        body = "claude --settings " + _posix_double_quote(settings_path)
         return ShellTarget(
             name="zsh",
             rc_file=home / ".zshrc",
-            alias_line=f"alias claudeskill='claude --settings \"{settings_path}\"'",
+            alias_line="alias claudeskill=" + _posix_single_quote(body),
         )
     if shell == "bash":
         # macOS uses .bash_profile; Linux uses .bashrc.
         bashrc = home / ".bashrc"
         rc = bashrc if bashrc.exists() else home / ".bash_profile"
+        body = "claude --settings " + _posix_double_quote(settings_path)
         return ShellTarget(
             name="bash",
             rc_file=rc,
-            alias_line=f"alias claudeskill='claude --settings \"{settings_path}\"'",
+            alias_line="alias claudeskill=" + _posix_single_quote(body),
+        )
+    # Windows without a Unix `$SHELL` → a PowerShell profile function (pwsh 7).
+    if _is_windows() and not shell:
+        return ShellTarget(
+            name="powershell",
+            rc_file=_powershell_profile_path(),
+            alias_line="",
+            snippet=(
+                "function claudeskill { claude --settings "
+                f"{ps_single_quote(settings_path)} @args }}"
+            ),
         )
     return None
 
@@ -306,7 +379,10 @@ def install_alias(shell: ShellTarget) -> bool:
     shell.rc_file.parent.mkdir(parents=True, exist_ok=True)
     original = _read_rc(shell.rc_file)
     stripped = _strip_block(original)
-    block = f"\n{ALIAS_BEGIN}\n{shell.alias_line}\n{ALIAS_END}\n"
+    # `snippet` (PowerShell function) wins over `alias_line` when present; the
+    # block mechanism stays content-agnostic either way.
+    block_body = shell.snippet if shell.snippet else shell.alias_line
+    block = f"\n{ALIAS_BEGIN}\n{block_body}\n{ALIAS_END}\n"
     updated = (stripped.rstrip("\n") + "\n" + block) if stripped.strip() else block.lstrip("\n")
     if updated == original:
         return False

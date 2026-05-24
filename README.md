@@ -1307,7 +1307,35 @@ expect auto-rebuild, there is none by design — rebuild is always explicit.
 
 ### Windows
 
-Not supported in v1. Use WSL2 or adapt `install.py`'s shell detection to PowerShell.
+Supported via PowerShell 7 (`pwsh`). On Windows with no Unix `$SHELL`, the installer
+targets your PowerShell profile instead of a shell rc file:
+
+```powershell
+skill-advisor install --write-alias
+. $PROFILE        # reload the profile so the function is defined
+claudeskill       # Claude Code with the advisor active
+```
+
+`--write-alias` writes a `claudeskill` **function** (not an alias) between the sentinel
+markers in `$USERPROFILE\Documents\PowerShell\Microsoft.PowerShell_profile.ps1`:
+
+```powershell
+function claudeskill { claude --settings 'C:\Users\you\AppData\...\claudeskill-settings.json' @args }
+```
+
+The settings path is single-quoted (PowerShell-literal), so spaces and other special
+characters in the path are safe.
+
+**ExecutionPolicy.** If PowerShell refuses to load your profile (`Restricted`,
+`AllSigned`, or a locked-down Group Policy), `claudeskill` won't be defined. Allow local
+scripts **yourself** — for example:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+skill-advisor **never** changes your ExecutionPolicy for you. Alternatively, run inside
+WSL2, where the normal bash/zsh/fish alias path applies.
 
 ---
 
