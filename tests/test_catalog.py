@@ -199,3 +199,126 @@ def test_symlink_commands_outside_home_skipped(isolated_paths, tmp_path):
     entries = catalog.scan()
 
     assert all(entry.name != "/outside" for entry in entries)
+
+
+def test_manifest_excludes_skill_by_name(fake_claude_home, tmp_path):
+    import json
+
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps({"excluded_subskills": ["demo-skill"]}),
+        encoding="utf-8",
+    )
+    cfg = Config(catalog=CatalogConfig(catalog_manifest=str(manifest_path)))
+
+    names = {entry.name for entry in catalog.scan(cfg)}
+
+    assert "demo-skill" not in names
+
+
+def test_manifest_and_config_excludes_union(fake_claude_home, tmp_path):
+    import json
+
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps({"excluded_subskills": ["demo-skill"]}),
+        encoding="utf-8",
+    )
+    cfg = Config(
+        catalog=CatalogConfig(
+            catalog_manifest=str(manifest_path),
+            exclude_names=("/loop",),
+        )
+    )
+
+    names = {entry.name for entry in catalog.scan(cfg)}
+
+    assert "demo-skill" not in names
+    assert "/loop" not in names
+    assert "Explore" in names
+
+
+def test_manifest_missing_is_noop(fake_claude_home):
+    cfg = Config(catalog=CatalogConfig(catalog_manifest=""))
+
+    names = {entry.name for entry in catalog.scan(cfg)}
+
+    assert "demo-skill" in names
+    assert "plugin-skill" in names
+    assert "/loop" in names
+
+
+def test_slash_insensitive_config_strips_leading_slash(fake_claude_home):
+    cfg = Config(catalog=CatalogConfig(exclude_names=("loop",)))
+
+    names = {entry.name for entry in catalog.scan(cfg)}
+
+    assert "/loop" not in names
+
+
+def test_slash_insensitive_with_leading_slash(fake_claude_home):
+    cfg = Config(catalog=CatalogConfig(exclude_names=("/loop",)))
+
+    names = {entry.name for entry in catalog.scan(cfg)}
+
+    assert "/loop" not in names
+
+
+def test_slash_insensitive_manifest_exclude_matches_command(fake_claude_home, tmp_path):
+    import json
+
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps({"excluded_subagents": ["loop"]}),
+        encoding="utf-8",
+    )
+    cfg = Config(catalog=CatalogConfig(catalog_manifest=str(manifest_path)))
+
+    names = {entry.name for entry in catalog.scan(cfg)}
+
+    assert "/loop" not in names
+
+
+def test_tristate_whitelist_absent_scans_all_plugins(fake_claude_home, tmp_path):
+    import json
+
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps({"excluded_subskills": []}), encoding="utf-8")
+    cfg = Config(catalog=CatalogConfig(catalog_manifest=str(manifest_path)))
+
+    names = {entry.name for entry in catalog.scan(cfg)}
+
+    assert "plugin-skill" in names
+
+
+def test_tristate_whitelist_empty_excludes_all_plugins(fake_claude_home, tmp_path):
+    import json
+
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps({"plugin_whitelist": []}), encoding="utf-8")
+    cfg = Config(catalog=CatalogConfig(catalog_manifest=str(manifest_path)))
+
+    names = {entry.name for entry in catalog.scan(cfg)}
+
+    assert "plugin-skill" not in names
+    assert "demo-skill" in names
+
+
+def test_tristate_whitelist_named_scans_only_listed(fake_claude_home, tmp_path):
+    import json
+
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps({"plugin_whitelist": ["x"]}), encoding="utf-8")
+    cfg = Config(catalog=CatalogConfig(catalog_manifest=str(manifest_path)))
+
+    names = {entry.name for entry in catalog.scan(cfg)}
+
+    assert "plugin-skill" in names
+
+    manifest_path.write_text(
+        json.dumps({"plugin_whitelist": ["other"]}),
+        encoding="utf-8",
+    )
+    other_names = {entry.name for entry in catalog.scan(cfg)}
+
+    assert "plugin-skill" not in other_names

@@ -11,16 +11,30 @@ from typing import Iterable
 import yaml
 
 from . import builtins as builtin_entries
+from . import manifest as manifest_loader
 from . import paths
 from .config import Config, load as load_config
 
 _FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
+
+def _norm_name(name: str) -> str:
+    """Normalize a name for slash-insensitive exclusion matching.
+
+    Commands carry a leading slash (``/loop``) while a config or manifest may
+    name them bare (``loop``); stripping a single leading slash lets either form
+    exclude the other. Only one leading slash is removed — names never legitimately
+    start with two.
+    """
+    name = name.strip()
+    return name[1:] if name.startswith("/") else name
+
 # Subdirectory under agent roots whose files are helper definitions, not
-# standalone subagents (e.g. `agents/reviewers/*.md`). Hardcoded here as the
-# default; MAN-003 will let a manifest override it via
-# `excluded_subagents.path` (the structural SSoT). Until then this constant
-# *is* the SSoT for the reviewers exclusion.
+# standalone subagents (e.g. `agents/reviewers/*.md`). This constant is the
+# structural default that hides the whole subtree by path. A manifest adds a
+# complementary, name-based layer: `excluded_subagents` entries are unioned into
+# the exclusion set in `scan()` (slash-insensitive), so teams can hide further
+# agents/skills by name without editing this constant.
 _REVIEWERS_SUBDIR = "reviewers"
 
 
@@ -179,7 +193,15 @@ def _scan_user_skills(root: Path) -> Iterable[CatalogEntry]:
             yield entry
 
 
-def _scan_plugin_skills(root: Path) -> Iterable[CatalogEntry]:
+def _scan_plugin_skills(
+    root: Path, plugin_whitelist: tuple[str, ...] | None = None
+) -> Iterable[CatalogEntry]:
+    """Scan a plugin marketplaces root for SKILL.md files.
+
+    `plugin_whitelist` is Tri-State (see manifest.ManifestFilter): ``None`` keeps
+    the default "scan every plugin" behaviour, while a tuple (possibly empty) gates
+    the scan to only those plugin names — an empty tuple therefore yields nothing.
+    """
     if not root.is_dir():
         return
     # Pattern: <marketplace>/plugins/<plugin>/skills/<skill>/SKILL.md
@@ -188,6 +210,8 @@ def _scan_plugin_skills(root: Path) -> Iterable[CatalogEntry]:
             plugin_name = skill_md.parents[2].name
         except IndexError:
             plugin_name = "unknown"
+        if plugin_whitelist is not None and plugin_name not in plugin_whitelist:
+            continue
         entry = _entries_from_skill_file(skill_md, namespace=f"plugin:{plugin_name}")
         if entry:
             yield entry
@@ -222,12 +246,27 @@ def _builtin_entries() -> Iterable[CatalogEntry]:
 
 def scan(config: Config | None = None) -> list[CatalogEntry]:
     cfg = config or load_config()
-    exclude = set(cfg.catalog.exclude_names)
+
+    # The manifest (when configured) is the structural SSoT for exclusions and
+    # plugin gating; it loads fail-soft to a neutral filter, so an unset/broken
+    # manifest leaves scan behaviour exactly as it was before MAN-003.
+    manifest_filter = manifest_loader.load_manifest(
+        cfg.catalog.catalog_manifest, paths.claude_home()
+    )
+
+    # Union of config excludes and manifest excludes, normalized for
+    # slash-insensitive matching so "loop" and "/loop" exclude each other.
+    exclude = {
+        _norm_name(name)
+        for name in (*cfg.catalog.exclude_names, *manifest_filter.excluded_names)
+    }
+    plugin_whitelist = manifest_filter.plugin_whitelist
+
     seen: set[tuple[str, str]] = set()
     out: list[CatalogEntry] = []
 
     def _accept(entry: CatalogEntry) -> None:
-        if entry.name in exclude:
+        if _norm_name(entry.name) in exclude:
             return
         key = (entry.kind, entry.name)
         if key in seen:
@@ -243,7 +282,7 @@ def scan(config: Config | None = None) -> list[CatalogEntry]:
             for entry in _scan_user_skills(root):
                 _accept(entry)
         elif root.name == "marketplaces":
-            for entry in _scan_plugin_skills(root):
+            for entry in _scan_plugin_skills(root, plugin_whitelist):
                 _accept(entry)
 
     for root in paths.agent_roots():
