@@ -150,6 +150,26 @@ def _scan_md_agents(root: Path) -> Iterable[CatalogEntry]:
             yield entry
 
 
+def _scan_md_commands(root: Path) -> Iterable[CatalogEntry]:
+    """Scan a `commands/` root for slash-command definitions.
+
+    Uses `rglob('*.md')` so namespaced commands (`commands/sub/x.md`) are found
+    and skips symlinks that escape the root. Unlike agents there is no helper
+    subtree to exclude. The command name is the slash-prefixed file stem
+    (`/{stem}`) for consistency with the built-in command names (`/loop` etc.).
+    """
+    if not root.is_dir():
+        return
+    for md in sorted(root.rglob("*.md")):
+        if _symlink_escapes(md, root):
+            continue
+        entry = _entry_from_md_file(
+            md, kind="command", namespace="user", name_from_stem=True
+        )
+        if entry:
+            yield entry
+
+
 def _scan_user_skills(root: Path) -> Iterable[CatalogEntry]:
     if not root.is_dir():
         return
@@ -228,6 +248,10 @@ def scan(config: Config | None = None) -> list[CatalogEntry]:
 
     for root in paths.agent_roots():
         for entry in _scan_md_agents(root):
+            _accept(entry)
+
+    for root in paths.command_roots():
+        for entry in _scan_md_commands(root):
             _accept(entry)
 
     for extra in cfg.catalog.extra_roots:

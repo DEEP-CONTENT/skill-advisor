@@ -145,3 +145,57 @@ def test_symlink_agents_outside_home_skipped(isolated_paths, tmp_path):
     entries = catalog.scan()
 
     assert all(entry.name != "outside-agent" for entry in entries)
+
+
+def _write_command_md(path, description=None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frontmatter = "---\n"
+    if description is not None:
+        frontmatter += f"description: {description}\n"
+    path.write_text(frontmatter + "---\n", encoding="utf-8")
+
+
+def test_scan_finds_user_commands(isolated_paths):
+    commands_dir = isolated_paths["claude_home"] / "commands"
+    _write_command_md(commands_dir / "deploy.md", "Deploy command.")
+
+    entries = catalog.scan()
+    names = {entry.name: entry for entry in entries}
+
+    assert "/deploy" in names
+    assert names["/deploy"].kind == "command"
+    assert names["/deploy"].namespace == "user"
+
+
+def test_namespaced_commands_scanned(isolated_paths):
+    commands_dir = isolated_paths["claude_home"] / "commands"
+    _write_command_md(commands_dir / "git" / "sync.md", "Nested sync command.")
+
+    entries = catalog.scan()
+
+    assert any(entry.name == "/sync" for entry in entries)
+
+
+def test_commands_without_description_dropped(isolated_paths):
+    commands_dir = isolated_paths["claude_home"] / "commands"
+    _write_command_md(commands_dir / "nodesc.md")
+
+    entries = catalog.scan()
+
+    assert all(entry.name != "/nodesc" for entry in entries)
+
+
+def test_symlink_commands_outside_home_skipped(isolated_paths, tmp_path):
+    commands_dir = isolated_paths["claude_home"] / "commands"
+    commands_dir.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside-command.md"
+    _write_command_md(outside, "Command outside Claude home.")
+    link = commands_dir / "outside.md"
+    try:
+        link.symlink_to(outside)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    entries = catalog.scan()
+
+    assert all(entry.name != "/outside" for entry in entries)
