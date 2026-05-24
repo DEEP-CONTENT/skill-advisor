@@ -107,6 +107,24 @@ def test_agent_command_roots_no_duplicate_when_primary_equals_default(monkeypatc
     assert paths.command_roots() == [home / ".claude" / "commands"]
 
 
+def test_fastembed_cache_dir_returns_path(isolated_paths):
+    assert isinstance(paths.fastembed_cache_dir(), Path)
+
+
+def test_fastembed_cache_dir_default_under_cache(isolated_paths, monkeypatch):
+    monkeypatch.delenv("SKILL_ADVISOR_FASTEMBED_CACHE", raising=False)
+    result = paths.fastembed_cache_dir()
+    # Default lives inside the (isolated) cache dir, never the real user cache.
+    assert result == paths.cache_dir() / "fastembed"
+    assert result.parent == isolated_paths["cache_home"]
+
+
+def test_fastembed_cache_dir_env_override(monkeypatch, tmp_path):
+    forced = tmp_path / "custom-fastembed"
+    monkeypatch.setenv("SKILL_ADVISOR_FASTEMBED_CACHE", str(forced))
+    assert paths.fastembed_cache_dir() == forced
+
+
 def test_xdg_fallback_without_override(monkeypatch, tmp_path):
     home = tmp_path / "fallback-home"
     home.mkdir()

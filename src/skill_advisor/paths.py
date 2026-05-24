@@ -105,6 +105,24 @@ def cache_dir() -> Path:
     return Path(base) / "skill-advisor"
 
 
+def fastembed_cache_dir() -> Path:
+    """Persistent cache dir for the fastembed model weights (BGE-small ONNX).
+
+    Pinning this keeps the ~15 MB model out of `~/.cache/fastembed` and off the
+    OS temp dir, so it survives temp cleanup instead of re-downloading on every
+    cold start. `index._embed_model()` passes it to `TextEmbedding(cache_dir=...)`.
+
+    Precedence:
+      1. `SKILL_ADVISOR_FASTEMBED_CACHE` — explicit override.
+      2. `cache_dir() / 'fastembed'`     — default, inside our XDG cache so test
+         isolation (`SKILL_ADVISOR_CACHE_HOME`) redirects it too.
+    """
+    override = os.environ.get("SKILL_ADVISOR_FASTEMBED_CACHE")
+    if override:
+        return Path(override)
+    return cache_dir() / "fastembed"
+
+
 def config_file() -> Path:
     return config_dir() / "config.toml"
 
