@@ -17,7 +17,7 @@ def test_user_overrides_applied(isolated_paths):
     paths.config_file().write_text(
         """
 [matcher]
-model = "claude-opus-4-7"
+model = "claude-opus-4-8"
 max_candidates = 8
 budget_seconds = 4.0
 
@@ -32,7 +32,7 @@ extra_skip_patterns = ["^wip:"]
         encoding="utf-8",
     )
     cfg = config.load()
-    assert cfg.matcher.model == "claude-opus-4-7"
+    assert cfg.matcher.model == "claude-opus-4-8"
     assert cfg.matcher.max_candidates == 8
     assert cfg.matcher.budget_seconds == 4.0
     assert cfg.catalog.extra_roots == ("/tmp/team-skills",)

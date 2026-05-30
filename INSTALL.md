@@ -158,7 +158,7 @@ Check `~/.cache/skill-advisor/advisor.log`. Common causes:
 
 ### Model keeps suggesting the wrong skill
 
-Bump `matcher.model` to `claude-opus-4-7` in `config.toml` for better
+Bump `matcher.model` to `claude-opus-4-8` in `config.toml` for better
 ranking quality (at the cost of latency).
 
 ### Windows
