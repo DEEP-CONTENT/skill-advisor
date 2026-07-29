@@ -765,7 +765,9 @@ Prompts that match the triage skip rules bypass the pipeline in ~0 ms:
 6. If a recommendation was produced, the hook writes it to
    `~/.cache/skill-advisor/effort.json` (atomic temp+rename) and compares it against
    `~/.cache/skill-advisor/observed-effort.json` — the live level the status line last
-   saw — to decide whether a nudge and/or a queued write-back announcement are due.
+   saw — to decide whether a nudge is due. Independently of that comparison, the hook
+   also checks for a write-back announcement queued by a previous session's `Stop`
+   handler and, if one is pending, attaches it to the same `systemMessage`.
 7. `inject.format()` renders picks into a `<skill-advisor>` block.
 8. The hook prints
    `{"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "..."}, "systemMessage": "..."}`
@@ -1329,11 +1331,13 @@ session has at least 3 recommendations, the `Stop` hook computes that session's 
 into a rolling window in `~/.cache/skill-advisor/baseline.json` (capped at the most recent
 30 qualifying sessions).
 
-The comparison point is the **effective launch value**: skill-advisor's own previously
-written `effortLevel` if it has written one, otherwise the status line's first observation
-for that session. When the most recent `write_back_after_sessions` (default **5**)
-sessions in the window all agree on one level, and that level differs from the effective
-launch value, skill-advisor writes it into `claudeskill-settings.json` — atomically
+The comparison point is the session's **first observed effort level** — the value the
+status line's sensor saw on that session's first render, which reflects whatever level the
+session actually launched at (including any `effortLevel` skill-advisor had already
+written, since that's what determined the launch). When the most recent
+`write_back_after_sessions` (default **5**) sessions in the window all agree on one level,
+and that level differs from that first-observed value, skill-advisor writes it into
+`claudeskill-settings.json` — atomically
 (temp file → JSON round-trip validation → rename) — and queues a one-shot announcement
 for the next session's first hook firing:
 
@@ -1373,12 +1377,14 @@ upstream default and start every future session in the expensive mode.
 ### Limits of this feature
 
 - **No recommendation, no nudge, no arrow — sometimes, by design.** Classification is
-  attached to the matcher's result, not computed independently. When your prompt matches
-  no catalog entry above `min_embedding_score` (or triage skips it), `matcher.pick()`
-  returns nothing to attach a recommendation to, so `effort.classify()` never runs. The
-  status line still renders your **live** effort level in that case — it just has no
-  `effort.json` to compare against, so it shows no arrow and the hook has nothing to nudge
-  about.
+  attached to the matcher's result, not computed independently. On the normal stateless
+  path, when your prompt matches no catalog entry above `min_embedding_score` (or triage
+  skips it), `matcher.pick()` returns nothing to attach a recommendation to, so
+  `effort.classify()` does not run. (Narrow lifecycle exception: a completion signal
+  during an active `review`/`correction` phase can still return a non-`None` result with
+  an *empty* picks list, and `classify()` does run on that path.) When it doesn't run, the
+  status line still renders your **live** effort level — it just has no `effort.json` to
+  compare against, so it shows no arrow and the hook has nothing to nudge about.
 - **Write-back is not lock-protected.** Writing `effortLevel` is a read-modify-write on
   the same `claudeskill-settings.json` that `skill-advisor install` also rewrites (to merge
   hook entries, the `statusLine` key, etc.). If the two run at literally the same moment,
