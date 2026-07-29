@@ -183,7 +183,34 @@ def run() -> int:
         except Exception as exc:  # pragma: no cover - defensive
             log.debug("baseline record failed: %s", exc, exc_info=True)
 
+    # A baseline write on a previous session's Stop leaves a one-shot
+    # announcement pending. Consume it here, on the first prompt after the
+    # write, and prepend it to any pending nudge so a single systemMessage
+    # carries both. `announcement` (not the merged `nudge`) is what gates the
+    # no-picks branch below — an ordinary effort nudge with no picks must
+    # stay silent (there's nothing to attach it to), but an announcement is
+    # its own message and must get through regardless of picks.
+    announcement = None
+    if cfg.effort.enabled:
+        try:
+            announcement = baseline.take_announcement()
+        except Exception:  # pragma: no cover - defensive
+            announcement = None
+        if announcement:
+            nudge = f"{announcement}\n{nudge}" if nudge else announcement
+
     if result is None or not result.picks:
+        if announcement:
+            try:
+                _emit_nudged(
+                    "",
+                    nudge=nudge,
+                    session_id=session_id,
+                    observed=observed,
+                    level=rec.level if rec else None,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                log.warning("emit failed: %s", exc, exc_info=True)
         log.debug("no picks for prompt (%.2fs)", duration)
     else:
         try:
@@ -306,13 +333,26 @@ def run_stop() -> int:
         log.debug("stop turn cleanup failed: %s", exc, exc_info=True)
         return 0
 
-    if turn is None:
-        return 0
-
     try:
         cfg = load_config()
     except Exception as exc:  # pragma: no cover - defensive
         log.debug("stop config load failed: %s", exc, exc_info=True)
+        return 0
+
+    # Effort baseline finalisation: tallies/window/write-back are session-level
+    # bookkeeping, independent of lifecycle turn-tracking. A turn that used no
+    # tools at all (turn is None — e.g. a plain conversational reply) still
+    # deserves this pass, so it runs before the turn-is-None short-circuit
+    # below. Wrapped defensively: run_stop must always return 0.
+    if cfg.effort.enabled:
+        try:
+            baseline.finalise_session(session_id)
+            baseline.decrement_cooldown()
+            baseline.maybe_write(cfg, launch_level=baseline.first_observation(session_id))
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("baseline finalise failed: %s", exc, exc_info=True)
+
+    if turn is None:
         return 0
 
     # Stop-event telemetry runs regardless of lifecycle config — it's how the

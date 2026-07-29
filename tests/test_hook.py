@@ -363,6 +363,127 @@ def test_nudge_rate_limited_per_level_pair():
     assert baseline.mark_nudged("s1", "medium", "low") is True
 
 
+# ---------------------------------------------------------------------------
+# Session finalisation (Stop) and the baseline-move announcement (first
+# prompt after a write)
+# ---------------------------------------------------------------------------
+
+
+def test_stop_finalises_session_and_may_write(monkeypatch, isolated_paths):
+    from skill_advisor import baseline
+
+    _enable_effort_in_config(isolated_paths)
+
+    calls = []
+    monkeypatch.setattr(baseline, "finalise_session", lambda s: calls.append(("final", s)))
+    monkeypatch.setattr(baseline, "decrement_cooldown", lambda: calls.append(("dec",)))
+    monkeypatch.setattr(baseline, "maybe_write", lambda cfg, launch_level: calls.append(("write",)))
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"session_id":"s1"}'))
+    hook.run_stop()
+    assert ("final", "s1") in calls
+    assert ("dec",) in calls
+    assert ("write",) in calls
+
+
+def test_stop_finalisation_skipped_when_effort_disabled(monkeypatch):
+    """No config.toml → effort.enabled defaults False. Finalisation must not run."""
+    from skill_advisor import baseline
+
+    calls = []
+    monkeypatch.setattr(baseline, "finalise_session", lambda s: calls.append(("final", s)))
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"session_id":"s1"}'))
+    rc = hook.run_stop()
+    assert rc == 0
+    assert calls == []
+
+
+def test_stop_finalisation_swallows_exceptions(isolated_paths):
+    """run_stop must always return 0, even if baseline bookkeeping blows up."""
+    _enable_effort_in_config(isolated_paths)
+    with patch("skill_advisor.hook.baseline.finalise_session", side_effect=RuntimeError("boom")), \
+         patch("sys.stdin", io.StringIO(json.dumps({"session_id": "s1"}))):
+        rc = hook.run_stop()
+    assert rc == 0
+
+
+def test_run_no_picks_emits_pending_announcement(isolated_paths):
+    """The no-picks branch is a second emission site: an announcement pending
+    from a previous session's Stop must reach the user even when this turn
+    matched no skills.
+    """
+    from skill_advisor import baseline
+
+    _enable_effort_in_config(isolated_paths)
+    baseline._save({"announce": {"from": "xhigh", "to": "low", "sessions": 3}})
+
+    with patch("skill_advisor.hook.matcher.pick", return_value=None):
+        out = _run_with_stdin({"prompt": "anything", "session_id": "s1"})
+    envelope = json.loads(out)
+    assert envelope["hookSpecificOutput"]["additionalContext"] == ""
+    assert "xhigh" in envelope["systemMessage"]
+    assert "low" in envelope["systemMessage"]
+
+    # Consumed once: a second no-picks prompt in the same session is fully silent.
+    with patch("skill_advisor.hook.matcher.pick", return_value=None):
+        out2 = _run_with_stdin({"prompt": "anything else", "session_id": "s1"})
+    assert out2 == ""
+
+
+def test_run_no_picks_announcement_merges_with_pending_nudge_via_emit_nudged(isolated_paths):
+    """When both an ordinary effort nudge and an announcement are pending on
+    a no-picks turn, the announcement must route through `_emit_nudged` (not
+    a raw `_emit`) — proven here by checking that the nudge's rate-limit slot
+    is actually consumed, which only `_emit_nudged` does.
+    """
+    from skill_advisor import baseline
+
+    _enable_effort_in_config(isolated_paths)
+    _write_observed("s1", "medium")
+    baseline._save({"announce": {"from": "xhigh", "to": "low", "sessions": 3}})
+
+    empty_result = PickResult(
+        picks=[], state=None, effort=effort.EffortRecommendation("xhigh", "5 tasks", "judge")
+    )
+    with patch("skill_advisor.hook.matcher.pick", return_value=empty_result):
+        out = _run_with_stdin({"prompt": "anything", "session_id": "s1"})
+    envelope = json.loads(out)
+    # Both messages landed in the single systemMessage, announcement first.
+    assert "low" in envelope["systemMessage"]
+    assert "you're at medium" in envelope["systemMessage"]
+    assert envelope["systemMessage"].index("skill-advisor moved") < envelope["systemMessage"].index(
+        "this looks like"
+    )
+    # The ordinary nudge rode along and was actually shown, so its rate-limit
+    # slot must now be consumed — proof this went through `_emit_nudged`.
+    assert baseline.was_nudged("s1", "medium", "xhigh") is True
+
+
+def test_run_no_picks_without_announcement_stays_silent(isolated_paths):
+    """No baseline write happened — no picks and no announcement must produce
+    no output at all, matching the pre-existing no-picks-stays-silent contract.
+    """
+    with patch("skill_advisor.hook.matcher.pick", return_value=None):
+        out = _run_with_stdin({"prompt": "anything", "session_id": "s1"})
+    assert out == ""
+
+
+def test_take_announcement_not_called_when_effort_disabled(isolated_paths):
+    """With cfg.effort.enabled False, take_announcement must never even be
+    consulted — a stray announce payload must survive untouched for whenever
+    the feature is turned on.
+    """
+    from skill_advisor import baseline, paths as paths_mod
+
+    paths_mod.ensure_dirs()
+    baseline._save({"announce": {"from": "xhigh", "to": "low", "sessions": 3}})
+
+    with patch("skill_advisor.hook.matcher.pick", return_value=None):
+        out = _run_with_stdin({"prompt": "anything", "session_id": "s1"})
+    assert out == ""
+    data = json.loads(paths_mod.baseline_file().read_text(encoding="utf-8"))
+    assert data.get("announce") == {"from": "xhigh", "to": "low", "sessions": 3}
+
+
 def test_nudge_bookkeeping_does_not_touch_lifecycle_state():
     """Regression guard: writing nudge state must not refresh `updated_at`.
 

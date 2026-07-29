@@ -464,3 +464,48 @@ def test_decrement_cooldown_floors_at_zero():
     baseline.decrement_cooldown()
     data = json.loads(paths.baseline_file().read_text(encoding="utf-8"))
     assert data["veto_cooldown_remaining"] == 0
+
+
+# ---------------------------------------------------------------------------
+# take_announcement: one-shot consumption of a pending baseline-move message
+# ---------------------------------------------------------------------------
+
+
+def test_announcement_is_returned_once_then_cleared():
+    _fill("low", 3)
+    baseline.maybe_write(_cfg(), launch_level="xhigh")
+    msg = baseline.take_announcement()
+    assert "xhigh" in msg and "low" in msg
+    assert "/effort xhigh" in msg
+    assert baseline.take_announcement() is None
+
+
+def test_no_announcement_without_a_write():
+    assert baseline.take_announcement() is None
+
+
+def test_announcement_tolerates_non_dict_shape():
+    """baseline.json can be structurally corrupt (valid JSON, wrong shape) —
+    e.g. hand-edited or clobbered by a racing writer. `announce` being a
+    non-dict must degrade to "nothing pending", never raise.
+    """
+    paths.ensure_dirs()
+    paths.baseline_file().write_text(json.dumps({"announce": "not-a-dict"}), encoding="utf-8")
+    assert baseline.take_announcement() is None
+
+    paths.baseline_file().write_text(json.dumps({"announce": ["from", "to"]}), encoding="utf-8")
+    assert baseline.take_announcement() is None
+
+    paths.baseline_file().write_text(json.dumps({"announce": 42}), encoding="utf-8")
+    assert baseline.take_announcement() is None
+
+
+def test_announcement_tolerates_missing_to_key():
+    """A dict-shaped `announce` missing its `to` key must not raise or format
+    a message with a blank destination.
+    """
+    paths.ensure_dirs()
+    paths.baseline_file().write_text(
+        json.dumps({"announce": {"from": "xhigh", "sessions": 3}}), encoding="utf-8"
+    )
+    assert baseline.take_announcement() is None

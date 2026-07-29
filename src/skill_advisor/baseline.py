@@ -298,3 +298,21 @@ def decrement_cooldown() -> None:
         return
     data["veto_cooldown_remaining"] = remaining - 1
     _save(data)
+
+
+def take_announcement() -> str | None:
+    """Formatted announcement for the most recent write, consumed once."""
+    data = _load()
+    ann = data.pop("announce", None)
+    if not isinstance(ann, dict):
+        return None
+    _save(data)
+    frm = ann.get("from") or "your previous default"
+    to = ann.get("to")
+    sessions = ann.get("sessions")
+    if not to:
+        return None
+    return (
+        f"skill-advisor moved your effort baseline {frm} → {to} "
+        f"({sessions} sessions of consistent work). Run /effort {frm} to keep it there."
+    )
