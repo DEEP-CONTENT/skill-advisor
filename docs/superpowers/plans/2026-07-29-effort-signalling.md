@@ -31,7 +31,7 @@
 | File | Responsibility |
 |---|---|
 | `src/skill_advisor/effort.py` | Level vocabulary, ordering, the observed/recommended asymmetry, the classifier ladder, and read/write of the two state files. |
-| `src/skill_advisor/baseline.py` | Rolling window of per-session modal recommendations; write-back to `claudeskill-settings.json`; veto and cooldown; announcement queue. |
+| `src/skill_advisor/baseline.py` | The effort feature's mutable JSON store: nudge ledger, rolling window of per-session modal recommendations, write-back to `claudeskill-settings.json`, veto and cooldown, announcement queue. Kept out of `LifecycleState` because `lifecycle.save()` refreshes `updated_at`, which the Stop hook's double-advance guard reads. |
 | `src/skill_advisor/statusline.py` | Renders the POSIX-shell status line script text (pure function) and writes it to disk. |
 | `tests/test_effort.py` | Levels, ordering, asymmetry, state files, classifier ladder. |
 | `tests/test_statusline.py` | Executes the generated script under `sh` with synthetic stdin. |
@@ -1281,16 +1281,32 @@ git commit -m "feat(install): register the status line and report it in doctor"
 ### Task 8: Hook integration — write state and nudge
 
 **Files:**
+- Create: `src/skill_advisor/baseline.py` (store + nudge ledger; Task 9 extends it)
 - Modify: `src/skill_advisor/matcher.py:22-26` (`PickResult`), `src/skill_advisor/matcher.py:132-231` (`pick`)
 - Modify: `src/skill_advisor/hook.py:47-55` (`_emit`), `src/skill_advisor/hook.py:74-136` (`run`)
-- Test: `tests/test_hook.py`
+- Test: `tests/test_hook.py`, `tests/test_baseline.py`
 
 **Interfaces:**
 - Consumes: Task 5's `effort.classify()`, Task 3's `write_recommendation`/`read_observed`, Task 2's `should_nudge`.
 - Produces:
   - `matcher.PickResult` gains `effort: effort.EffortRecommendation | None = None`.
   - `hook._emit(text: str, system_message: str | None = None) -> None`.
-  - Nudge rate-limit state stored on the lifecycle session file key `nudged_pairs: list[str]` (format `"observed>recommended"`).
+  - `baseline.mark_nudged(session_id, observed, recommended) -> bool` (added here, extended in Task 9's module).
+
+**Do NOT store nudge state on `LifecycleState`.** Two reasons, both load-bearing:
+
+1. `lifecycle.save()` (`lifecycle.py:272-277`) unconditionally sets
+   `state.updated_at = time.time()`. `hook.run_stop()` (`hook.py:259`) skips
+   auto-advance when `time.time() - state.updated_at < 1.0`. So writing nudge
+   state through `save()` would refresh that timestamp on every prompt and
+   **silently suppress lifecycle auto-advance** whenever a Stop event lands within
+   a second of a nudge. A cross-feature regression with no visible symptom.
+2. `LifecycleState.from_json()` (`lifecycle.py:249-258`) filters against an explicit
+   `known` set, so a new field is silently dropped on every load unless that set is
+   also updated — the rate limit would appear to work and never actually persist.
+
+Nudge bookkeeping therefore lives in `baseline.json`, which is the effort feature's
+own mutable store and touches nothing the lifecycle depends on.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1352,13 +1368,28 @@ def test_nudge_suppressed_at_max():
 
 def test_nudge_rate_limited_per_level_pair():
     """A long session must not nag on every prompt for the same disagreement."""
-    from skill_advisor import lifecycle
+    from skill_advisor import baseline
 
-    lifecycle.start("s1", "build a thing")
-    assert lifecycle.mark_nudged("s1", "medium", "xhigh") is True
-    assert lifecycle.mark_nudged("s1", "medium", "xhigh") is False
+    assert baseline.mark_nudged("s1", "medium", "xhigh") is True
+    assert baseline.mark_nudged("s1", "medium", "xhigh") is False
     # a different pair is a genuinely new piece of information
-    assert lifecycle.mark_nudged("s1", "medium", "low") is True
+    assert baseline.mark_nudged("s1", "medium", "low") is True
+
+
+def test_nudge_bookkeeping_does_not_touch_lifecycle_state():
+    """Regression guard: writing nudge state must not refresh `updated_at`.
+
+    `hook.run_stop()` skips auto-advance when the lifecycle state was updated
+    less than a second ago. If nudge bookkeeping went through `lifecycle.save()`
+    it would bump that timestamp on every prompt and silently disable
+    auto-advance.
+    """
+    from skill_advisor import baseline, lifecycle
+
+    state = lifecycle.start("s1", "build a thing")
+    before = lifecycle.load("s1").updated_at
+    baseline.mark_nudged("s1", "medium", "xhigh")
+    assert lifecycle.load("s1").updated_at == before
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1489,7 +1520,7 @@ In `hook.run()`, after `picks = result.picks if result else []` (`hook.py:103`):
             obs_session, observed = effort.read_observed()
             if obs_session == session_id:
                 nudge = _nudge_message(observed, rec)
-                if nudge and not lifecycle.mark_nudged(session_id, observed, rec.level):
+                if nudge and not baseline.mark_nudged(session_id, observed, rec.level):
                     nudge = None  # already nudged for this (observed, recommended) pair
 ```
 
@@ -1499,31 +1530,73 @@ and change the emit call (`hook.py:109`) to:
             _emit(inject.format(result), system_message=nudge)
 ```
 
-Add `mark_nudged` to `src/skill_advisor/lifecycle.py`:
+Create `src/skill_advisor/baseline.py` with just the JSON store and the nudge
+ledger. Task 9 extends this same module with the rolling window — do not create a
+second file.
 
 ```python
+"""Mutable state for the effort feature: nudge ledger and (from Task 9) the
+rolling window of per-session modal recommendations.
+
+Deliberately separate from `LifecycleState`: `lifecycle.save()` refreshes
+`updated_at`, which `hook.run_stop()` uses as its double-advance guard. Writing
+effort bookkeeping through it would silently suppress lifecycle auto-advance.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+
+from . import paths
+
+log = logging.getLogger(__name__)
+
+
+def _load() -> dict:
+    try:
+        data = json.loads(paths.baseline_file().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save(data: dict) -> None:
+    paths.ensure_dirs()
+    target = paths.baseline_file()
+    tmp = target.with_suffix(f".json.tmp.{os.getpid()}")
+    try:
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        tmp.replace(target)
+    except OSError as exc:
+        log.debug("baseline save failed: %s", exc)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def mark_nudged(session_id: str | None, observed: str | None, recommended: str) -> bool:
     """True the first time this (observed, recommended) pair is nudged this session.
 
-    Rate limits the systemMessage so a long session doesn't nag every prompt.
-    Returns True on first call for the pair, False thereafter.
+    Rate limits the systemMessage so a long session doesn't nag on every prompt.
     """
     if not session_id:
         return False
     key = f"{observed}>{recommended}"
-    state = load(session_id)
-    if state is None:
-        return True  # no lifecycle state to record against; allow one nudge
-    seen = list(getattr(state, "nudged_pairs", []) or [])
+    data = _load()
+    ledger = data.setdefault("nudged", {})
+    if not isinstance(ledger, dict):
+        ledger = {}
+        data["nudged"] = ledger
+    seen = list(ledger.get(session_id, []))
     if key in seen:
         return False
     seen.append(key)
-    state.nudged_pairs = seen
-    save(state)
+    ledger[session_id] = seen
+    _save(data)
     return True
 ```
-
-Add `nudged_pairs: list[str] = field(default_factory=list)` to the `LifecycleState` dataclass and include it in its serialisation, matching how `pending_todos` is handled.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -1533,7 +1606,8 @@ Expected: PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/skill_advisor/hook.py src/skill_advisor/matcher.py src/skill_advisor/lifecycle.py tests/test_hook.py
+git add src/skill_advisor/hook.py src/skill_advisor/matcher.py src/skill_advisor/baseline.py \
+        tests/test_hook.py tests/test_baseline.py
 git commit -m "feat(hook): write effort state and emit a rate-limited nudge"
 ```
 
@@ -1542,11 +1616,11 @@ git commit -m "feat(hook): write effort state and emit a rate-limited nudge"
 ### Task 9: Baseline window
 
 **Files:**
-- Create: `src/skill_advisor/baseline.py`
-- Create: `tests/test_baseline.py`
+- Modify: `src/skill_advisor/baseline.py` (created in Task 8 — **extend it**, do not recreate)
+- Modify: `tests/test_baseline.py`
 
 **Interfaces:**
-- Consumes: Task 2 constants and `to_persistable`, `paths.baseline_file()`.
+- Consumes: Task 2 constants and `to_persistable`, Task 8's `_load`/`_save`.
 - Produces:
   - `baseline.record(session_id: str, level: str) -> None` — append one recommendation to the session's tally.
   - `baseline.finalise_session(session_id: str) -> str | None` — compute the modal level, append to the rolling window, clear the tally. Returns the modal level, or `None` when the session had fewer than `_MIN_RECOMMENDATIONS` (3).
@@ -1611,53 +1685,21 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'skill_advisor.baselin
 
 - [ ] **Step 3: Write minimal implementation**
 
-Create `src/skill_advisor/baseline.py`:
+Extend `src/skill_advisor/baseline.py` (Task 8 created it with `_load`, `_save`,
+and `mark_nudged`). Add the import and constants to the existing header:
 
 ```python
-"""Rolling window of per-session modal effort recommendations.
-
-Feeds the occasional, announced, vetoable write of `effortLevel` into
-claudeskill-settings.json. Sessions contributing fewer than
-`_MIN_RECOMMENDATIONS` are discarded as too thin to be meaningful.
-"""
-from __future__ import annotations
-
-import json
-import logging
-import os
 from collections import Counter
 
-from . import effort, paths
-
-log = logging.getLogger(__name__)
+from . import effort
 
 _MIN_RECOMMENDATIONS = 3
 _WINDOW_CAP = 30
+```
 
+Then append:
 
-def _load() -> dict:
-    try:
-        data = json.loads(paths.baseline_file().read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _save(data: dict) -> None:
-    paths.ensure_dirs()
-    target = paths.baseline_file()
-    tmp = target.with_suffix(f".json.tmp.{os.getpid()}")
-    try:
-        tmp.write_text(json.dumps(data), encoding="utf-8")
-        tmp.replace(target)
-    except OSError as exc:
-        log.debug("baseline save failed: %s", exc)
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-
-
+```python
 def record(session_id: str, level: str) -> None:
     """Append one recommendation to this session's tally."""
     if not session_id or level not in effort.RECOMMENDABLE:
