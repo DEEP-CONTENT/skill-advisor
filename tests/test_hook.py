@@ -377,3 +377,93 @@ def test_nudge_bookkeeping_does_not_touch_lifecycle_state():
     before = lifecycle.load("s1").updated_at
     baseline.mark_nudged("s1", "medium", "xhigh")
     assert lifecycle.load("s1").updated_at == before
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1: the nudge rate-limit slot must be consumed only when the
+# nudge was actually shown to the user — not merely computed.
+# ---------------------------------------------------------------------------
+
+
+def _enable_effort_in_config(isolated_paths):
+    cfg = isolated_paths["config_home"] / "config.toml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text("[effort]\nenabled = true\nnudge = true\n")
+
+
+def _write_observed(session_id: str, level: str) -> None:
+    paths.ensure_dirs()
+    paths.observed_effort_file().write_text(
+        json.dumps({"session_id": session_id, "level": level}), encoding="utf-8"
+    )
+
+
+def test_hook_no_picks_does_not_consume_nudge_slot(isolated_paths):
+    """A PickResult with empty picks never reaches _emit — the slot must survive."""
+    from skill_advisor import baseline
+
+    _enable_effort_in_config(isolated_paths)
+    _write_observed("s1", "medium")
+
+    empty_result = PickResult(
+        picks=[], state=None, effort=effort.EffortRecommendation("xhigh", "5 tasks", "judge")
+    )
+    with patch("skill_advisor.hook.matcher.pick", return_value=empty_result):
+        out = _run_with_stdin({"prompt": "anything", "session_id": "s1"})
+    assert out == ""
+    # Nothing was shown, so the pair must still be un-nudged.
+    assert baseline.was_nudged("s1", "medium", "xhigh") is False
+
+    # A later prompt that DOES have picks must still get the nudge — proving
+    # the earlier no-picks turn never burned the slot.
+    entry = CatalogEntry(kind="skill", name="brainstorming", namespace="user", description="...")
+    result_with_picks = PickResult(
+        picks=[ResolvedPick(entry=entry, reason="embedding match (0.80)")],
+        state=None,
+        effort=effort.EffortRecommendation("xhigh", "5 tasks", "judge"),
+    )
+    with patch("skill_advisor.hook.matcher.pick", return_value=result_with_picks):
+        out2 = _run_with_stdin({"prompt": "anything else", "session_id": "s1"})
+    envelope = json.loads(out2)
+    assert envelope.get("systemMessage")
+    assert "xhigh" in envelope["systemMessage"]
+
+
+def test_hook_emit_failure_does_not_consume_nudge_slot(isolated_paths):
+    """If _emit raises, the message never reached the user — slot must survive."""
+    from skill_advisor import baseline
+
+    _enable_effort_in_config(isolated_paths)
+    _write_observed("s1", "medium")
+
+    entry = CatalogEntry(kind="skill", name="brainstorming", namespace="user", description="...")
+    result = PickResult(
+        picks=[ResolvedPick(entry=entry, reason="embedding match (0.80)")],
+        state=None,
+        effort=effort.EffortRecommendation("xhigh", "5 tasks", "judge"),
+    )
+    with patch("skill_advisor.hook.matcher.pick", return_value=result), \
+         patch("skill_advisor.hook._emit", side_effect=RuntimeError("boom")):
+        out = _run_with_stdin({"prompt": "anything", "session_id": "s1"})
+    assert out == ""
+    assert baseline.was_nudged("s1", "medium", "xhigh") is False
+
+
+def test_hook_nudge_shown_once_across_two_successful_emits(isolated_paths):
+    """Existing behaviour preserved: a genuinely shown nudge is not repeated."""
+    _enable_effort_in_config(isolated_paths)
+    _write_observed("s1", "medium")
+
+    entry = CatalogEntry(kind="skill", name="brainstorming", namespace="user", description="...")
+    result = PickResult(
+        picks=[ResolvedPick(entry=entry, reason="embedding match (0.80)")],
+        state=None,
+        effort=effort.EffortRecommendation("xhigh", "5 tasks", "judge"),
+    )
+    with patch("skill_advisor.hook.matcher.pick", return_value=result):
+        out1 = _run_with_stdin({"prompt": "first", "session_id": "s1"})
+        out2 = _run_with_stdin({"prompt": "second", "session_id": "s1"})
+    env1 = json.loads(out1)
+    env2 = json.loads(out2)
+    assert env1.get("systemMessage")
+    assert "systemMessage" not in env2

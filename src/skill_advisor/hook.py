@@ -73,6 +73,34 @@ def _nudge_message(observed: str | None, rec) -> str | None:
     )
 
 
+def _emit_nudged(
+    text: str,
+    *,
+    nudge: str | None,
+    session_id: str | None,
+    observed: str | None,
+    level: str | None,
+) -> None:
+    """Emit the envelope, then consume the nudge rate-limit slot only once the
+    emit actually happened.
+
+    Consumption is tied to this single emission point rather than to any one
+    caller's branch, so a future emission site that also carries a pending
+    nudge (e.g. a no-picks-but-announcement path) stays correct by calling
+    this same helper instead of re-deriving "did this reach the user" logic.
+    If `_emit` raises, the caller's own exception handling takes over and the
+    slot is never touched — the message never reached the user.
+    """
+    _emit(text, system_message=nudge)
+    if nudge:
+        try:
+            baseline.mark_nudged(session_id, observed, level)
+        except Exception as exc:  # pragma: no cover - defensive
+            logging.getLogger("skill_advisor.hook").debug(
+                "nudge mark failed: %s", exc, exc_info=True
+            )
+
+
 def _extract_todo_titles(tool_input: dict) -> list[str]:
     """Pull the `content` string from each todo in a TodoWrite tool_input.
 
@@ -123,6 +151,7 @@ def run() -> int:
 
     rec = result.effort if result else None
     nudge = None
+    observed = None
     if cfg.effort.enabled and rec is not None:
         try:
             effort.write_recommendation(rec, session_id=session_id)
@@ -130,20 +159,34 @@ def run() -> int:
             log.debug("effort write failed: %s", exc, exc_info=True)
         if cfg.effort.nudge:
             try:
-                obs_session, observed = effort.read_observed()
+                obs_session, obs_level = effort.read_observed()
                 if obs_session == session_id:
-                    nudge = _nudge_message(observed, rec)
-                    if nudge and not baseline.mark_nudged(session_id, observed, rec.level):
-                        nudge = None  # already nudged for this (observed, recommended) pair
+                    candidate = _nudge_message(obs_level, rec)
+                    # Check only — do NOT consume the slot here. It must not
+                    # be spent until we know the message actually reached the
+                    # user (see `_emit_nudged`); otherwise a turn that never
+                    # emits (empty picks) or fails mid-emit silently burns the
+                    # one shot this session gets for this (observed, level)
+                    # pair, and the user is never told.
+                    if candidate and not baseline.was_nudged(session_id, obs_level, rec.level):
+                        nudge = candidate
+                        observed = obs_level
             except Exception as exc:  # pragma: no cover - defensive
                 log.debug("nudge computation failed: %s", exc, exc_info=True)
                 nudge = None
+                observed = None
 
     if result is None or not result.picks:
         log.debug("no picks for prompt (%.2fs)", duration)
     else:
         try:
-            _emit(inject.format(result), system_message=nudge)
+            _emit_nudged(
+                inject.format(result),
+                nudge=nudge,
+                session_id=session_id,
+                observed=observed,
+                level=rec.level if rec else None,
+            )
         except Exception as exc:  # pragma: no cover - defensive
             log.warning("emit failed: %s", exc, exc_info=True)
             return 0

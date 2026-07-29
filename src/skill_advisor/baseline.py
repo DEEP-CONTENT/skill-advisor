@@ -39,6 +39,26 @@ def _save(data: dict) -> None:
             pass
 
 
+def was_nudged(session_id: str | None, observed: str | None, recommended: str) -> bool:
+    """Read-only counterpart to `mark_nudged`.
+
+    True when this (observed, recommended) pair has already been nudged this
+    session. Lets a caller decide whether a message is worth building at all,
+    without consuming the slot — consumption must wait until the caller knows
+    the message actually reached the user (see `mark_nudged`).
+    """
+    if not session_id:
+        return False
+    key = f"{observed}>{recommended}"
+    ledger = _load().get("nudged", {})
+    if not isinstance(ledger, dict):
+        return False
+    seen = ledger.get(session_id, [])
+    if not isinstance(seen, list):
+        return False
+    return key in seen
+
+
 def mark_nudged(session_id: str | None, observed: str | None, recommended: str) -> bool:
     """True the first time this (observed, recommended) pair is nudged this session.
 
