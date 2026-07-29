@@ -48,3 +48,38 @@ judge_timeout_seconds = 12.0
         pass
     out = capsys.readouterr().out + capsys.readouterr().err
     assert "parallelization" not in out.lower() or "ok" in out.lower()
+
+
+def test_doctor_reports_statusline_when_effort_enabled(capsys, monkeypatch):
+    from skill_advisor import cli, paths
+
+    paths.config_file().parent.mkdir(parents=True, exist_ok=True)
+    paths.config_file().write_text(
+        """
+[effort]
+enabled = true
+""",
+        encoding="utf-8",
+    )
+    try:
+        cli.main(["doctor"])
+    except SystemExit:
+        pass
+    out = capsys.readouterr().out
+    assert "jq" in out.lower()
+    assert "statusline" in out.lower()
+    assert "effort state" in out.lower()
+
+
+def test_doctor_silent_on_effort_when_feature_disabled(capsys, monkeypatch):
+    from skill_advisor import cli, paths
+
+    paths.config_file().parent.mkdir(parents=True, exist_ok=True)
+    paths.config_file().write_text("", encoding="utf-8")
+    try:
+        cli.main(["doctor"])
+    except SystemExit:
+        pass
+    out = capsys.readouterr().out
+    assert "statusline" not in out.lower()
+    assert "effort state" not in out.lower()

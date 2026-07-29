@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import paths
+from . import statusline
+from .config import load as load_config
 
 ALIAS_BEGIN = "# >>> skill-advisor alias >>>"
 ALIAS_END = "# <<< skill-advisor alias <<<"
@@ -143,6 +145,22 @@ def render_settings() -> Path:
     _merge_hook_entry(hooks, "UserPromptSubmit", f"{advisor} hook")
     _merge_hook_entry(hooks, "PostToolUse", f"{advisor} posttooluse")
     _merge_hook_entry(hooks, "Stop", f"{advisor} stop")
+
+    try:
+        cfg = load_config()
+    except Exception:  # pragma: no cover - defensive; installer must not crash
+        cfg = None
+
+    if cfg is not None and cfg.effort.enabled and cfg.effort.statusline:
+        existing = data.get("statusLine")
+        ours = str(statusline.write_script())
+        is_foreign = (
+            isinstance(existing, dict)
+            and isinstance(existing.get("command"), str)
+            and not existing["command"].endswith("statusline.sh")
+        )
+        if not is_foreign:
+            data["statusLine"] = {"type": "command", "command": ours}
 
     target.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     return target

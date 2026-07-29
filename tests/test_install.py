@@ -1,7 +1,16 @@
 import json
 
+from skill_advisor import config
 from skill_advisor import install as install_mod
 from skill_advisor import paths
+
+
+def _settings() -> dict:
+    return json.loads(paths.settings_file().read_text(encoding="utf-8"))
+
+
+def _config(*, enabled: bool = False, statusline: bool = True) -> config.Config:
+    return config.Config(effort=config.EffortConfig(enabled=enabled, statusline=statusline))
 
 
 def test_render_settings_points_to_skill_advisor(isolated_paths):
@@ -155,3 +164,51 @@ def test_detect_shell_fish_uses_config_fish(isolated_paths, monkeypatch):
     assert shell.name == "fish"
     assert shell.rc_file.name == "config.fish"
     assert 'alias claudeskill' in shell.alias_line
+
+
+def test_statusline_registered_when_enabled(isolated_paths, monkeypatch):
+    monkeypatch.setattr(
+        "skill_advisor.install.load_config",
+        lambda: _config(enabled=True, statusline=True),
+    )
+    install_mod.render_settings()
+    data = _settings()
+    assert data["statusLine"]["type"] == "command"
+    assert data["statusLine"]["command"].endswith("statusline.sh")
+    assert paths.statusline_script().is_file()
+
+
+def test_statusline_absent_when_feature_disabled(isolated_paths, monkeypatch):
+    monkeypatch.setattr(
+        "skill_advisor.install.load_config",
+        lambda: _config(),
+    )
+    install_mod.render_settings()
+    assert "statusLine" not in _settings()
+
+
+def test_render_settings_preserves_effortlevel_written_by_baseline(isolated_paths, monkeypatch):
+    """A baseline write must survive a later `skill-advisor install`."""
+    paths.ensure_dirs()
+    paths.settings_file().write_text(json.dumps({"effortLevel": "high"}), encoding="utf-8")
+    monkeypatch.setattr(
+        "skill_advisor.install.load_config",
+        lambda: _config(),
+    )
+    install_mod.render_settings()
+    assert _settings()["effortLevel"] == "high"
+
+
+def test_render_settings_preserves_foreign_statusline(isolated_paths, monkeypatch):
+    """Never clobber a status line the user configured themselves."""
+    paths.ensure_dirs()
+    paths.settings_file().write_text(
+        json.dumps({"statusLine": {"type": "command", "command": "/usr/local/bin/mine.sh"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "skill_advisor.install.load_config",
+        lambda: _config(enabled=True, statusline=True),
+    )
+    install_mod.render_settings()
+    assert _settings()["statusLine"]["command"] == "/usr/local/bin/mine.sh"

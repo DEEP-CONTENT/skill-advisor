@@ -194,6 +194,16 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
     # Parallelization-specific: judge needs budget headroom.
     cfg = load_config()
+
+    cfg_effort = cfg.effort
+    if cfg_effort.enabled:
+        jq = shutil.which("jq")
+        print(f"jq             : {jq or 'MISSING (status line will render nothing)'}")
+        script = paths.statusline_script()
+        print(f"statusline     : {script if script.is_file() else 'not written (run install)'}")
+        rec = paths.effort_file()
+        print(f"effort state   : {'present' if rec.is_file() else 'none yet'}")
+
     if cfg.parallelization.enabled:
         min_budget = cfg.parallelization.judge_timeout_seconds + 3.0
         if cfg.matcher.budget_seconds < min_budget:
