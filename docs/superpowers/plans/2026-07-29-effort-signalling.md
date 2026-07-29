@@ -536,13 +536,17 @@ git commit -m "feat(effort): atomic recommendation + sensor state files"
 
 **Files:**
 - Modify: `src/skill_advisor/judge.py:27-43` (template), `src/skill_advisor/judge.py:57-133` (parse + return)
-- Test: `tests/test_judge.py`
+- Modify: `src/skill_advisor/matcher.py:22-76,118-119` (`StatelessResult`, `pick_stateless`, `_default_picks`)
+- Modify: `src/skill_advisor/cli.py:552-560` (`_cmd_match`)
+- Test: `tests/test_judge.py`, `tests/test_matcher.py`, `tests/test_match_cli.py`
 
 **Interfaces:**
 - Consumes: Task 2's `RECOMMENDABLE`.
-- Produces: `judge.JudgeResult` frozen dataclass with `picks: list[Pick]` and `effort: str | None`. `judge.rank()` returns `JudgeResult | None` instead of `list[Pick] | None`.
+- Produces:
+  - `judge.JudgeResult` frozen dataclass with `picks: list[Pick]` and `effort: str | None`. `judge.rank()` returns `JudgeResult | None` instead of `list[Pick] | None`.
+  - `matcher.StatelessResult` frozen dataclass with `picks: list[ResolvedPick]` and `judge_effort: str | None`. `matcher.pick_stateless()` returns it instead of a bare list.
 
-**Why a new return type:** `matcher.pick_stateless()` at `matcher.py:60` does `raw = judge.rank(...)` then `for p in raw[:k_picks]`. Changing the return type is a breaking change to that call site, updated in this task.
+**Why two new return types:** `matcher.pick_stateless()` at `matcher.py:60` does `raw = judge.rank(...)` then `for p in raw[:k_picks]`, so changing the judge's return type breaks that call site. And Task 8 needs the judge's effort verdict at `matcher.pick()`, two frames up. Both are solved the same way — by returning the value explicitly rather than stashing it in module state. `_cmd_match` and `_default_picks` are the only other consumers.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -688,31 +692,100 @@ Rewrite `_parse_judge_reply`'s body from `judge.py:113` onward:
     return JudgeResult(picks=picks, effort=parsed_effort)
 ```
 
-Update the one call site in `src/skill_advisor/matcher.py:60-69`:
+The judge's verdict has to reach `matcher.pick()` in Task 8. Return it
+**explicitly** — never via module-level mutable state. Add the result type beside
+`PickResult` in `src/skill_advisor/matcher.py:22`:
 
 ```python
+@dataclass(frozen=True)
+class StatelessResult:
+    picks: list[ResolvedPick]
+    judge_effort: str | None = None
+```
+
+Change `pick_stateless()` (`matcher.py:28-37`) to `-> StatelessResult` and wrap
+each of its three returns:
+
+```python
+    idx = index if index is not None else _load_index()
+    if idx is None:
+        return StatelessResult(picks=[])
+```
+
+```python
+    if use_judge:
+        cand_entries = [e for e, _ in ranked]
+        if not cand_entries:
+            return StatelessResult(picks=[])
         raw = judge.rank(prompt, cand_entries, cfg)
-        if raw is None or not raw.picks:
-            return []
+        if raw is None:
+            return StatelessResult(picks=[])
         by_name = {e.name: e for e in cand_entries}
         out: list[ResolvedPick] = []
         for p in raw.picks[:k_picks]:
             entry = by_name.get(p.name)
             if entry is not None:
                 out.append(ResolvedPick(entry=entry, reason=p.reason))
-        return out
+        return StatelessResult(picks=out, judge_effort=raw.effort)
+```
+
+```python
+    out: list[ResolvedPick] = []
+    for entry, score in ranked[:k_picks]:
+        if score < min_score:
+            break
+        out.append(ResolvedPick(entry=entry, reason=f"embedding match ({score:.2f})"))
+    return StatelessResult(picks=out)
+```
+
+Note the judge branch keeps `judge_effort` even when it produced no picks — a
+`skip: true` reply still carries a valid effort assessment.
+
+Update the two consumers. `_default_picks` (`matcher.py:118-119`) keeps its list
+contract for now; Task 8 widens it:
+
+```python
+def _default_picks(prompt: str, cfg: Config, idx: index_mod.Index) -> list[ResolvedPick]:
+    return pick_stateless(prompt, cfg, index=idx).picks
+```
+
+And `_cmd_match` in `src/skill_advisor/cli.py:552-560` — append `.picks` to the
+existing call:
+
+```python
+        picks = matcher.pick_stateless(
+            prompt,
+            cfg,
+            force_judge=args.judge,
+            threshold=args.threshold,
+            top_k=args.top_k,
+            candidates=args.candidates,
+            index=idx,
+        ).picks
+```
+
+Add a guard test to `tests/test_matcher.py` so a module global cannot creep in
+later:
+
+```python
+def test_judge_verdict_returned_explicitly_not_via_module_state():
+    assert not hasattr(matcher, "_LAST_JUDGE_EFFORT")
+    assert "judge_effort" in matcher.StatelessResult.__dataclass_fields__
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `uv run pytest tests/test_judge.py tests/test_matcher.py -v`
-Expected: PASS — both files, since the matcher call site changed.
+Run: `uv run pytest tests/test_judge.py tests/test_matcher.py tests/test_match_cli.py tests/test_lifecycle_config.py -v`
+Expected: PASS. All four files exercise the changed return types — `test_match_cli.py`
+covers `_cmd_match`, and `test_lifecycle_config.py:138,170` call `matcher.pick(...)`
+end-to-end.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/skill_advisor/judge.py src/skill_advisor/matcher.py tests/test_judge.py
-git commit -m "feat(judge): optional effort field in the ranking schema"
+git add src/skill_advisor/judge.py src/skill_advisor/matcher.py src/skill_advisor/cli.py \
+        tests/test_judge.py tests/test_matcher.py
+git commit -m "feat(judge): return effort explicitly via JudgeResult and StatelessResult"
 ```
 
 ---
@@ -1399,17 +1472,9 @@ Expected: FAIL with `TypeError: _emit() got an unexpected keyword argument 'syst
 
 - [ ] **Step 3: Write minimal implementation**
 
-In `src/skill_advisor/matcher.py`, extend `PickResult` (`matcher.py:22-26`):
-
-```python
-@dataclass(frozen=True)
-class PickResult:
-    picks: list[ResolvedPick]
-    state: lifecycle.LifecycleState | None  # None when not in an active lifecycle
-    effort: "effort_mod.EffortRecommendation | None" = None
-```
-
 Add `from . import effort as effort_mod` to the imports at `matcher.py:8-11`.
+`PickResult` is extended below, together with the `StatelessResult` change — do
+both in one edit.
 
 In `matcher.pick()`, compute the recommendation once before each `return PickResult(...)`. The cleanest change is to wrap the existing returns: rename the current `pick` body to `_pick_inner` and add a thin wrapper at the end of the module:
 
@@ -1429,7 +1494,7 @@ def pick(
     parallel = any(p.reason.startswith("parallelization:") for p in result.picks)
     rec = effort_mod.classify(
         phase=phase,
-        judge_effort=_LAST_JUDGE_EFFORT.get("value"),
+        judge_effort=result.judge_effort,
         parallel=parallel,
         cfg=cfg,
         prompt=prompt,
@@ -1449,24 +1514,63 @@ def _pick_inner(
 
 and delete its first line `cfg = config or load_config()` (the wrapper now owns it).
 
-Stash the judge's effort so the wrapper can reach it without a second call. Add near the top of `matcher.py`:
+Task 4 already introduced `StatelessResult` and made `pick_stateless()` return the
+judge's verdict explicitly. This task carries that verdict the rest of the way, on
+`PickResult` itself — the judge's
+effort assessment genuinely *is* part of a match result, so this is a real field,
+not a smuggling channel. `PickResult` (`matcher.py:22-26`) becomes:
 
 ```python
-# The judge runs deep inside pick_stateless(); this carries its effort verdict
-# back out to pick() without changing that function's return type.
-_LAST_JUDGE_EFFORT: dict[str, str | None] = {"value": None}
+@dataclass(frozen=True)
+class PickResult:
+    picks: list[ResolvedPick]
+    state: lifecycle.LifecycleState | None  # None when not in an active lifecycle
+    judge_effort: str | None = None          # raw verdict from the judge, if it ran
+    effort: "effort_mod.EffortRecommendation | None" = None  # resolved recommendation
 ```
 
-and in `pick_stateless()` after `raw = judge.rank(...)` (`matcher.py:60`):
+Widen `_default_picks` (narrowed to `.picks` in Task 4) so callers reach both
+halves:
 
 ```python
-        _LAST_JUDGE_EFFORT["value"] = raw.effort if raw is not None else None
+def _default_picks(prompt: str, cfg: Config, idx: index_mod.Index) -> "StatelessResult":
+    return pick_stateless(prompt, cfg, index=idx)
 ```
 
-Reset it at the top of `pick_stateless()`:
+Each of the four `_default_picks` call sites inside `_pick_inner`
+(`matcher.py:184`, `191`, `203`, `210`, `226`, `230`) uses `.picks` where it
+previously used the list, and the `PickResult(...)` it builds passes the verdict
+through. For example `matcher.py:229-231` becomes:
 
 ```python
-    _LAST_JUDGE_EFFORT["value"] = None
+    sr = _default_picks(text, cfg, idx)
+    return PickResult(picks=sr.picks, state=None, judge_effort=sr.judge_effort) if sr.picks else None
+```
+
+Apply the same shape at every other `_default_picks` site: bind the result to
+`sr`, use `sr.picks`, and pass `judge_effort=sr.judge_effort` into the
+`PickResult`. Sites that build a `PickResult` purely from `_phase_picks` (which
+never runs the judge) leave `judge_effort` at its `None` default.
+
+The `pick()` wrapper then reads it directly — no second judge call, no global:
+
+```python
+    rec = effort_mod.classify(
+        phase=phase,
+        judge_effort=result.judge_effort,
+        parallel=parallel,
+        cfg=cfg,
+        prompt=prompt,
+    )
+```
+
+Extend Task 4's guard test to cover `PickResult` too:
+
+```python
+def test_judge_verdict_returned_explicitly_not_via_module_state():
+    assert not hasattr(matcher, "_LAST_JUDGE_EFFORT")
+    assert "judge_effort" in matcher.StatelessResult.__dataclass_fields__
+    assert "judge_effort" in matcher.PickResult.__dataclass_fields__
 ```
 
 In `src/skill_advisor/hook.py`, replace `_emit` (`hook.py:47-55`):
