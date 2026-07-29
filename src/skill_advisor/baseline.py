@@ -130,3 +130,102 @@ def window() -> list[str]:
     data = _load()
     win = data.get("window", [])
     return [w for w in win if isinstance(w, str)] if isinstance(win, list) else []
+
+
+import time
+
+
+def current_written_level() -> str | None:
+    """`effortLevel` currently in claudeskill-settings.json, if any."""
+    try:
+        data = json.loads(paths.settings_file().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    level = data.get("effortLevel")
+    return level if level in effort.RECOMMENDABLE else None
+
+
+def _write_settings_effort(level: str) -> bool:
+    """Merge `effortLevel` into the settings file atomically. False on any failure."""
+    target = paths.settings_file()
+    data: dict = {}
+    if target.is_file():
+        try:
+            parsed = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            log.warning("settings unparseable; write-back aborted")
+            return False
+        if not isinstance(parsed, dict):
+            log.warning("settings not a JSON object; write-back aborted")
+            return False
+        data = parsed
+
+    data["effortLevel"] = level
+    tmp = target.with_suffix(f".json.tmp.{os.getpid()}")
+    try:
+        serialised = json.dumps(data, indent=2) + "\n"
+        json.loads(serialised)  # round-trip validation before it touches the real path
+        tmp.write_text(serialised, encoding="utf-8")
+        tmp.replace(target)
+        return True
+    except (OSError, ValueError) as exc:
+        log.warning("settings write failed: %s", exc)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return False
+
+
+def maybe_write(cfg, *, launch_level: str | None) -> str | None:
+    """Write a new baseline if the window has disagreed for long enough.
+
+    `launch_level` is the effective value this session started with — the
+    advisor's own written value if present, else the sensor's first observation.
+    Returns the level written, or None.
+    """
+    if not cfg.effort.enabled or not cfg.effort.write_back:
+        return None
+
+    data = _load()
+    if int(data.get("veto_cooldown_remaining", 0)) > 0:
+        return None
+
+    if launch_level is None:
+        # No observation ever landed — e.g. a model without reasoning-effort
+        # support. Never write a baseline on no evidence.
+        return None
+
+    need = max(int(cfg.effort.write_back_after_sessions), 1)
+    win = window()
+    if len(win) < need:
+        return None
+
+    recent = win[-need:]
+    if len(set(recent)) != 1:
+        return None  # not a sustained signal
+
+    target_level = recent[0]
+    if effort.to_persistable(target_level) != target_level:
+        return None  # never write ultracode or max
+    if target_level == launch_level:
+        return None  # already there
+
+    if not _write_settings_effort(target_level):
+        return None
+
+    data = _load()
+    history = list(data.get("history", []))
+    history.append({
+        "from": launch_level,
+        "to": target_level,
+        "sessions": need,
+        "ts": int(time.time()),
+    })
+    data["history"] = history[-50:]
+    data["announce"] = {"from": launch_level, "to": target_level, "sessions": need}
+    data["window"] = []  # consumed; start a fresh observation window
+    _save(data)
+    return target_level

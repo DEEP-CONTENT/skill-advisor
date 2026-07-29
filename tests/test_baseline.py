@@ -226,3 +226,142 @@ def test_tie_breaking_uses_insertion_order():
     baseline.record("s1", "medium")  # Now: 2 high, 2 low, 1 medium → high is modal.
     result = baseline.finalise_session("s1")
     assert result == effort.HIGH
+
+
+# ---------------------------------------------------------------------------
+# maybe_write / current_written_level: atomic, provenance-tracked write-back
+# ---------------------------------------------------------------------------
+
+import json
+
+import pytest
+
+from skill_advisor import config as config_mod
+from skill_advisor import paths
+
+
+def _cfg(**kw):
+    base = dict(enabled=True, write_back=True, write_back_after_sessions=3)
+    base.update(kw)
+    return config_mod.Config(effort=config_mod.EffortConfig(**base))
+
+
+def _fill(level, n):
+    for i in range(n):
+        for _ in range(3):
+            baseline.record(f"sess{i}", level)
+        baseline.finalise_session(f"sess{i}")
+
+
+def test_no_write_below_threshold():
+    _fill("high", 2)
+    assert baseline.maybe_write(_cfg(), launch_level="xhigh") is None
+    assert baseline.current_written_level() is None
+
+
+def test_writes_at_threshold():
+    _fill("high", 3)
+    assert baseline.maybe_write(_cfg(), launch_level="xhigh") == "high"
+    assert baseline.current_written_level() == "high"
+
+
+def test_no_write_when_window_agrees_with_launch():
+    _fill("xhigh", 5)
+    assert baseline.maybe_write(_cfg(), launch_level="xhigh") is None
+
+
+def test_write_preserves_existing_settings_keys():
+    paths.ensure_dirs()
+    paths.settings_file().write_text(
+        json.dumps({"hooks": {"UserPromptSubmit": [{"matcher": ""}]}}), encoding="utf-8"
+    )
+    _fill("low", 3)
+    baseline.maybe_write(_cfg(), launch_level="xhigh")
+    data = json.loads(paths.settings_file().read_text(encoding="utf-8"))
+    assert data["effortLevel"] == "low"
+    assert "hooks" in data  # merged, not clobbered
+
+
+def test_write_aborts_on_unparseable_settings():
+    paths.ensure_dirs()
+    paths.settings_file().write_text("not json{", encoding="utf-8")
+    _fill("low", 3)
+    assert baseline.maybe_write(_cfg(), launch_level="xhigh") is None
+    # the original file is left exactly as-is
+    assert paths.settings_file().read_text(encoding="utf-8") == "not json{"
+
+
+def test_write_records_provenance():
+    _fill("medium", 3)
+    baseline.maybe_write(_cfg(), launch_level="xhigh")
+    data = json.loads(paths.baseline_file().read_text(encoding="utf-8"))
+    entry = data["history"][-1]
+    assert entry["from"] == "xhigh"
+    assert entry["to"] == "medium"
+    assert entry["sessions"] == 3
+
+
+def test_write_disabled_by_config():
+    _fill("low", 5)
+    assert baseline.maybe_write(_cfg(write_back=False), launch_level="xhigh") is None
+
+
+def test_ultracode_is_never_written():
+    """Guard the invariant even if a bad level reaches the window."""
+    paths.ensure_dirs()
+    paths.baseline_file().write_text(
+        json.dumps({"window": ["ultracode"] * 5}), encoding="utf-8"
+    )
+    assert baseline.maybe_write(_cfg(), launch_level="high") is None
+
+
+def test_no_write_without_a_launch_observation():
+    """Model without reasoning-effort support: the whole feature stays silent.
+
+    `launch_level` is None when the sensor never saw an effort level, which is
+    exactly the case for a model that doesn't support the dial. Writing a
+    baseline there would be acting on no evidence.
+    """
+    _fill("low", 5)
+    assert baseline.maybe_write(_cfg(), launch_level=None) is None
+
+
+# ---------------------------------------------------------------------------
+# Extra coverage for the atomicity guarantee (Task 10 brief, behaviour 7):
+# these two go beyond the brief's verbatim test list because "the file is
+# unchanged" alone can pass for the wrong reason — these pin down *why*.
+# ---------------------------------------------------------------------------
+
+
+def test_write_settings_effort_cleans_up_tmp_on_replace_failure(monkeypatch):
+    """If the final rename fails, no stray temp file must survive."""
+    paths.ensure_dirs()
+    paths.settings_file().write_text(json.dumps({"marker": True}), encoding="utf-8")
+
+    from pathlib import Path
+
+    def failing_replace(self, target):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(Path, "replace", failing_replace)
+    assert baseline._write_settings_effort("high") is False
+    leftovers = list(paths.config_dir().glob("claudeskill-settings.json.tmp.*"))
+    assert leftovers == []
+    # target untouched — the failed rename never landed
+    assert json.loads(paths.settings_file().read_text(encoding="utf-8")) == {"marker": True}
+
+
+def test_write_settings_effort_aborts_before_touching_target_on_bad_serialisation(monkeypatch):
+    """The round-trip json.loads(serialised) check must fire before target is ever written."""
+    paths.ensure_dirs()
+    paths.settings_file().write_text(json.dumps({"marker": True}), encoding="utf-8")
+
+    def bad_dumps(*args, **kwargs):
+        return "{not valid json"
+
+    monkeypatch.setattr(baseline.json, "dumps", bad_dumps)
+    assert baseline._write_settings_effort("high") is False
+    # never reached tmp.write_text / tmp.replace: target is byte-for-byte original
+    assert json.loads(paths.settings_file().read_text(encoding="utf-8")) == {"marker": True}
+    leftovers = list(paths.config_dir().glob("claudeskill-settings.json.tmp.*"))
+    assert leftovers == []
