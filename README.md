@@ -668,13 +668,6 @@ veto_cooldown_sessions = 10
 ultracode_nudge = true
 ```
 
-> **Sync note:** as of this writing, `skill-advisor install` does not yet write this
-> `[effort]` block into a fresh `config.toml` — `install.py::_default_config_text()`
-> has no `[effort]` section (a separate task adds it). The seven fields, names, and
-> defaults above are read directly from `src/skill_advisor/config.py::EffortConfig`
-> and are what the advisor actually uses when you add this block by hand; they are
-> not yet what a fresh install writes for you.
-
 Environment variables override path-derived defaults (useful for tests / multi-user
 setups):
 
@@ -1792,16 +1785,9 @@ Skills copied into `~/.claude/skills/` via `sync-skills` are **not** removed by
 Remove them by name if you want to.
 
 `uninstall` deletes `claudeskill-settings.json` (dropping any `effortLevel` baseline the
-advisor had written), plus the catalog, embeddings, log, and telemetry files. **As of this
-writing it does not yet remove the effort feature's own state** —
-`~/.cache/skill-advisor/effort.json`, `observed-effort.json`, `baseline.json`, or
-`~/.config/skill-advisor/statusline.sh` — that wiring is tracked as follow-up work. Clean
-those up by hand if you want a fully clean slate:
-
-```bash
-rm -f ~/.cache/skill-advisor/{effort,observed-effort,baseline}.json \
-      ~/.config/skill-advisor/statusline.sh
-```
+advisor had written), plus the catalog, embeddings, log, and telemetry files. It also
+removes the effort feature's own state — `~/.cache/skill-advisor/effort.json`,
+`observed-effort.json`, `baseline.json`, and `~/.config/skill-advisor/statusline.sh`.
 
 ---
 
