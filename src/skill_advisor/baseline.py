@@ -148,7 +148,20 @@ def current_written_level() -> str | None:
 
 
 def _write_settings_effort(level: str) -> bool:
-    """Merge `effortLevel` into the settings file atomically. False on any failure."""
+    """Merge `effortLevel` into the settings file atomically. False on any failure.
+
+    Race note: this is a read-modify-write on `claudeskill-settings.json`, and
+    `install.render_settings()` does its own independent read-modify-write of the
+    same file. If the two interleave, the later writer silently discards the
+    earlier writer's key — e.g. this function can report success and reset
+    baseline.json's window/history believing `effortLevel` landed, while a
+    concurrent `render_settings()` clobbers it, leaving baseline.json's
+    provenance permanently out of sync with the file on disk. No lock is taken:
+    `render_settings()` only runs during an explicit `install`, `maybe_write`
+    only fires from a live-session hook, and the overlap requires running
+    install at the exact moment a Stop hook fires — judged an acceptable
+    exposure for a single-user local tool.
+    """
     target = paths.settings_file()
     data: dict = {}
     if target.is_file():
@@ -165,6 +178,7 @@ def _write_settings_effort(level: str) -> bool:
     data["effortLevel"] = level
     tmp = target.with_suffix(f".json.tmp.{os.getpid()}")
     try:
+        paths.ensure_dirs()
         serialised = json.dumps(data, indent=2) + "\n"
         json.loads(serialised)  # round-trip validation before it touches the real path
         tmp.write_text(serialised, encoding="utf-8")

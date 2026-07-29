@@ -365,3 +365,19 @@ def test_write_settings_effort_aborts_before_touching_target_on_bad_serialisatio
     assert json.loads(paths.settings_file().read_text(encoding="utf-8")) == {"marker": True}
     leftovers = list(paths.config_dir().glob("claudeskill-settings.json.tmp.*"))
     assert leftovers == []
+
+
+def test_maybe_write_survives_ensure_dirs_failure(monkeypatch):
+    """A future caller could reach _write_settings_effort before config_dir exists.
+
+    ensure_dirs() must be called INSIDE _write_settings_effort's try block so a
+    failure there degrades to a no-op (maybe_write returns None) rather than an
+    uncaught crash — matching the shape fixed for effort.write_recommendation.
+    """
+    _fill("low", 3)  # populate the window (and create config_dir) before breaking ensure_dirs
+
+    def failing_ensure_dirs():
+        raise OSError("simulated ensure_dirs failure")
+
+    monkeypatch.setattr(paths, "ensure_dirs", failing_ensure_dirs)
+    assert baseline.maybe_write(_cfg(), launch_level="xhigh") is None
