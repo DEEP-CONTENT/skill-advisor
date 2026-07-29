@@ -1647,10 +1647,43 @@ In `hook.run()`, after `picks = result.picks if result else []` (`hook.py:103`):
         if cfg.effort.nudge:
             obs_session, observed = effort.read_observed()
             if obs_session == session_id:
-                nudge = _nudge_message(observed, rec)
-                if nudge and not baseline.mark_nudged(session_id, observed, rec.level):
-                    nudge = None  # already nudged for this (observed, recommended) pair
+                candidate = _nudge_message(observed, rec)
+                # Read-only check here; the slot is CONSUMED only after a
+                # successful emit, inside _emit_nudged(). Consuming it here
+                # would burn the slot on any path that never reaches _emit
+                # (empty picks, or _emit raising), silently suppressing the
+                # nudge for the rest of the session without ever showing it.
+                if candidate and not baseline.was_nudged(session_id, observed, rec.level):
+                    nudge = candidate
 ```
+
+and add the emission helper, which is the single place consumption happens:
+
+```python
+def _emit_nudged(
+    text: str,
+    *,
+    nudge: str | None,
+    session_id: str | None,
+    observed: str | None,
+    level: str | None,
+) -> None:
+    """Emit the envelope, then consume the nudge slot only once the emit happened.
+
+    Consumption is tied to this one emission point rather than to any caller's
+    branch, so any future emission site that carries a nudge stays correct by
+    calling this helper instead of re-deriving "did this reach the user".
+    """
+    _emit(text, system_message=nudge)
+    if nudge:
+        try:
+            baseline.mark_nudged(session_id, observed, level)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("nudge mark failed: %s", exc, exc_info=True)
+```
+
+`baseline.was_nudged(session_id, observed, recommended) -> bool` is the read-only
+sibling of `mark_nudged`; it calls `_load()` and never `_save()`.
 
 and change the emit call (`hook.py:109`) to:
 
@@ -2371,13 +2404,26 @@ In `run()`, prepend the announcement to any nudge so a single `systemMessage` ca
             nudge = f"{announcement}\n{nudge}" if nudge else announcement
 ```
 
-Place this immediately before the `if result is None or not result.picks:` branch, and make the no-picks branch still emit when an announcement exists:
+Place this immediately before the `if result is None or not result.picks:` branch, and make the no-picks branch still emit when an announcement exists.
+
+**This second emission site MUST route through `_emit_nudged()`, never raw `_emit()`.**
+Task 8 moved nudge-slot consumption inside `_emit_nudged` precisely so a second
+emission point stays correct for free. Calling `_emit` directly here would either
+re-nudge the same pair forever (slot never consumed) or, if you re-added a
+`mark_nudged` call by hand, reintroduce the consume-without-emitting bug Task 8
+fixed. Nothing structurally enforces this — it is a convention, so honour it.
 
 ```python
     if result is None or not result.picks:
         if nudge:
             try:
-                _emit("", system_message=nudge)
+                _emit_nudged(
+                    "",
+                    nudge=nudge,
+                    session_id=session_id,
+                    observed=observed,
+                    level=rec.level if rec else None,
+                )
             except Exception as exc:  # pragma: no cover - defensive
                 log.warning("emit failed: %s", exc, exc_info=True)
         log.debug("no picks for prompt (%.2fs)", duration)
