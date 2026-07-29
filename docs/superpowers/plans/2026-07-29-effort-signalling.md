@@ -1801,11 +1801,35 @@ def test_modal_of_a_session():
     assert baseline.finalise_session("s1") == effort.HIGH
 
 
-def test_thin_session_is_discarded():
+def test_thin_session_is_not_yet_in_the_window_but_tally_survives():
+    """Stop fires per TURN, so a 2-recommendation session is simply not ready yet.
+
+    The tally must NOT be cleared — clearing it is what made the window
+    permanently empty, since each turn contributes only one recommendation.
+    """
     baseline.record("s1", "high")
     baseline.record("s1", "high")
     assert baseline.finalise_session("s1") is None
     assert baseline.window() == []
+    baseline.record("s1", "high")            # third turn arrives
+    assert baseline.finalise_session("s1") == effort.HIGH
+    assert baseline.window() == [effort.HIGH]
+
+
+def test_long_session_contributes_exactly_one_window_entry():
+    """A session finalised on every turn must not flood the window."""
+    for _ in range(9):
+        baseline.record("s1", "high")
+        baseline.finalise_session("s1")
+    assert baseline.window() == [effort.HIGH]
+
+
+def test_distinct_sessions_each_get_an_entry():
+    for sid, lvl in (("a", "high"), ("b", "low")):
+        for _ in range(3):
+            baseline.record(sid, lvl)
+            baseline.finalise_session(sid)
+    assert baseline.window() == [effort.HIGH, effort.LOW]
 
 
 def test_finalise_appends_to_window_and_clears_tally():
@@ -1877,35 +1901,71 @@ def record(session_id: str, level: str) -> None:
 
 
 def finalise_session(session_id: str) -> str | None:
-    """Collapse a session's tally to its modal level and append to the window."""
+    """Upsert this session's modal level into the rolling window.
+
+    CRITICAL: the Stop hook fires once per TURN, not once per session, so this
+    runs repeatedly for the same session as it grows. Two consequences:
+
+      * The tally is NOT consumed. Clearing it would mean a single-recommendation
+        turn is discarded for being under _MIN_RECOMMENDATIONS and the tally can
+        never accumulate — which made the whole write-back unreachable.
+      * The window entry is UPDATED IN PLACE, keyed by session id, so a long
+        session contributes exactly one entry no matter how many turns it runs.
+        `write_back_after_sessions` therefore genuinely means sessions.
+
+    Returns the persistable modal level once the session has at least
+    _MIN_RECOMMENDATIONS recommendations, else None.
+    """
     data = _load()
     tallies = data.get("tallies", {})
-    levels = tallies.pop(session_id, [])
-    if len(levels) < _MIN_RECOMMENDATIONS:
-        data["tallies"] = tallies
-        _save(data)
+    if not isinstance(tallies, dict):
+        return None
+    levels = tallies.get(session_id)
+    if not isinstance(levels, list) or len(levels) < _MIN_RECOMMENDATIONS:
         return None
 
     modal = Counter(levels).most_common(1)[0][0]
     persistable = effort.to_persistable(modal)
     if persistable is None:
-        data["tallies"] = tallies
-        _save(data)
         return None
 
-    window = list(data.get("window", []))
-    window.append(persistable)
-    data["window"] = window[-_WINDOW_CAP:]
-    data["tallies"] = tallies
+    entries = _window_entries(data)
+    for entry in entries:
+        if entry.get("session") == session_id:
+            entry["level"] = persistable
+            break
+    else:
+        entries.append({"session": session_id, "level": persistable})
+    entries = entries[-_WINDOW_CAP:]
+    data["window"] = entries
+
+    # Bound growth: keep tallies only for sessions still represented in the
+    # window. Without this, `tallies` grows forever now that it is never popped.
+    live = {e["session"] for e in entries}
+    data["tallies"] = {k: v for k, v in tallies.items() if k in live}
     _save(data)
     return persistable
 
 
+def _window_entries(data: dict) -> list[dict]:
+    """Window as a list of {"session", "level"} dicts, tolerating corruption."""
+    raw = data.get("window", [])
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for e in raw:
+        if isinstance(e, dict) and isinstance(e.get("session"), str) and e.get("level") in effort.RECOMMENDABLE:
+            out.append({"session": e["session"], "level": e["level"]})
+    return out
+
+
 def window() -> list[str]:
-    """Rolling window of session modals, oldest first."""
-    data = _load()
-    win = data.get("window", [])
-    return [w for w in win if isinstance(w, str)] if isinstance(win, list) else []
+    """Rolling window of per-session modal levels, oldest session first.
+
+    Projects the levels out of the {"session","level"} entries so `maybe_write`
+    keeps its existing `list[str]` contract.
+    """
+    return [e["level"] for e in _window_entries(_load())]
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
