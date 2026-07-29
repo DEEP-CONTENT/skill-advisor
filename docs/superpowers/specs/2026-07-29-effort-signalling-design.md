@@ -284,9 +284,15 @@ per-session state under `~/.cache/skill-advisor/sessions/<session_id>.json`. The
 auto-advance) and appended to a rolling window in `baseline.json`. Sessions contributing
 fewer than 3 recommendations are discarded as too thin to be meaningful.
 
-The comparison baseline is the **effective launch value**: `effortLevel` from
-`claudeskill-settings.json` if the advisor has written one, otherwise the value the session
-actually launched with as reported by the sensor's first observation. When that value has
+The comparison baseline is the session's **first observed effort level**, as recorded by
+the sensor.
+
+An earlier draft of this spec described a two-branch rule — the advisor's own written
+`effortLevel` if present, else the sensor's first observation. That was over-specified: the
+`--settings` file is what determines the level a session launches at, so the sensor's first
+observation already *is* the effective launch value and the two branches would always agree.
+Implementation correctly wired only the observation. (`baseline.current_written_level()`
+exists but has no production caller as a result.) When that value has
 differed from the session modal for `write_back_after_sessions` consecutive qualifying
 sessions, the advisor writes.
 
