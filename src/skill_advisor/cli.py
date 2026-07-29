@@ -28,7 +28,11 @@ def _cmd_install(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    settings_path = install_mod.render_settings()
+    try:
+        settings_path = install_mod.render_settings()
+    except install_mod.RenderSettingsError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     config_path = install_mod.write_default_config(force=False)
 
     print(f"settings: {settings_path}")

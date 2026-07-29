@@ -15,6 +15,16 @@ ALIAS_BEGIN = "# >>> skill-advisor alias >>>"
 ALIAS_END = "# <<< skill-advisor alias <<<"
 
 
+class RenderSettingsError(RuntimeError):
+    """`render_settings()` could not prepare or write its target settings file.
+
+    Raised instead of letting the underlying OSError propagate as a raw
+    traceback — the message names the resolved path and, when set, the
+    `SKILL_ADVISOR_SETTINGS_FILE` override responsible for it, so a typo'd or
+    permission-restricted override fails with something the user can act on.
+    """
+
+
 @dataclass(frozen=True)
 class ShellTarget:
     name: str           # "bash" | "zsh" | "fish"
@@ -126,9 +136,22 @@ def render_settings() -> Path:
     When the effort feature is enabled, also upserts a `statusLine` key pointing
     at our generated script by exact path match — any `statusLine` whose command
     is not exactly our script's path is treated as user-owned and left untouched.
+
+    Raises `RenderSettingsError` (not the raw OSError) if the settings file's
+    directory can't be prepared — most likely a typo'd or permission-restricted
+    `SKILL_ADVISOR_SETTINGS_FILE`. Deliberately not swallowed: the caller must
+    know install did not complete.
     """
-    paths.ensure_dirs()
     target = paths.settings_file()
+    try:
+        paths.ensure_dirs()
+    except OSError as exc:
+        override = os.environ.get("SKILL_ADVISOR_SETTINGS_FILE")
+        source = f"SKILL_ADVISOR_SETTINGS_FILE={override!r}" if override else "the default config directory"
+        raise RenderSettingsError(
+            f"could not prepare the directory for the settings file at {target} "
+            f"(from {source}): {exc}"
+        ) from exc
 
     data: dict = {}
     if target.is_file():

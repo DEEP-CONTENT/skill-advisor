@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from skill_advisor import config
 from skill_advisor import install as install_mod
 from skill_advisor import paths
@@ -272,14 +274,41 @@ def test_render_settings_honors_settings_file_override_for_statusline(isolated_p
 
     result = install_mod.render_settings()
 
+    # Checked FIRST and on its own: pre-fix, render_settings() ignores the
+    # override entirely and writes the default-named file instead, so this
+    # assertion alone is enough to fail red without depending on anything
+    # below it (which pre-fix would instead error out reading a file that
+    # was never created at `override`).
+    default_named_file = isolated_paths["config_home"] / "claudeskill-settings.json"
+    assert not default_named_file.exists()
+
     assert result == override
     data = json.loads(override.read_text(encoding="utf-8"))
     assert data["statusLine"]["type"] == "command"
     assert data["statusLine"]["command"].endswith("statusline.sh")
     assert "UserPromptSubmit" in data["hooks"]
 
-    default_named_file = isolated_paths["config_home"] / "claudeskill-settings.json"
-    assert not default_named_file.exists()
+
+def test_render_settings_raises_clean_error_on_unwritable_override(monkeypatch, tmp_path):
+    """A bad SKILL_ADVISOR_SETTINGS_FILE (typo, permission-restricted parent)
+    must fail with a message naming the path and the env var — not a raw
+    OSError traceback from the unguarded `paths.ensure_dirs()` call that
+    now also has to create this override's parent directory.
+    """
+    readonly_root = tmp_path / "readonly"
+    readonly_root.mkdir()
+    readonly_root.chmod(0o500)  # r-x: mkdir of a child directory fails (EACCES)
+    override = readonly_root / "nested" / "claudew-settings.json"
+    monkeypatch.setenv("SKILL_ADVISOR_SETTINGS_FILE", str(override))
+
+    try:
+        with pytest.raises(install_mod.RenderSettingsError) as excinfo:
+            install_mod.render_settings()
+        message = str(excinfo.value)
+        assert str(override) in message
+        assert "SKILL_ADVISOR_SETTINGS_FILE" in message
+    finally:
+        readonly_root.chmod(0o700)  # restore so tmp_path teardown can remove it
 
 
 def test_render_settings_preserves_foreign_statusline_with_embedded_suffix(isolated_paths, monkeypatch):

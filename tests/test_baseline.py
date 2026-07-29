@@ -567,13 +567,18 @@ def test_maybe_write_honors_settings_file_override(monkeypatch, tmp_path):
 
     _fill("low", 3)
     written = baseline.maybe_write(_cfg(), launch_level="xhigh")
-    assert written == "low"
 
-    data = json.loads(override.read_text(encoding="utf-8"))
-    assert data["effortLevel"] == "low"
-
+    # Checked FIRST and on its own: pre-fix, _write_settings_effort() ignores
+    # the override entirely and writes the default-named file instead, so
+    # this assertion alone is enough to fail red without depending on
+    # anything below it (which pre-fix would instead error out reading a
+    # file that was never created at `override`).
     default_named_file = paths.config_dir() / "claudeskill-settings.json"
     assert not default_named_file.exists()
+
+    assert written == "low"
+    data = json.loads(override.read_text(encoding="utf-8"))
+    assert data["effortLevel"] == "low"
 
 
 def test_maybe_write_survives_ensure_dirs_failure(monkeypatch):
