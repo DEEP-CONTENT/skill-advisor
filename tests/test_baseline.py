@@ -121,21 +121,55 @@ def test_modal_of_a_session():
     assert baseline.finalise_session("s1") == effort.HIGH
 
 
-def test_thin_session_is_discarded():
+def test_thin_session_is_not_yet_in_the_window_but_tally_survives():
+    """Stop fires per TURN, so a 2-recommendation session is simply not ready yet.
+
+    The tally must NOT be cleared — clearing it is what made the window
+    permanently empty, since each turn contributes only one recommendation.
+    """
     baseline.record("s1", "high")
     baseline.record("s1", "high")
     assert baseline.finalise_session("s1") is None
     assert baseline.window() == []
+    baseline.record("s1", "high")  # third turn arrives
+    assert baseline.finalise_session("s1") == effort.HIGH
+    assert baseline.window() == [effort.HIGH]
 
 
-def test_finalise_appends_to_window_and_clears_tally():
-    for lvl in ("low", "low", "low"):
-        baseline.record("s1", lvl)
-    baseline.finalise_session("s1")
-    assert baseline.window() == [effort.LOW]
-    # tally cleared — re-finalising the same session must not double-count
-    assert baseline.finalise_session("s1") is None
-    assert baseline.window() == [effort.LOW]
+def test_long_session_contributes_exactly_one_window_entry():
+    """A session finalised on every turn must not flood the window."""
+    for _ in range(9):
+        baseline.record("s1", "high")
+        baseline.finalise_session("s1")
+    assert baseline.window() == [effort.HIGH]
+
+
+def test_distinct_sessions_each_get_an_entry():
+    for sid, lvl in (("a", "high"), ("b", "low")):
+        for _ in range(3):
+            baseline.record(sid, lvl)
+            baseline.finalise_session(sid)
+    assert baseline.window() == [effort.HIGH, effort.LOW]
+
+
+def test_thin_session_tally_accumulates_across_finalise_calls():
+    """Inverts the old (buggy) 'must not leak data to subsequent finalise calls'
+    premise: because finalise_session no longer clears the tally, two
+    below-threshold batches for the same session must ACCUMULATE into one
+    tally rather than reset between calls — that accumulation is exactly what
+    makes write-back reachable when Stop fires once per turn.
+    """
+    baseline.record("s1", "high")
+    baseline.record("s1", "high")
+    assert baseline.finalise_session("s1") is None  # 2 < 3, still thin
+    baseline.record("s1", "low")
+    baseline.record("s1", "low")
+    # Now 4 total (2 high + 2 low), no longer thin — and critically, this only
+    # works because the first two records survived the earlier None-returning
+    # call instead of being popped.
+    result = baseline.finalise_session("s1")
+    assert result is not None
+    assert baseline.window() == [result]
 
 
 def test_ultracode_contributes_xhigh_to_the_window():
@@ -187,28 +221,19 @@ def test_record_tolerates_malformed_tallies():
 
 
 def test_finalise_tolerates_malformed_tallies():
-    """A corrupted 'tallies' value (not a dict) must not raise on finalise."""
+    """A corrupted 'tallies' value (not a dict) must not raise on finalise.
+
+    finalise_session no longer owns healing malformed tallies — since it no
+    longer consumes/clears the tally on the happy path, it also does not
+    write on this read-only "nothing to finalise" path. Healing malformed
+    tallies is `record()`'s job (see test_record_tolerates_malformed_tallies).
+    """
     paths.ensure_dirs()
     paths.baseline_file().write_text(json.dumps({"tallies": ["list", "not", "dict"]}), encoding="utf-8")
-    # finalise_session must not crash; it should reset tallies and return None (no session to finalize).
     assert baseline.finalise_session("s1") is None
-    # Verify tallies was reset to an empty dict in the file.
+    # File is left exactly as-is — finalise_session never wrote on this path.
     data = json.loads(paths.baseline_file().read_text(encoding="utf-8"))
-    assert data["tallies"] == {}
-
-
-def test_thin_session_clears_tally_across_calls():
-    """A thin session (< 3 recommendations) must not leak data to subsequent finalise calls."""
-    # First thin session.
-    baseline.record("s1", "high")
-    baseline.record("s1", "high")
-    assert baseline.finalise_session("s1") is None
-    # Record two more times for the same session (simulating a new attempt).
-    baseline.record("s1", "low")
-    baseline.record("s1", "low")
-    # Still thin — must return None and not have accumulated the first two records.
-    assert baseline.finalise_session("s1") is None
-    assert baseline.window() == []
+    assert data["tallies"] == ["list", "not", "dict"]
 
 
 def test_tie_breaking_uses_insertion_order():
@@ -307,10 +332,17 @@ def test_write_disabled_by_config():
 
 
 def test_ultracode_is_never_written():
-    """Guard the invariant even if a bad level reaches the window."""
+    """Guard the invariant even if a bad level reaches the window.
+
+    Window entries are {"session","level"} dicts (Task 12 fix-round-1), not
+    bare strings — writing bare strings here would make `_window_entries`
+    filter every entry out as malformed, and the assertion below would then
+    pass for the wrong reason (empty window, not the ultracode guard).
+    """
     paths.ensure_dirs()
     paths.baseline_file().write_text(
-        json.dumps({"window": ["ultracode"] * 5}), encoding="utf-8"
+        json.dumps({"window": [{"session": f"s{i}", "level": "ultracode"} for i in range(5)]}),
+        encoding="utf-8",
     )
     assert baseline.maybe_write(_cfg(), launch_level="high") is None
 
@@ -324,6 +356,32 @@ def test_no_write_without_a_launch_observation():
     """
     _fill("low", 5)
     assert baseline.maybe_write(_cfg(), launch_level=None) is None
+
+
+def test_end_to_end_production_turn_sequence_reaches_write_back():
+    """The regression this whole fix-round exists for: the Stop hook fires once
+    per TURN, not once per session. Simulate the real interleaving — record()
+    then finalise_session() after EVERY turn, across enough sessions to cross
+    write_back_after_sessions — and prove maybe_write actually writes.
+
+    Before this fix, finalise_session() popped/cleared the tally on every
+    call, so with only one record() per turn the tally could never reach
+    _MIN_RECOMMENDATIONS and window() stayed [] forever; this is the exact
+    sequence that exposed that (390 passing tests never caught it because
+    every one of them called record() N times then finalise_session() ONCE,
+    which is not the order the hooks actually emit).
+    """
+    for session_num in range(3):
+        session_id = f"prod-sess{session_num}"
+        for _turn in range(5):
+            # One prompt => one record(); one Stop => one finalise_session().
+            baseline.record(session_id, "high")
+            baseline.finalise_session(session_id)
+    assert baseline.window() == [effort.HIGH, effort.HIGH, effort.HIGH]
+
+    written = baseline.maybe_write(_cfg(), launch_level="xhigh")
+    assert written == effort.HIGH
+    assert baseline.current_written_level() == effort.HIGH
 
 
 # ---------------------------------------------------------------------------
@@ -437,10 +495,14 @@ def test_note_observation_tolerates_malformed_first_observation():
     """
     _fill("low", 5)  # accumulated evidence that must survive
     paths.ensure_dirs()
-    paths.baseline_file().write_text(
-        json.dumps({"first_observations": {"s1": 123}, "window": baseline.window()}),
-        encoding="utf-8",
-    )
+    # Merge the malformed first_observations value into the real baseline.json
+    # rather than reserialising baseline.window() — window() now returns the
+    # projected list[str] form, which is not the on-disk {"session","level"}
+    # entry shape; round-tripping it back into "window" would silently drop
+    # every entry as malformed and defeat the "must survive" assertion below.
+    data = json.loads(paths.baseline_file().read_text(encoding="utf-8"))
+    data["first_observations"] = {"s1": 123}
+    paths.baseline_file().write_text(json.dumps(data), encoding="utf-8")
     assert baseline.note_observation("s1", "xhigh", _cfg()) is False
     data = json.loads(paths.baseline_file().read_text(encoding="utf-8"))
     assert data.get("veto_cooldown_remaining", 0) == 0
