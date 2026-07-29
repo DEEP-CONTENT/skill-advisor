@@ -1784,7 +1784,7 @@ git commit -m "feat(hook): write effort state and emit a rate-limited nudge"
 - Consumes: Task 2 constants and `to_persistable`, Task 8's `_load`/`_save`.
 - Produces:
   - `baseline.record(session_id: str, level: str) -> None` — append one recommendation to the session's tally.
-  - `baseline.finalise_session(session_id: str) -> str | None` — compute the modal level, append to the rolling window, clear the tally. Returns the modal level, or `None` when the session had fewer than `_MIN_RECOMMENDATIONS` (3).
+  - `baseline.finalise_session(session_id: str) -> str | None` — compute the modal level and UPSERT it into the rolling window keyed by session id. Does NOT consume the tally: the Stop hook fires once per turn, so this runs repeatedly for a growing session and clearing would stop the tally ever reaching `_MIN_RECOMMENDATIONS` (3). Returns the modal level, or `None` while the session is still below that threshold.
   - `baseline.window() -> list[str]` — the rolling window of session modals, oldest first.
 
 - [ ] **Step 1: Write the failing test**
@@ -1832,13 +1832,15 @@ def test_distinct_sessions_each_get_an_entry():
     assert baseline.window() == [effort.HIGH, effort.LOW]
 
 
-def test_finalise_appends_to_window_and_clears_tally():
+def test_finalise_upserts_and_leaves_the_tally_intact():
     for lvl in ("low", "low", "low"):
         baseline.record("s1", lvl)
     baseline.finalise_session("s1")
     assert baseline.window() == [effort.LOW]
-    # tally cleared — re-finalising the same session must not double-count
-    assert baseline.finalise_session("s1") is None
+    # Re-finalising the SAME session updates in place rather than appending,
+    # and the tally survives so later turns keep refining the modal.
+    baseline.record("s1", "low")
+    assert baseline.finalise_session("s1") == effort.LOW
     assert baseline.window() == [effort.LOW]
 
 
