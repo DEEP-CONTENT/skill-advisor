@@ -1880,6 +1880,7 @@ from . import effort
 
 _MIN_RECOMMENDATIONS = 3
 _WINDOW_CAP = 30
+_TALLY_CAP = 50
 ```
 
 Then append:
@@ -1939,10 +1940,14 @@ def finalise_session(session_id: str) -> str | None:
     entries = entries[-_WINDOW_CAP:]
     data["window"] = entries
 
-    # Bound growth: keep tallies only for sessions still represented in the
-    # window. Without this, `tallies` grows forever now that it is never popped.
-    live = {e["session"] for e in entries}
-    data["tallies"] = {k: v for k, v in tallies.items() if k in live}
+    # Bound growth by RECENCY, never by window membership. A thin session is
+    # absent from the window precisely because it is still accumulating, so
+    # pruning on membership deletes exactly the tallies that matter — two
+    # concurrent sessions would starve each other permanently.
+    if len(tallies) > _TALLY_CAP:
+        for stale in list(tallies)[: len(tallies) - _TALLY_CAP]:
+            del tallies[stale]
+    data["tallies"] = tallies
     _save(data)
     return persistable
 
