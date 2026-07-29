@@ -402,7 +402,9 @@ Catalog refresh and skill rotation is a **separate spec**. It is not blocked by 
 but it carries a known defect worth recording here so it is not lost:
 
 `catalog.py` scans `SKILL.md` from disk and never reads `skillOverrides` from
-`settings.json`. Measured against the live event log (8,403 events) and live settings:
+`settings.json`. Measured 2026-07-29 against `advisor.events.jsonl` (8,403 events at the
+time of measurement — the log is append-only and live, so re-running this will give larger
+absolute counts) and the then-current `skillOverrides`:
 
 ```
 skill picks total:                      3,955
