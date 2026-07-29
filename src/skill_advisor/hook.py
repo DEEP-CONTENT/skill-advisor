@@ -347,7 +347,7 @@ def run_stop() -> int:
     if cfg.effort.enabled:
         try:
             baseline.finalise_session(session_id)
-            baseline.decrement_cooldown()
+            baseline.decrement_cooldown(session_id)
             baseline.maybe_write(cfg, launch_level=baseline.first_observation(session_id))
         except Exception as exc:  # pragma: no cover - defensive
             log.debug("baseline finalise failed: %s", exc, exc_info=True)

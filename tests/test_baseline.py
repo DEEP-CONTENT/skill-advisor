@@ -458,6 +458,59 @@ def test_end_to_end_production_turn_sequence_reaches_write_back():
     assert baseline.current_written_level() == effort.HIGH
 
 
+def test_maybe_write_does_not_rewrite_or_reannounce_across_a_second_production_batch():
+    """F2: maybe_write compared target_level only against launch_level (the
+    session's first observation), never against what is actually on disk. A
+    session's first_observation never changes just because a write landed, so
+    every subsequent Stop that re-accumulated the SAME target level in the
+    window re-passed that comparison and wrote (and announced) it again.
+
+    Drives the real production interleave twice in a row — record() then
+    finalise_session() then maybe_write() every turn, exactly what
+    hook.run_stop() does — with a FIXED launch_level throughout (as it is in
+    production: hook.py computes it once from first_observation()). The
+    second batch re-accumulates the identical 'low' target; a correct
+    implementation must not write or announce it twice.
+    """
+    cfg = _cfg()
+    launch_level = "xhigh"
+    writes: list[str] = []
+    announcements: list[str] = []
+    for batch in range(2):
+        for session_num in range(3):
+            session_id = f"batch{batch}-sess{session_num}"
+            for _turn in range(3):
+                baseline.record(session_id, "low")
+                baseline.finalise_session(session_id)
+                result = baseline.maybe_write(cfg, launch_level=launch_level)
+                if result is not None:
+                    writes.append(result)
+                ann = baseline.take_announcement()
+                if ann is not None:
+                    announcements.append(ann)
+
+    assert writes == ["low"]
+    assert len(announcements) == 1
+    assert baseline.current_written_level() == "low"
+
+
+def test_maybe_write_refuses_to_rewrite_the_value_already_on_disk():
+    """Narrower pin of the same guard: even though target_level ('low') still
+    differs from launch_level ('xhigh', the session's first observation,
+    unchanged by a write), a second write of the identical value must be
+    refused once 'low' is already what current_written_level() reads back
+    from claudeskill-settings.json — and no second announcement is queued.
+    """
+    _fill("low", 3)
+    assert baseline.maybe_write(_cfg(), launch_level="xhigh") == "low"
+    assert baseline.current_written_level() == "low"
+    assert baseline.take_announcement() is not None
+
+    _fill("low", 3)  # window re-accumulates the same target after the reset
+    assert baseline.maybe_write(_cfg(), launch_level="xhigh") is None
+    assert baseline.take_announcement() is None
+
+
 # ---------------------------------------------------------------------------
 # Extra coverage for the atomicity guarantee (Task 10 brief, behaviour 7):
 # these two go beyond the brief's verbatim test list because "the file is
@@ -545,11 +598,44 @@ def test_veto_blocks_write_back_for_the_cooldown():
     assert baseline.maybe_write(cfg, launch_level="xhigh") is None
 
 
-def test_cooldown_decrements_and_expires():
-    cfg = _cfg(veto_cooldown_sessions=1)
+def test_veto_cooldown_survives_a_multi_turn_session():
+    """F1: the Stop hook fires once per TURN, not once per session. An
+    N-session cooldown must not drain within a single session no matter how
+    many Stop events (turns) that session produces — only a session BOUNDARY
+    (a differing session_id at the next Stop) may consume a unit.
+
+    Before the fix, decrement_cooldown() ticked on every call regardless of
+    session, so N turns of the SAME session fully drained an N-session
+    cooldown — and with veto_cooldown_sessions=1, the very Stop of the turn
+    that detected the veto drained it to zero, giving no protection at all.
+    Here N+5 turns of one session must still leave the cooldown blocking.
+    """
+    n = 3
+    cfg = _cfg(veto_cooldown_sessions=n)
     baseline.note_observation("s1", "xhigh", cfg)
-    baseline.note_observation("s1", "medium", cfg)  # veto → cooldown 1
-    baseline.decrement_cooldown()
+    baseline.note_observation("s1", "medium", cfg)  # veto → cooldown armed at n, by s1
+    for _turn in range(n + 5):  # far more Stop events than the cooldown count
+        baseline.decrement_cooldown("s1")
+    _fill("low", 3)
+    assert baseline.maybe_write(cfg, launch_level="xhigh") is None  # still blocked
+
+
+def test_veto_cooldown_is_consumed_by_session_boundaries_and_expires():
+    """Complements the survival test above: the cooldown must still actually
+    count down — just by distinct sessions, not by turns. The arming session
+    itself (s1, where the veto was detected) must not count; only genuinely
+    different session ids at subsequent Stop events consume a unit, and
+    repeated turns within one of those later sessions must not double-count.
+    """
+    n = 2
+    cfg = _cfg(veto_cooldown_sessions=n)
+    baseline.note_observation("s1", "xhigh", cfg)
+    baseline.note_observation("s1", "medium", cfg)  # veto → cooldown armed at n=2, by s1
+    baseline.decrement_cooldown("s1")  # arming session itself — no-op
+    baseline.decrement_cooldown("s1")  # still s1 — no-op
+    baseline.decrement_cooldown("s2")  # session boundary #1 → cooldown 1
+    baseline.decrement_cooldown("s2")  # still s2 (another turn) — no-op
+    baseline.decrement_cooldown("s3")  # session boundary #2 → cooldown 0
     _fill("low", 3)
     assert baseline.maybe_write(cfg, launch_level="xhigh") == "low"
 
@@ -597,9 +683,17 @@ def test_note_observation_ignores_empty_session_id():
 
 def test_decrement_cooldown_floors_at_zero():
     baseline._save({"veto_cooldown_remaining": 0})
-    baseline.decrement_cooldown()
+    baseline.decrement_cooldown("s1")
     data = json.loads(paths.baseline_file().read_text(encoding="utf-8"))
     assert data["veto_cooldown_remaining"] == 0
+
+
+def test_decrement_cooldown_tolerates_empty_session_id():
+    baseline._save({"veto_cooldown_remaining": 3})
+    baseline.decrement_cooldown("")
+    baseline.decrement_cooldown(None)
+    data = json.loads(paths.baseline_file().read_text(encoding="utf-8"))
+    assert data["veto_cooldown_remaining"] == 3
 
 
 # ---------------------------------------------------------------------------

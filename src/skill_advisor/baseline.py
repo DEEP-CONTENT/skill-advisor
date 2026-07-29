@@ -288,6 +288,14 @@ def maybe_write(cfg, *, launch_level: str | None) -> str | None:
         return None  # never write ultracode or max
     if target_level == launch_level:
         return None  # already there
+    if target_level == current_written_level():
+        # F2: launch_level is the session's FIRST observation and never
+        # changes after a write lands, so comparing against it alone lets a
+        # sustained window re-trigger the identical write (and re-announce)
+        # on every later turn. current_written_level() reads what is
+        # actually on disk right now, which a write updates — the two
+        # guards serve different purposes and both must hold.
+        return None  # already written; avoid rewrite + re-announce
 
     if not _write_settings_effort(target_level):
         return None
@@ -344,21 +352,41 @@ def note_observation(session_id: str, level: str, cfg) -> bool:
         return False
 
     # Veto: reset the window so post-override evidence starts fresh, and hold
-    # off write-back for the cooldown.
+    # off write-back for the cooldown. `veto_cooldown_last_session` records the
+    # session that ARMED the cooldown, so `decrement_cooldown` never charges
+    # this same session against its own cooldown (see there for why).
     data["veto_cooldown_remaining"] = max(int(cfg.effort.veto_cooldown_sessions), 0)
+    data["veto_cooldown_last_session"] = session_id
     data["window"] = []
     _save(data)
     log.info("effort veto: session %s moved %s → %s", session_id, previous, level)
     return True
 
 
-def decrement_cooldown() -> None:
-    """Tick the veto cooldown down by one session."""
+def decrement_cooldown(session_id: str) -> None:
+    """Tick the veto cooldown down by one SESSION, not one turn.
+
+    The Stop hook fires once per turn, so naively decrementing on every call
+    drains an N-session cooldown in N turns of a single session — with
+    veto_cooldown_sessions=1, the very Stop of the turn that armed the
+    cooldown would drain it to zero, giving no protection at all (F1).
+
+    Track the session id that last consumed a unit (`veto_cooldown_last_session`,
+    seeded to the arming session by `note_observation`) and only decrement
+    again once a DIFFERENT session id shows up — i.e. once per session
+    boundary. Repeated Stop events (turns) within the same session, including
+    the arming session itself, are no-ops.
+    """
+    if not session_id:
+        return
     data = _load()
     remaining = int(data.get("veto_cooldown_remaining", 0))
     if remaining <= 0:
         return
+    if data.get("veto_cooldown_last_session") == session_id:
+        return  # same session already charged (or is the arming session)
     data["veto_cooldown_remaining"] = remaining - 1
+    data["veto_cooldown_last_session"] = session_id
     _save(data)
 
 

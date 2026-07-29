@@ -376,12 +376,12 @@ def test_stop_finalises_session_and_may_write(monkeypatch, isolated_paths):
 
     calls = []
     monkeypatch.setattr(baseline, "finalise_session", lambda s: calls.append(("final", s)))
-    monkeypatch.setattr(baseline, "decrement_cooldown", lambda: calls.append(("dec",)))
+    monkeypatch.setattr(baseline, "decrement_cooldown", lambda s: calls.append(("dec", s)))
     monkeypatch.setattr(baseline, "maybe_write", lambda cfg, launch_level: calls.append(("write",)))
     monkeypatch.setattr("sys.stdin", io.StringIO('{"session_id":"s1"}'))
     hook.run_stop()
     assert ("final", "s1") in calls
-    assert ("dec",) in calls
+    assert ("dec", "s1") in calls
     assert ("write",) in calls
 
 
