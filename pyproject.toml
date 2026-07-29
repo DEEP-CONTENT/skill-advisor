@@ -1,6 +1,6 @@
 [project]
 name = "skill-advisor"
-version = "0.1.0"
+version = "0.3.0"
 description = "Silent UserPromptSubmit-hook advisor that picks the best Claude Code skill, subagent, or command for every prompt."
 readme = "README.md"
 authors = [
