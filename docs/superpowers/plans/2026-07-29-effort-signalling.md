@@ -2256,7 +2256,11 @@ def note_observation(session_id: str, level: str, cfg) -> bool:
         data["first_observations"] = firsts
 
     previous = firsts.get(session_id)
-    if previous is None:
+    # isinstance, not `is None`: a corrupted non-string value would otherwise
+    # compare unequal by type and register as a spurious veto, setting the
+    # cooldown and wiping the accumulated window. Same guard shape as
+    # record() and mark_nudged() use for their own malformed sub-dicts.
+    if not isinstance(previous, str):
         firsts[session_id] = level
         _save(data)
         return False
