@@ -25,6 +25,12 @@ class PickResult:
     state: lifecycle.LifecycleState | None  # None when not in an active lifecycle
 
 
+@dataclass(frozen=True)
+class StatelessResult:
+    picks: list[ResolvedPick]
+    judge_effort: str | None = None
+
+
 def pick_stateless(
     prompt: str,
     cfg: Config,
@@ -34,7 +40,7 @@ def pick_stateless(
     top_k: int | None = None,
     candidates: int | None = None,
     index: index_mod.Index | None = None,
-) -> list[ResolvedPick]:
+) -> StatelessResult:
     """Match a prompt against the catalog without consulting lifecycle state.
 
     Shared between `matcher.pick()` (hot path) and `skill-advisor match` (CLI).
@@ -42,7 +48,7 @@ def pick_stateless(
     """
     idx = index if index is not None else _load_index()
     if idx is None:
-        return []
+        return StatelessResult(picks=[])
 
     use_judge = cfg.matcher.use_judge if force_judge is None else force_judge
     k_picks = cfg.matcher.max_picks if top_k is None else top_k
@@ -56,24 +62,24 @@ def pick_stateless(
     if use_judge:
         cand_entries = [e for e, _ in ranked]
         if not cand_entries:
-            return []
+            return StatelessResult(picks=[])
         raw = judge.rank(prompt, cand_entries, cfg)
-        if not raw:
-            return []
+        if raw is None:
+            return StatelessResult(picks=[])
         by_name = {e.name: e for e in cand_entries}
         out: list[ResolvedPick] = []
-        for p in raw[:k_picks]:
+        for p in raw.picks[:k_picks]:
             entry = by_name.get(p.name)
             if entry is not None:
                 out.append(ResolvedPick(entry=entry, reason=p.reason))
-        return out
+        return StatelessResult(picks=out, judge_effort=raw.effort)
 
     out: list[ResolvedPick] = []
     for entry, score in ranked[:k_picks]:
         if score < min_score:
             break
         out.append(ResolvedPick(entry=entry, reason=f"embedding match ({score:.2f})"))
-    return out
+    return StatelessResult(picks=out)
 
 
 def _parallelization_picks(
@@ -116,7 +122,7 @@ def _phase_picks(phase: str, catalog: list[CatalogEntry], cfg: Config) -> list[R
 
 
 def _default_picks(prompt: str, cfg: Config, idx: index_mod.Index) -> list[ResolvedPick]:
-    return pick_stateless(prompt, cfg, index=idx)
+    return pick_stateless(prompt, cfg, index=idx).picks
 
 
 def _load_index() -> index_mod.Index | None:

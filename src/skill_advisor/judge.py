@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 from .catalog import CatalogEntry
 from .config import Config
+from . import effort as effort_mod
 
 log = logging.getLogger(__name__)
 
@@ -24,14 +25,21 @@ class Pick:
     reason: str
 
 
+@dataclass(frozen=True)
+class JudgeResult:
+    picks: list[Pick]
+    effort: str | None = None
+
+
 _JUDGE_TEMPLATE = """You are a skill router for Claude Code. Given the user's message and a candidate list, pick 0-3 catalog entries that best apply. Return ONLY JSON matching this schema (no prose, no code fences):
 
-{{"picks": [{{"name": "<exact catalog name>", "reason": "<<=12 words>"}}], "skip": <bool>}}
+{{"picks": [{{"name": "<exact catalog name>", "reason": "<<=12 words>"}}], "skip": <bool>, "effort": "<low|medium|high|xhigh|ultracode>"}}
 
 Rules:
 - Use exact names from the candidate list. Do not invent or rename.
 - If nothing is a strong fit, return {{"picks": [], "skip": true}}.
 - Prefer skills over subagents when both match; prefer subagents for heavy exploration/planning work.
+- `effort` is how much reasoning depth this task warrants: `low` for trivial edits and lookups, `medium` for routine changes, `high` for multi-file work, `xhigh` for design or debugging that needs sustained reasoning, `ultracode` only when the task decomposes into several independent sub-tasks that could run in parallel.
 
 User message:
 <<<
@@ -54,7 +62,9 @@ def _render_candidates(candidates: list[CatalogEntry]) -> str:
     return "\n".join(lines)
 
 
-def rank(prompt: str, candidates: list[CatalogEntry], config: Config, timeout: float | None = None) -> list[Pick] | None:
+def rank(
+    prompt: str, candidates: list[CatalogEntry], config: Config, timeout: float | None = None
+) -> JudgeResult | None:
     if not candidates:
         return None
     if shutil.which("claude") is None:
@@ -90,7 +100,7 @@ def rank(prompt: str, candidates: list[CatalogEntry], config: Config, timeout: f
     return _parse_judge_reply(completed.stdout, candidates)
 
 
-def _parse_judge_reply(stdout: str, candidates: list[CatalogEntry]) -> list[Pick] | None:
+def _parse_judge_reply(stdout: str, candidates: list[CatalogEntry]) -> JudgeResult | None:
     stdout = stdout.strip()
     if not stdout:
         return None
@@ -113,9 +123,15 @@ def _parse_judge_reply(stdout: str, candidates: list[CatalogEntry]) -> list[Pick
     picks_raw = inner.get("picks")
     if not isinstance(picks_raw, list):
         return None
+
+    raw_effort = inner.get("effort")
+    parsed_effort = raw_effort if raw_effort in effort_mod.RECOMMENDABLE else None
+    if raw_effort is not None and parsed_effort is None:
+        log.info("rejected out-of-enum effort: %r", raw_effort)
+
     skip = bool(inner.get("skip", False))
     if skip and not picks_raw:
-        return []
+        return JudgeResult(picks=[], effort=parsed_effort)
 
     valid_names = {e.name for e in candidates}
     picks: list[Pick] = []
@@ -130,7 +146,7 @@ def _parse_judge_reply(stdout: str, candidates: list[CatalogEntry]) -> list[Pick
             log.info("rejected hallucinated pick: %r", name)
             continue
         picks.append(Pick(name=name.strip(), reason=reason.strip()))
-    return picks
+    return JudgeResult(picks=picks, effort=parsed_effort)
 
 
 def _extract_json_object(text: str) -> dict | None:

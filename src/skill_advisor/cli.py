@@ -557,7 +557,7 @@ def _cmd_match(args: argparse.Namespace) -> int:
             top_k=args.top_k,
             candidates=args.candidates,
             index=idx,
-        )
+        ).picks
 
     triage_skip = triage.should_skip(prompt, cfg) if args.show_triage else None
 
