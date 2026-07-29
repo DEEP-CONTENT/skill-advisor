@@ -428,3 +428,39 @@ def test_veto_resets_the_window():
     baseline.note_observation("s9", "xhigh", cfg)
     baseline.note_observation("s9", "high", cfg)  # veto
     assert baseline.window() == []
+
+
+def test_note_observation_tolerates_malformed_first_observation():
+    """A corrupted per-session value (not a string) must not be treated as a real
+    first observation — otherwise any later call reads as a spurious veto purely
+    from the type mismatch, wiping the window and burning the cooldown on garbage.
+    """
+    _fill("low", 5)  # accumulated evidence that must survive
+    paths.ensure_dirs()
+    paths.baseline_file().write_text(
+        json.dumps({"first_observations": {"s1": 123}, "window": baseline.window()}),
+        encoding="utf-8",
+    )
+    assert baseline.note_observation("s1", "xhigh", _cfg()) is False
+    data = json.loads(paths.baseline_file().read_text(encoding="utf-8"))
+    assert data.get("veto_cooldown_remaining", 0) == 0
+    assert baseline.window() == ["low"] * 5
+    # the malformed value is now healed to a real first observation
+    assert baseline.first_observation("s1") == "xhigh"
+
+
+def test_note_observation_ignores_level_not_observable():
+    assert baseline.note_observation("s1", "not-a-level", _cfg()) is False
+    assert baseline.first_observation("s1") is None
+
+
+def test_note_observation_ignores_empty_session_id():
+    assert baseline.note_observation("", "xhigh", _cfg()) is False
+    assert baseline.note_observation(None, "xhigh", _cfg()) is False
+
+
+def test_decrement_cooldown_floors_at_zero():
+    baseline._save({"veto_cooldown_remaining": 0})
+    baseline.decrement_cooldown()
+    data = json.loads(paths.baseline_file().read_text(encoding="utf-8"))
+    assert data["veto_cooldown_remaining"] == 0

@@ -270,7 +270,10 @@ def note_observation(session_id: str, level: str, cfg) -> bool:
         data["first_observations"] = firsts
 
     previous = firsts.get(session_id)
-    if previous is None:
+    if not isinstance(previous, str):
+        # None (never observed) and any malformed non-string value (corrupt
+        # baseline.json) both degrade to "no first observation yet" — never
+        # let a type mismatch alone read as a genuine veto.
         firsts[session_id] = level
         _save(data)
         return False
