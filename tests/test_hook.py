@@ -294,3 +294,86 @@ def test_posttooluse_taskcreate_missing_subject_is_silent(monkeypatch):
     turn = lifecycle.load_turn("sess-tc3")
     assert turn is not None
     assert turn.todo_write is None
+
+
+# ---------------------------------------------------------------------------
+# Effort: nudge builder + rate-limited state
+# ---------------------------------------------------------------------------
+
+import json
+
+from skill_advisor import effort, hook, paths
+
+
+def _emit_capture(capsys):
+    out = capsys.readouterr().out.strip()
+    return json.loads(out) if out else {}
+
+
+def test_emit_includes_system_message(capsys):
+    hook._emit("ctx", system_message="hello")
+    payload = _emit_capture(capsys)
+    assert payload["hookSpecificOutput"]["additionalContext"] == "ctx"
+    assert payload["systemMessage"] == "hello"
+
+
+def test_emit_omits_system_message_when_none(capsys):
+    hook._emit("ctx")
+    payload = _emit_capture(capsys)
+    assert "systemMessage" not in payload
+
+
+def test_nudge_suppressed_without_observation():
+    """First prompt of a session — the sensor has not run yet."""
+    msg = hook._nudge_message(observed=None, rec=effort.EffortRecommendation("xhigh", "r", "judge"))
+    assert msg is None
+
+
+def test_nudge_message_names_both_levels():
+    msg = hook._nudge_message(
+        observed="medium", rec=effort.EffortRecommendation("xhigh", "5 tasks", "judge")
+    )
+    assert "xhigh" in msg and "medium" in msg
+    assert "/effort xhigh" in msg
+
+
+def test_ultracode_nudge_suggests_the_keyword_not_a_slash_command():
+    msg = hook._nudge_message(
+        observed="medium",
+        rec=effort.EffortRecommendation("ultracode", "parallel tasks", "parallelization"),
+    )
+    assert "ultracode" in msg
+    assert "/effort" not in msg
+
+
+def test_nudge_suppressed_at_max():
+    msg = hook._nudge_message(
+        observed="max", rec=effort.EffortRecommendation("low", "r", "heuristic")
+    )
+    assert msg is None
+
+
+def test_nudge_rate_limited_per_level_pair():
+    """A long session must not nag on every prompt for the same disagreement."""
+    from skill_advisor import baseline
+
+    assert baseline.mark_nudged("s1", "medium", "xhigh") is True
+    assert baseline.mark_nudged("s1", "medium", "xhigh") is False
+    # a different pair is a genuinely new piece of information
+    assert baseline.mark_nudged("s1", "medium", "low") is True
+
+
+def test_nudge_bookkeeping_does_not_touch_lifecycle_state():
+    """Regression guard: writing nudge state must not refresh `updated_at`.
+
+    `hook.run_stop()` skips auto-advance when the lifecycle state was updated
+    less than a second ago. If nudge bookkeeping went through `lifecycle.save()`
+    it would bump that timestamp on every prompt and silently disable
+    auto-advance.
+    """
+    from skill_advisor import baseline, lifecycle
+
+    state = lifecycle.start("s1", "build a thing")
+    before = lifecycle.load("s1").updated_at
+    baseline.mark_nudged("s1", "medium", "xhigh")
+    assert lifecycle.load("s1").updated_at == before

@@ -374,3 +374,4 @@ def test_matcher_detector_returns_none_silently_advances(monkeypatch):
 def test_judge_verdict_returned_explicitly_not_via_module_state():
     assert not hasattr(matcher, "_LAST_JUDGE_EFFORT")
     assert "judge_effort" in matcher.StatelessResult.__dataclass_fields__
+    assert "judge_effort" in matcher.PickResult.__dataclass_fields__

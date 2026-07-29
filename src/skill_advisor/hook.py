@@ -12,7 +12,7 @@ import sys
 import time
 from typing import Any
 
-from . import inject, lifecycle, matcher, paths, telemetry, triage
+from . import baseline, effort, inject, lifecycle, matcher, paths, telemetry, triage
 from .config import load as load_config
 
 
@@ -44,14 +44,33 @@ def _read_input() -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _emit(text: str) -> None:
-    envelope = {
+def _emit(text: str, system_message: str | None = None) -> None:
+    envelope: dict[str, Any] = {
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": text,
         }
     }
+    if system_message:
+        envelope["systemMessage"] = system_message
     sys.stdout.write(json.dumps(envelope))
+
+
+def _nudge_message(observed: str | None, rec) -> str | None:
+    """One-line systemMessage, or None when we must stay quiet."""
+    if rec is None or not effort.should_nudge(observed, rec.level):
+        return None
+    if rec.level == effort.ULTRACODE:
+        # ultracode is a keyword, not a /effort argument — typing it trips the
+        # harness's own built-in badge.
+        return (
+            f"skill-advisor: this decomposes into parallel work ({rec.reason}) — "
+            f"consider the `ultracode` keyword. You're at {observed}."
+        )
+    return (
+        f"skill-advisor: this looks like {rec.level} work ({rec.reason}) — "
+        f"you're at {observed}.  /effort {rec.level}"
+    )
 
 
 def _extract_todo_titles(tool_input: dict) -> list[str]:
@@ -102,11 +121,29 @@ def run() -> int:
     phase = result.state.phase if (result and result.state) else "none"
     picks = result.picks if result else []
 
+    rec = result.effort if result else None
+    nudge = None
+    if cfg.effort.enabled and rec is not None:
+        try:
+            effort.write_recommendation(rec, session_id=session_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("effort write failed: %s", exc, exc_info=True)
+        if cfg.effort.nudge:
+            try:
+                obs_session, observed = effort.read_observed()
+                if obs_session == session_id:
+                    nudge = _nudge_message(observed, rec)
+                    if nudge and not baseline.mark_nudged(session_id, observed, rec.level):
+                        nudge = None  # already nudged for this (observed, recommended) pair
+            except Exception as exc:  # pragma: no cover - defensive
+                log.debug("nudge computation failed: %s", exc, exc_info=True)
+                nudge = None
+
     if result is None or not result.picks:
         log.debug("no picks for prompt (%.2fs)", duration)
     else:
         try:
-            _emit(inject.format(result))
+            _emit(inject.format(result), system_message=nudge)
         except Exception as exc:  # pragma: no cover - defensive
             log.warning("emit failed: %s", exc, exc_info=True)
             return 0

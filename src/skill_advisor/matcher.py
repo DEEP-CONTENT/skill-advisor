@@ -5,6 +5,7 @@ import dataclasses
 import logging
 from dataclasses import dataclass
 
+from . import effort as effort_mod
 from . import index as index_mod
 from . import judge, lifecycle, parallelization, triage
 from .catalog import CatalogEntry
@@ -23,6 +24,8 @@ class ResolvedPick:
 class PickResult:
     picks: list[ResolvedPick]
     state: lifecycle.LifecycleState | None  # None when not in an active lifecycle
+    judge_effort: str | None = None          # raw verdict from the judge, if it ran
+    effort: "effort_mod.EffortRecommendation | None" = None  # resolved recommendation
 
 
 @dataclass(frozen=True)
@@ -121,8 +124,8 @@ def _phase_picks(phase: str, catalog: list[CatalogEntry], cfg: Config) -> list[R
     ]
 
 
-def _default_picks(prompt: str, cfg: Config, idx: index_mod.Index) -> list[ResolvedPick]:
-    return pick_stateless(prompt, cfg, index=idx).picks
+def _default_picks(prompt: str, cfg: Config, idx: index_mod.Index) -> "StatelessResult":
+    return pick_stateless(prompt, cfg, index=idx)
 
 
 def _load_index() -> index_mod.Index | None:
@@ -135,18 +138,16 @@ def _load_index() -> index_mod.Index | None:
     return None
 
 
-def pick(
+def _pick_inner(
     prompt: str,
-    config: Config | None = None,
-    session_id: str | None = None,
+    cfg: Config,
+    session_id: str | None,
 ) -> PickResult | None:
     """Return picks for a prompt. None means the advisor should stay silent.
 
     When `session_id` is provided, a persistent lifecycle state machine is
     consulted: planning → implementation → review → (correction)* → complete.
     """
-    cfg = config or load_config()
-
     # Honour the master toggle: skip lifecycle bookkeeping entirely when disabled.
     state = lifecycle.load(session_id) if (session_id and cfg.lifecycle.enabled) else None
     in_lifecycle = state is not None and state.is_active()
@@ -187,15 +188,18 @@ def pick(
         if lifecycle.is_cancel_signal(text):
             lifecycle.cancel(state, note="user cancelled")
             # Route the actual prompt through the normal matcher too.
-            picks = _default_picks(text, cfg, idx)
-            return PickResult(picks=picks, state=None) if picks else None
+            sr = _default_picks(text, cfg, idx)
+            return PickResult(picks=sr.picks, state=None, judge_effort=sr.judge_effort) if sr.picks else None
 
         if lifecycle.is_complete_signal(text) and state.phase in {lifecycle.REVIEW, lifecycle.CORRECTION}:
             lifecycle.force_complete(state, note="user signalled complete")
             complete_picks = _phase_picks(lifecycle.COMPLETE, idx.catalog, cfg)
+            judge_effort = None
             if not complete_picks:
-                complete_picks = _default_picks(text, cfg, idx)
-            return PickResult(picks=complete_picks, state=state)
+                sr = _default_picks(text, cfg, idx)
+                complete_picks = sr.picks
+                judge_effort = sr.judge_effort
+            return PickResult(picks=complete_picks, state=state, judge_effort=judge_effort)
 
         if lifecycle.is_continue_signal(text):
             had_issues = False
@@ -205,16 +209,19 @@ def pick(
                 state, had_issues=had_issues, note=f"continuation: '{text[:40]}'", config=cfg.lifecycle
             )
             picks = _phase_picks(state.phase, idx.catalog, cfg)
+            judge_effort = None
             if not picks:
-                picks = _default_picks(state.original_prompt, cfg, idx)
-            return PickResult(picks=picks, state=state) if picks else None
+                sr = _default_picks(state.original_prompt, cfg, idx)
+                picks = sr.picks
+                judge_effort = sr.judge_effort
+            return PickResult(picks=picks, state=state, judge_effort=judge_effort) if picks else None
 
         # User typed a substantive prompt that's not a continuation signal →
         # treat as off-topic; silently cancel the lifecycle and route normally.
         if len(text.split()) >= 4:
             lifecycle.cancel(state, note="off-topic follow-up")
-            picks = _default_picks(text, cfg, idx)
-            return PickResult(picks=picks, state=None) if picks else None
+            sr = _default_picks(text, cfg, idx)
+            return PickResult(picks=sr.picks, state=None, judge_effort=sr.judge_effort) if sr.picks else None
 
         # Short prompt, no signal matched — stay silent, don't advance.
         return None
@@ -228,10 +235,36 @@ def pick(
     ):
         new_state = lifecycle.start(session_id, text)
         picks = _phase_picks(new_state.phase, idx.catalog, cfg)
+        judge_effort = None
         if not picks:
-            picks = _default_picks(new_state.original_prompt, cfg, idx)
-        return PickResult(picks=picks, state=new_state) if picks else None
+            sr = _default_picks(new_state.original_prompt, cfg, idx)
+            picks = sr.picks
+            judge_effort = sr.judge_effort
+        return PickResult(picks=picks, state=new_state, judge_effort=judge_effort) if picks else None
 
     # -------- Default: stateless matcher --------
-    picks = _default_picks(text, cfg, idx)
-    return PickResult(picks=picks, state=None) if picks else None
+    sr = _default_picks(text, cfg, idx)
+    return PickResult(picks=sr.picks, state=None, judge_effort=sr.judge_effort) if sr.picks else None
+
+
+def pick(
+    prompt: str,
+    config: Config | None = None,
+    session_id: str | None = None,
+) -> PickResult | None:
+    """Return picks for a prompt, with an effort recommendation attached."""
+    cfg = config or load_config()
+    result = _pick_inner(prompt, cfg, session_id)
+    if result is None or not cfg.effort.enabled:
+        return result
+
+    phase = result.state.phase if result.state else None
+    parallel = any(p.reason.startswith("parallelization:") for p in result.picks)
+    rec = effort_mod.classify(
+        phase=phase,
+        judge_effort=result.judge_effort,
+        parallel=parallel,
+        cfg=cfg,
+        prompt=prompt,
+    )
+    return dataclasses.replace(result, effort=rec)
