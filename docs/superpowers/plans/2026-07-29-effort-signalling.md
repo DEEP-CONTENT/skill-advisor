@@ -1335,14 +1335,13 @@ Then, in `render_settings()` immediately before the final `target.write_text(...
 
     if cfg is not None and cfg.effort.enabled and cfg.effort.statusline:
         existing = data.get("statusLine")
-        ours = str(statusline.write_script())
-        is_foreign = (
-            isinstance(existing, dict)
-            and isinstance(existing.get("command"), str)
-            and not existing["command"].endswith("statusline.sh")
-        )
+        expected = str(paths.statusline_script())
+        existing_cmd = existing.get("command") if isinstance(existing, dict) else None
+        # Exact path, never a suffix test: endswith("statusline.sh") would also
+        # match /opt/other/user-statusline.sh and clobber a script the user owns.
+        is_foreign = isinstance(existing_cmd, str) and existing_cmd != expected
         if not is_foreign:
-            data["statusLine"] = {"type": "command", "command": ours}
+            data["statusLine"] = {"type": "command", "command": str(statusline.write_script())}
 ```
 
 The foreign-status-line guard mirrors `_merge_hook_entry`'s sentinel approach: we only own entries whose command ends in our own filename.
