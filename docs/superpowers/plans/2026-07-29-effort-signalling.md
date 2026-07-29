@@ -400,6 +400,16 @@ def test_read_observed_rejects_unknown_level():
         json.dumps({"session_id": "s9", "level": "turbo"}), encoding="utf-8"
     )
     assert effort.read_observed() == ("s9", None)
+
+
+def test_write_recommendation_swallows_ensure_dirs_oserror(monkeypatch):
+    """Silent-on-error: even directory creation failing must not raise."""
+    rec = effort.EffortRecommendation(level=effort.LOW, reason="r", source="heuristic")
+    monkeypatch.setattr(
+        "skill_advisor.paths.ensure_dirs",
+        lambda: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    effort.write_recommendation(rec, session_id="s1")  # must return normally
 ```
 
 Append to `tests/test_paths.py`:
@@ -473,7 +483,6 @@ def write_recommendation(rec: EffortRecommendation, *, session_id: str | None) -
     Atomic (temp + rename) so a half-written file is never observed by the
     status line, which reads this on every render.
     """
-    paths.ensure_dirs()
     target = paths.effort_file()
     tmp = target.with_suffix(f".json.tmp.{os.getpid()}")
     payload = {
@@ -485,6 +494,9 @@ def write_recommendation(rec: EffortRecommendation, *, session_id: str | None) -
         "ts": int(time.time()),
     }
     try:
+        # Inside the guard: mkdir can raise OSError too, and the Global
+        # Constraints forbid any exception escaping to Claude Code.
+        paths.ensure_dirs()
         tmp.write_text(json.dumps(payload), encoding="utf-8")
         tmp.replace(target)
     except OSError as exc:
