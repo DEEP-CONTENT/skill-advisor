@@ -30,13 +30,19 @@ session=$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null)
 model=$(printf '%s' "$input" | jq -r '.model.display_name // empty' 2>/dev/null)
 ctx=$(printf '%s' "$input" | jq -r '.context_window.used_percentage // empty' 2>/dev/null)
 
+# ctx must be numeric (digits + optional decimal point) or it is dropped
+case "$ctx" in
+  ''|*[!0-9.]*) ctx="" ;;
+esac
+
 # --- sensor: the only place live effort is visible ---
 if [ -n "$observed" ]; then
-  mkdir -p "$CACHE" 2>/dev/null
-  tmp="$CACHE/observed-effort.json.tmp.$$"
-  if printf '{"session_id":"%s","level":"%s","ts":%s}\n' \
-       "$session" "$observed" "$(date +%s)" > "$tmp" 2>/dev/null; then
-    mv "$tmp" "$CACHE/observed-effort.json" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  if mkdir -p "$CACHE" 2>/dev/null; then
+    tmp="$CACHE/observed-effort.json.tmp.$$"
+    if jq -n --arg session "$session" --arg level "$observed" --argjson ts "$(date +%s)" \
+         '{session_id:$session, level:$level, ts:$ts}' > "$tmp" 2>/dev/null; then
+      mv "$tmp" "$CACHE/observed-effort.json" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    fi
   fi
 fi
 
@@ -71,7 +77,7 @@ fi
 [ -n "$model" ] && { [ -n "$out" ] && out="$out \033[2m·\033[0m $model" || out="$model"; }
 [ -n "$ctx" ] && out="$out \033[2m·\033[0m ctx $(printf '%.0f' "$ctx")%"
 
-[ -n "$out" ] && printf "$out\n"
+[ -n "$out" ] && printf '%b\n' "$out"
 exit 0
 """
 
