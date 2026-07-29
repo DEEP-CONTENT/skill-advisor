@@ -1143,13 +1143,25 @@ session=$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null)
 model=$(printf '%s' "$input" | jq -r '.model.display_name // empty' 2>/dev/null)
 ctx=$(printf '%s' "$input" | jq -r '.context_window.used_percentage // empty' 2>/dev/null)
 
+# ctx must be numerically well-formed, not just the right character set:
+# digits with at most one decimal point, and at least one digit (reject "",
+# non-[0-9.] chars, "a.b.c"-style multi-dot, and a bare "." with no digits).
+case "$ctx" in
+  ''|*[!0-9.]*|*.*.*) ctx="" ;;
+esac
+case "$ctx" in
+  *[0-9]*) : ;;
+  *) ctx="" ;;
+esac
+
 # --- sensor: the only place live effort is visible ---
 if [ -n "$observed" ]; then
-  mkdir -p "$CACHE" 2>/dev/null
-  tmp="$CACHE/observed-effort.json.tmp.$$"
-  if printf '{"session_id":"%s","level":"%s","ts":%s}\n' \
-       "$session" "$observed" "$(date +%s)" > "$tmp" 2>/dev/null; then
-    mv "$tmp" "$CACHE/observed-effort.json" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  if mkdir -p "$CACHE" 2>/dev/null; then
+    tmp="$CACHE/observed-effort.json.tmp.$$"
+    if jq -n --arg session "$session" --arg level "$observed" --argjson ts "$(date +%s)" \
+         '{session_id:$session, level:$level, ts:$ts}' > "$tmp" 2>/dev/null; then
+      mv "$tmp" "$CACHE/observed-effort.json" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    fi
   fi
 fi
 
@@ -1160,15 +1172,15 @@ fi
 
 colour() {
   case "$1" in
-    low)       printf '\033[34m' ;;
-    medium)    printf '\033[36m' ;;
-    high)      printf '\033[32m' ;;
-    xhigh|max) printf '\033[33m' ;;
-    ultracode) printf '\033[35m' ;;
+    low)       printf '[34m' ;;
+    medium)    printf '[36m' ;;
+    high)      printf '[32m' ;;
+    xhigh|max) printf '[33m' ;;
+    ultracode) printf '[35m' ;;
     *)         printf '' ;;
   esac
 }
-RESET='\033[0m'
+RESET='[0m'
 
 out=""
 if [ -n "$observed" ]; then
@@ -1177,14 +1189,15 @@ if [ -n "$observed" ]; then
   if [ -n "$recommended" ] && [ "$recommended" != "$observed" ] \
      && ! { [ "$recommended" = "ultracode" ] && [ "$observed" = "xhigh" ]; } \
      && [ "$observed" != "max" ]; then
-    out="$out \033[2m→\033[0m $(colour "$recommended")${recommended}${RESET}"
+    out="$out [2m→[0m $(colour "$recommended")${recommended}${RESET}"
   fi
 fi
 
-[ -n "$model" ] && { [ -n "$out" ] && out="$out \033[2m·\033[0m $model" || out="$model"; }
-[ -n "$ctx" ] && out="$out \033[2m·\033[0m ctx $(printf '%.0f' "$ctx")%"
+[ -n "$model" ] && { [ -n "$out" ] && out="$out [2m·[0m $model" || out="$model"; }
+[ -n "$ctx" ] && out="$out [2m·[0m ctx $(printf '%.0f' "$ctx")%"
 
-[ -n "$out" ] && printf "$out\n"
+[ -n "$out" ] && printf '%b
+' "$out"
 exit 0
 """
 
