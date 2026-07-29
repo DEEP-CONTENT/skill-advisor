@@ -88,3 +88,14 @@ def test_ensure_dirs_creates_both(isolated_paths):
     paths.ensure_dirs()
     assert isolated_paths["config_home"].is_dir()
     assert isolated_paths["cache_home"].is_dir()
+
+
+def test_effort_paths_live_in_cache_dir():
+    assert paths.effort_file().parent == paths.cache_dir()
+    assert paths.observed_effort_file().parent == paths.cache_dir()
+    assert paths.baseline_file().parent == paths.cache_dir()
+
+
+def test_statusline_script_lives_in_config_dir():
+    assert paths.statusline_script().parent == paths.config_dir()
+    assert paths.statusline_script().name == "statusline.sh"

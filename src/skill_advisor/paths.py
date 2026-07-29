@@ -101,6 +101,26 @@ def telemetry_salt_file() -> Path:
     return cache_dir() / "telemetry.salt"
 
 
+def effort_file() -> Path:
+    """Latest effort recommendation, written by the UserPromptSubmit hook."""
+    return cache_dir() / "effort.json"
+
+
+def observed_effort_file() -> Path:
+    """Live effort level as last seen by the status line (the sensor)."""
+    return cache_dir() / "observed-effort.json"
+
+
+def baseline_file() -> Path:
+    """Rolling window + write-back provenance."""
+    return cache_dir() / "baseline.json"
+
+
+def statusline_script() -> Path:
+    """Generated POSIX-sh status line, registered in claudeskill-settings.json."""
+    return config_dir() / "statusline.sh"
+
+
 def sessions_dir() -> Path:
     return cache_dir() / "sessions"
 
