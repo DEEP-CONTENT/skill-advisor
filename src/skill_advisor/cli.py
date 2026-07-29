@@ -75,6 +75,10 @@ def _cmd_uninstall(args: argparse.Namespace) -> int:
         paths.log_file(),
         paths.events_file(),
         paths.telemetry_salt_file(),
+        paths.effort_file(),
+        paths.observed_effort_file(),
+        paths.baseline_file(),
+        paths.statusline_script(),
     ):
         if path.is_file():
             path.unlink()

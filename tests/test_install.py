@@ -110,6 +110,21 @@ def test_write_default_config_force_rewrites(isolated_paths):
     assert "[matcher]" in paths.config_file().read_text(encoding="utf-8")
 
 
+def test_default_config_text_effort_section_matches_effortconfig_defaults():
+    """The `[effort]` block the installer writes must parse to the exact same
+    values as `EffortConfig()`'s dataclass defaults — keeps install.py's bundled
+    text and config.py's schema from drifting apart silently."""
+    import dataclasses
+    import tomllib
+
+    text = install_mod._default_config_text()
+    parsed = tomllib.loads(text)
+    assert "effort" in parsed, "_default_config_text() has no [effort] section"
+
+    expected = dataclasses.asdict(config.EffortConfig())
+    assert parsed["effort"] == expected
+
+
 def test_install_alias_is_idempotent(isolated_paths, monkeypatch):
     monkeypatch.setenv("SHELL", "/bin/bash")
     shell = install_mod.detect_shell()
