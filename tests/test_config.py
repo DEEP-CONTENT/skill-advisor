@@ -64,3 +64,38 @@ judge_timeout_seconds = 8.5
     assert cfg.parallelization.enabled is True
     assert cfg.parallelization.min_tasks == 5
     assert cfg.parallelization.judge_timeout_seconds == 8.5
+
+
+def test_effort_defaults_are_conservative():
+    cfg = config.Config()
+    assert cfg.effort.enabled is False
+    assert cfg.effort.statusline is True
+    assert cfg.effort.nudge is True
+    assert cfg.effort.write_back is True
+    assert cfg.effort.write_back_after_sessions == 5
+    assert cfg.effort.veto_cooldown_sessions == 10
+    assert cfg.effort.ultracode_nudge is True
+
+
+def test_effort_parsed_from_toml(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text(
+        "[effort]\n"
+        "enabled = true\n"
+        "statusline = false\n"
+        "write_back_after_sessions = 3\n",
+        encoding="utf-8",
+    )
+    cfg = config.load(p)
+    assert cfg.effort.enabled is True
+    assert cfg.effort.statusline is False
+    assert cfg.effort.write_back_after_sessions == 3
+    # unspecified keys keep their defaults
+    assert cfg.effort.nudge is True
+
+
+def test_effort_section_absent_yields_defaults(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text("[matcher]\nuse_judge = true\n", encoding="utf-8")
+    cfg = config.load(p)
+    assert cfg.effort.enabled is False

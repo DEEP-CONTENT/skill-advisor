@@ -89,6 +89,27 @@ class ParallelizationConfig:
 
 
 @dataclass(frozen=True)
+class EffortConfig:
+    # Master toggle. When false, nothing in this feature runs: no classification,
+    # no status line registration, no nudge, no write-back. Off by default so
+    # existing installs are untouched until the user opts in.
+    enabled: bool = False
+    # Register a `statusLine` command in claudeskill-settings.json.
+    statusline: bool = True
+    # Emit a systemMessage when the recommendation disagrees with observed effort.
+    nudge: bool = True
+    # Allow occasional writes of `effortLevel` into claudeskill-settings.json.
+    write_back: bool = True
+    # Consecutive qualifying sessions of disagreement before a write happens.
+    write_back_after_sessions: int = 5
+    # Sessions to suppress write-back for after the user manually overrides.
+    veto_cooldown_sessions: int = 10
+    # Recommend `ultracode` when the parallelization detector says yes.
+    # Never persisted — Claude Code treats ultracode as session-only by design.
+    ultracode_nudge: bool = True
+
+
+@dataclass(frozen=True)
 class Config:
     matcher: MatcherConfig = field(default_factory=MatcherConfig)
     catalog: CatalogConfig = field(default_factory=CatalogConfig)
@@ -96,6 +117,7 @@ class Config:
     lifecycle: LifecycleConfig = field(default_factory=LifecycleConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     parallelization: ParallelizationConfig = field(default_factory=ParallelizationConfig)
+    effort: EffortConfig = field(default_factory=EffortConfig)
 
 
 def _as_tuple(value) -> tuple[str, ...]:
@@ -163,6 +185,7 @@ def load(path: Path | None = None) -> Config:
     lifecycle = raw.get("lifecycle", {}) or {}
     telemetry = raw.get("telemetry", {}) or {}
     parallelization = raw.get("parallelization", {}) or {}
+    effort = raw.get("effort", {}) or {}
 
     return Config(
         matcher=MatcherConfig(
@@ -206,5 +229,18 @@ def load(path: Path | None = None) -> Config:
                     ParallelizationConfig.judge_timeout_seconds,
                 )
             ),
+        ),
+        effort=EffortConfig(
+            enabled=bool(effort.get("enabled", EffortConfig.enabled)),
+            statusline=bool(effort.get("statusline", EffortConfig.statusline)),
+            nudge=bool(effort.get("nudge", EffortConfig.nudge)),
+            write_back=bool(effort.get("write_back", EffortConfig.write_back)),
+            write_back_after_sessions=int(
+                effort.get("write_back_after_sessions", EffortConfig.write_back_after_sessions)
+            ),
+            veto_cooldown_sessions=int(
+                effort.get("veto_cooldown_sessions", EffortConfig.veto_cooldown_sessions)
+            ),
+            ultracode_nudge=bool(effort.get("ultracode_nudge", EffortConfig.ultracode_nudge)),
         ),
     )
