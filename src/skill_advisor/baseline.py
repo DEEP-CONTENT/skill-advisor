@@ -18,6 +18,7 @@ log = logging.getLogger(__name__)
 
 _MIN_RECOMMENDATIONS = 3
 _WINDOW_CAP = 30
+_TALLY_CAP = 50
 
 
 def _load() -> dict:
@@ -137,10 +138,16 @@ def finalise_session(session_id: str) -> str | None:
     entries = entries[-_WINDOW_CAP:]
     data["window"] = entries
 
-    # Bound growth: keep tallies only for sessions still represented in the
-    # window. Without this, `tallies` grows forever now that it is never popped.
-    live = {e["session"] for e in entries}
-    data["tallies"] = {k: v for k, v in tallies.items() if k in live}
+    # Bound growth by RECENCY, not by window membership (fix round 2): a thin
+    # session is legitimately absent from the window precisely because it is
+    # still accumulating — pruning by "in the window" deleted its tally the
+    # moment any OTHER session finalised, which starved concurrent sessions
+    # indefinitely. Keep the most recently touched _TALLY_CAP session keys
+    # (dict insertion order, Python 3.7+) and drop only the oldest overflow.
+    if len(tallies) > _TALLY_CAP:
+        for stale in list(tallies)[: len(tallies) - _TALLY_CAP]:
+            del tallies[stale]
+    data["tallies"] = tallies
     _save(data)
     return persistable
 

@@ -236,6 +236,48 @@ def test_finalise_tolerates_malformed_tallies():
     assert data["tallies"] == ["list", "not", "dict"]
 
 
+def test_concurrent_sessions_do_not_starve_each_other(monkeypatch):
+    """Fix round 2: pruning tallies by window membership deleted a DIFFERENT,
+    still-accumulating session's tally the moment any session finalised
+    successfully — a thin session is legitimately absent from the window
+    precisely because it's still accumulating, which is when its tally
+    matters most. Reproduces the coordinator's exact repro: B records 2
+    (thin), A records 3 and finalises (this used to wipe B's tally via the
+    window-membership prune), then B records a 3rd and must still reach the
+    window with its own modal.
+    """
+    baseline.record("B", "high")
+    baseline.record("B", "high")
+
+    baseline.record("A", "low")
+    baseline.record("A", "low")
+    baseline.record("A", "low")
+    assert baseline.finalise_session("A") == effort.LOW
+
+    # B's tally must have survived A's finalise call.
+    data = json.loads(paths.baseline_file().read_text(encoding="utf-8"))
+    assert data["tallies"].get("B") == ["high", "high"]
+
+    baseline.record("B", "high")
+    assert baseline.finalise_session("B") == effort.HIGH
+    assert baseline.window() == [effort.LOW, effort.HIGH]
+
+
+def test_tally_growth_is_bounded_by_recency_not_window_membership():
+    """More than _TALLY_CAP sessions must not grow `tallies` without bound,
+    but the cap must be keyed on recency (insertion order), not on whether a
+    session made it into the window — see test_concurrent_sessions_do_not_starve_each_other
+    for why window-membership pruning is wrong.
+    """
+    for i in range(baseline._TALLY_CAP + 10):
+        baseline.record(f"s{i}", "high")
+        baseline.record(f"s{i}", "high")
+        baseline.record(f"s{i}", "high")
+        baseline.finalise_session(f"s{i}")
+    data = json.loads(paths.baseline_file().read_text(encoding="utf-8"))
+    assert len(data["tallies"]) <= baseline._TALLY_CAP
+
+
 def test_tie_breaking_uses_insertion_order():
     """When multiple levels tie for mode, Counter.most_common picks first encountered."""
     # Create a tie: two high, two low (equal count). High is encountered first.
