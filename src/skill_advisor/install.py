@@ -123,6 +123,9 @@ def render_settings() -> Path:
     read the existing file if present, upsert our UserPromptSubmit / PostToolUse
     / Stop hook entries by their sentinel command strings, leave every other
     hook block alone. Idempotent — re-runs yield no diff once paths are stable.
+    When the effort feature is enabled, also upserts a `statusLine` key pointing
+    at our generated script by exact path match — any `statusLine` whose command
+    is not exactly our script's path is treated as user-owned and left untouched.
     """
     paths.ensure_dirs()
     target = paths.settings_file()
@@ -153,13 +156,11 @@ def render_settings() -> Path:
 
     if cfg is not None and cfg.effort.enabled and cfg.effort.statusline:
         existing = data.get("statusLine")
-        ours = str(statusline.write_script())
-        is_foreign = (
-            isinstance(existing, dict)
-            and isinstance(existing.get("command"), str)
-            and not existing["command"].endswith("statusline.sh")
-        )
+        expected = str(paths.statusline_script())
+        existing_cmd = existing.get("command") if isinstance(existing, dict) else None
+        is_foreign = isinstance(existing_cmd, str) and existing_cmd != expected
         if not is_foreign:
+            ours = str(statusline.write_script())
             data["statusLine"] = {"type": "command", "command": ours}
 
     target.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")

@@ -177,6 +177,10 @@ def test_statusline_registered_when_enabled(isolated_paths, monkeypatch):
     assert data["statusLine"]["command"].endswith("statusline.sh")
     assert paths.statusline_script().is_file()
 
+    # OUR entry is upserted in place on every render — a re-run must be idempotent.
+    install_mod.render_settings()
+    assert _settings()["statusLine"] == data["statusLine"]
+
 
 def test_statusline_absent_when_feature_disabled(isolated_paths, monkeypatch):
     monkeypatch.setattr(
@@ -212,3 +216,39 @@ def test_render_settings_preserves_foreign_statusline(isolated_paths, monkeypatc
     )
     install_mod.render_settings()
     assert _settings()["statusLine"]["command"] == "/usr/local/bin/mine.sh"
+
+
+def test_render_settings_preserves_foreign_statusline_with_matching_suffix(isolated_paths, monkeypatch):
+    """A foreign script that merely ENDS in 'statusline.sh' must not be mistaken for ours.
+
+    Guards against a naive `.endswith("statusline.sh")` check, which would wrongly
+    classify "/opt/other/user-statusline.sh" as our own entry and clobber it.
+    """
+    paths.ensure_dirs()
+    paths.settings_file().write_text(
+        json.dumps({"statusLine": {"type": "command", "command": "/opt/other/user-statusline.sh"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "skill_advisor.install.load_config",
+        lambda: _config(enabled=True, statusline=True),
+    )
+    install_mod.render_settings()
+    assert _settings()["statusLine"]["command"] == "/opt/other/user-statusline.sh"
+
+
+def test_render_settings_preserves_foreign_statusline_with_embedded_suffix(isolated_paths, monkeypatch):
+    """Same guard, for a command whose tail literally spells 'statusline.sh' without
+    being our script at all — e.g. "/opt/other/notstatusline.sh".
+    """
+    paths.ensure_dirs()
+    paths.settings_file().write_text(
+        json.dumps({"statusLine": {"type": "command", "command": "/opt/other/notstatusline.sh"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "skill_advisor.install.load_config",
+        lambda: _config(enabled=True, statusline=True),
+    )
+    install_mod.render_settings()
+    assert _settings()["statusLine"]["command"] == "/opt/other/notstatusline.sh"
