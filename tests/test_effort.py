@@ -98,3 +98,11 @@ def test_read_observed_rejects_unknown_level():
         json.dumps({"session_id": "s9", "level": "turbo"}), encoding="utf-8"
     )
     assert effort.read_observed() == ("s9", None)
+
+
+def test_write_recommendation_swallows_ensure_dirs_oserror(monkeypatch):
+    """write_recommendation must not raise even if ensure_dirs fails."""
+    rec = effort.EffortRecommendation(level=effort.LOW, reason="r", source="heuristic")
+    monkeypatch.setattr("skill_advisor.paths.ensure_dirs", lambda: (_ for _ in ()).throw(OSError("disk full")))
+    # Must not raise; must return normally.
+    effort.write_recommendation(rec, session_id="s1")

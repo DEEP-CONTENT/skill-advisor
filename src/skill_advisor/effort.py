@@ -78,7 +78,6 @@ def write_recommendation(rec: EffortRecommendation, *, session_id: str | None) -
     Atomic (temp + rename) so a half-written file is never observed by the
     status line, which reads this on every render.
     """
-    paths.ensure_dirs()
     target = paths.effort_file()
     tmp = target.with_suffix(f".json.tmp.{os.getpid()}")
     payload = {
@@ -90,6 +89,7 @@ def write_recommendation(rec: EffortRecommendation, *, session_id: str | None) -
         "ts": int(time.time()),
     }
     try:
+        paths.ensure_dirs()
         tmp.write_text(json.dumps(payload), encoding="utf-8")
         tmp.replace(target)
     except OSError as exc:
