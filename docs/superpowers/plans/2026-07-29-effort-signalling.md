@@ -2076,6 +2076,9 @@ def _write_settings_effort(level: str) -> bool:
     data["effortLevel"] = level
     tmp = target.with_suffix(f".json.tmp.{os.getpid()}")
     try:
+        # Inside the guard, same as effort.write_recommendation: mkdir raises
+        # OSError too, and nothing here may escape.
+        paths.ensure_dirs()
         serialised = json.dumps(data, indent=2) + "\n"
         json.loads(serialised)  # round-trip validation before it touches the real path
         tmp.write_text(serialised, encoding="utf-8")
