@@ -10,10 +10,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections import Counter
 
-from . import paths
+from . import effort, paths
 
 log = logging.getLogger(__name__)
+
+_MIN_RECOMMENDATIONS = 3
+_WINDOW_CAP = 30
 
 
 def _load() -> dict:
@@ -79,3 +83,45 @@ def mark_nudged(session_id: str | None, observed: str | None, recommended: str) 
     ledger[session_id] = seen
     _save(data)
     return True
+
+
+def record(session_id: str, level: str) -> None:
+    """Append one recommendation to this session's tally."""
+    if not session_id or level not in effort.RECOMMENDABLE:
+        return
+    data = _load()
+    tallies = data.setdefault("tallies", {})
+    tallies.setdefault(session_id, []).append(level)
+    _save(data)
+
+
+def finalise_session(session_id: str) -> str | None:
+    """Collapse a session's tally to its modal level and append to the window."""
+    data = _load()
+    tallies = data.get("tallies", {})
+    levels = tallies.pop(session_id, [])
+    if len(levels) < _MIN_RECOMMENDATIONS:
+        data["tallies"] = tallies
+        _save(data)
+        return None
+
+    modal = Counter(levels).most_common(1)[0][0]
+    persistable = effort.to_persistable(modal)
+    if persistable is None:
+        data["tallies"] = tallies
+        _save(data)
+        return None
+
+    window = list(data.get("window", []))
+    window.append(persistable)
+    data["window"] = window[-_WINDOW_CAP:]
+    data["tallies"] = tallies
+    _save(data)
+    return persistable
+
+
+def window() -> list[str]:
+    """Rolling window of session modals, oldest first."""
+    data = _load()
+    win = data.get("window", [])
+    return [w for w in win if isinstance(w, str)] if isinstance(win, list) else []

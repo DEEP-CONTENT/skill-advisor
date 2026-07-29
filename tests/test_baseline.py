@@ -1,6 +1,6 @@
 import json
 
-from skill_advisor import baseline, paths
+from skill_advisor import baseline, effort, paths
 
 
 def test_load_missing_file_returns_empty_dict():
@@ -107,3 +107,51 @@ def test_was_nudged_tolerates_malformed_session_entry():
         json.dumps({"nudged": {"sess-a": "not-a-list"}}), encoding="utf-8"
     )
     assert baseline.was_nudged("sess-a", "medium", "xhigh") is False
+
+
+# ---------------------------------------------------------------------------
+# record, finalise_session, window: rolling window of session modals
+# ---------------------------------------------------------------------------
+
+
+def test_modal_of_a_session():
+    for lvl in ("high", "high", "low"):
+        baseline.record("s1", lvl)
+    assert baseline.finalise_session("s1") == effort.HIGH
+
+
+def test_thin_session_is_discarded():
+    baseline.record("s1", "high")
+    baseline.record("s1", "high")
+    assert baseline.finalise_session("s1") is None
+    assert baseline.window() == []
+
+
+def test_finalise_appends_to_window_and_clears_tally():
+    for lvl in ("low", "low", "low"):
+        baseline.record("s1", lvl)
+    baseline.finalise_session("s1")
+    assert baseline.window() == [effort.LOW]
+    # tally cleared — re-finalising the same session must not double-count
+    assert baseline.finalise_session("s1") is None
+    assert baseline.window() == [effort.LOW]
+
+
+def test_ultracode_contributes_xhigh_to_the_window():
+    for _ in range(3):
+        baseline.record("s1", effort.ULTRACODE)
+    assert baseline.finalise_session("s1") == effort.XHIGH
+
+
+def test_window_is_bounded():
+    for i in range(40):
+        for _ in range(3):
+            baseline.record(f"s{i}", "high")
+        baseline.finalise_session(f"s{i}")
+    assert len(baseline.window()) <= baseline._WINDOW_CAP
+
+
+def test_corrupt_baseline_file_resets_cleanly():
+    paths.ensure_dirs()
+    paths.baseline_file().write_text("{{{", encoding="utf-8")
+    assert baseline.window() == []
