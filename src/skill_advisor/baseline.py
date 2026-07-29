@@ -87,7 +87,24 @@ def mark_nudged(session_id: str | None, observed: str | None, recommended: str) 
 
 
 def record(session_id: str, level: str) -> None:
-    """Append one recommendation to this session's tally."""
+    """Append one recommendation to this session's tally.
+
+    Enforces `_TALLY_CAP` HERE, not in `finalise_session` (fix round 3):
+    `record()` is the only function that ever creates a tally key, so a
+    session that never reaches `_MIN_RECOMMENDATIONS` never takes
+    `finalise_session`'s success path and its key was never counted against
+    the cap there — a user with many short 1-2 prompt sessions grew the file
+    forever. Capping here bounds growth unconditionally, regardless of
+    whether any session ever finalises.
+
+    Append first, then cap, and never evict the session just recorded for:
+    a brand-new key is the most recently inserted (Python 3.7+ dict order),
+    so oldest-first eviction alone already skips it — but `session_id` is
+    also explicitly excluded from the eviction candidates below, so this
+    holds even against a pre-existing file that already has more than
+    `_TALLY_CAP` keys (e.g. from before this cap existed) where `session_id`
+    happens to be the oldest one.
+    """
     if not session_id or level not in effort.RECOMMENDABLE:
         return
     data = _load()
@@ -96,6 +113,14 @@ def record(session_id: str, level: str) -> None:
         tallies = {}
         data["tallies"] = tallies
     tallies.setdefault(session_id, []).append(level)
+
+    if len(tallies) > _TALLY_CAP:
+        overflow = len(tallies) - _TALLY_CAP
+        stale = [k for k in tallies if k != session_id][:overflow]
+        for k in stale:
+            del tallies[k]
+        assert session_id in tallies, "record() must never evict its own session"
+
     _save(data)
 
 
@@ -138,16 +163,12 @@ def finalise_session(session_id: str) -> str | None:
     entries = entries[-_WINDOW_CAP:]
     data["window"] = entries
 
-    # Bound growth by RECENCY, not by window membership (fix round 2): a thin
-    # session is legitimately absent from the window precisely because it is
-    # still accumulating — pruning by "in the window" deleted its tally the
-    # moment any OTHER session finalised, which starved concurrent sessions
-    # indefinitely. Keep the most recently touched _TALLY_CAP session keys
-    # (dict insertion order, Python 3.7+) and drop only the oldest overflow.
-    if len(tallies) > _TALLY_CAP:
-        for stale in list(tallies)[: len(tallies) - _TALLY_CAP]:
-            del tallies[stale]
-    data["tallies"] = tallies
+    # `tallies` growth is bounded in `record()` now (fix round 3), not here:
+    # record() is the only function that ever creates a tally key, so it's
+    # the only place that can bound growth unconditionally — this function's
+    # own copy of that logic (fix round 2) only ran on the success path
+    # above, which a session that never reaches _MIN_RECOMMENDATIONS never
+    # takes, so it never actually bounded the sessions that needed it most.
     _save(data)
     return persistable
 

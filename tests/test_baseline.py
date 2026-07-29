@@ -278,6 +278,38 @@ def test_tally_growth_is_bounded_by_recency_not_window_membership():
     assert len(data["tallies"]) <= baseline._TALLY_CAP
 
 
+def test_tally_growth_is_bounded_even_when_no_session_ever_finalises():
+    """Fix round 3: _TALLY_CAP was only enforced on finalise_session's SUCCESS
+    path, so a session that never reaches _MIN_RECOMMENDATIONS never passes
+    through it and its key is never counted against the cap. Reproduces the
+    coordinator's exact finding: many short sessions that record once and
+    never finalise must still be bounded, because record() — not
+    finalise_session — is the only function that ever creates a tally key.
+    """
+    for i in range(baseline._TALLY_CAP + 30):
+        baseline.record(f"s{i}", "high")  # single prompt, session never finalises
+    data = json.loads(paths.baseline_file().read_text(encoding="utf-8"))
+    assert len(data["tallies"]) <= baseline._TALLY_CAP
+
+
+def test_record_never_evicts_the_session_it_is_currently_recording_for():
+    """The cap must be enforced without ever dropping the key record() itself
+    just touched — append-then-cap makes a brand-new key the most recently
+    inserted, so oldest-first eviction alone would already skip it, but this
+    pins down the guarantee explicitly rather than relying on that ordering
+    argument going unverified.
+    """
+    for i in range(baseline._TALLY_CAP):
+        baseline.record(f"s{i}", "high")
+    data = json.loads(paths.baseline_file().read_text(encoding="utf-8"))
+    assert len(data["tallies"]) == baseline._TALLY_CAP  # exactly at cap, no overflow yet
+
+    baseline.record("brand-new-session", "high")
+    data = json.loads(paths.baseline_file().read_text(encoding="utf-8"))
+    assert data["tallies"].get("brand-new-session") == ["high"]
+    assert len(data["tallies"]) <= baseline._TALLY_CAP
+
+
 def test_tie_breaking_uses_insertion_order():
     """When multiple levels tie for mode, Counter.most_common picks first encountered."""
     # Create a tie: two high, two low (equal count). High is encountered first.
