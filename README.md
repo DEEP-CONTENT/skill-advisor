@@ -1334,7 +1334,8 @@ into a rolling window in `~/.cache/skill-advisor/baseline.json` (capped at the m
 The comparison point is the session's **first observed effort level** — the value the
 status line's sensor saw on that session's first render, which reflects whatever level the
 session actually launched at (including any `effortLevel` skill-advisor had already
-written, since that's what determined the launch). When the most recent
+written, since that's what determines the launch — unless `CLAUDE_CODE_EFFORT_LEVEL` or an
+`--effort` launch pin overrides it; see the precedence chain above). When the most recent
 `write_back_after_sessions` (default **5**) sessions in the window all agree on one level,
 and that level differs from that first-observed value, skill-advisor writes it into
 `claudeskill-settings.json` — atomically
