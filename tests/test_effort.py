@@ -106,3 +106,80 @@ def test_write_recommendation_swallows_ensure_dirs_oserror(monkeypatch):
     monkeypatch.setattr("skill_advisor.paths.ensure_dirs", lambda: (_ for _ in ()).throw(OSError("disk full")))
     # Must not raise; must return normally.
     effort.write_recommendation(rec, session_id="s1")
+
+
+from skill_advisor import config as config_mod
+from skill_advisor import lifecycle
+
+
+def _cfg(**kw):
+    base = dict(enabled=True, ultracode_nudge=True)
+    base.update(kw)
+    return config_mod.Config(effort=config_mod.EffortConfig(**base))
+
+
+def test_rung1_parallel_wins_and_yields_ultracode():
+    rec = effort.classify(
+        phase=lifecycle.PLANNING, judge_effort=effort.LOW, parallel=True,
+        cfg=_cfg(), prompt="build the thing",
+    )
+    assert rec.level == effort.ULTRACODE
+    assert rec.source == "parallelization"
+
+
+def test_rung1_suppressed_when_ultracode_nudge_off():
+    rec = effort.classify(
+        phase=lifecycle.PLANNING, judge_effort=effort.LOW, parallel=True,
+        cfg=_cfg(ultracode_nudge=False), prompt="build the thing",
+    )
+    assert rec.level == effort.LOW
+    assert rec.source == "judge"
+
+
+def test_rung2_judge_used_when_not_parallel():
+    rec = effort.classify(
+        phase=None, judge_effort=effort.XHIGH, parallel=False, cfg=_cfg(), prompt="x"
+    )
+    assert rec.level == effort.XHIGH
+    assert rec.source == "judge"
+
+
+def test_rung3_phase_used_when_judge_silent():
+    rec = effort.classify(
+        phase=lifecycle.COMPLETE, judge_effort=None, parallel=False, cfg=_cfg(), prompt="x"
+    )
+    assert rec.level == effort.LOW
+    assert rec.source == "phase"
+
+
+def test_rung4_heuristic_long_technical_prompt():
+    prompt = "refactor the auth middleware and migrate the session schema to postgres"
+    rec = effort.classify(
+        phase=None, judge_effort=None, parallel=False, cfg=_cfg(), prompt=prompt
+    )
+    assert rec.source == "heuristic"
+    assert rec.level in (effort.HIGH, effort.XHIGH)
+
+
+def test_rung4_heuristic_short_prompt_is_low():
+    rec = effort.classify(
+        phase=None, judge_effort=None, parallel=False, cfg=_cfg(), prompt="rename this var"
+    )
+    assert rec.source == "heuristic"
+    assert rec.level == effort.LOW
+
+
+def test_disabled_config_returns_none():
+    rec = effort.classify(
+        phase=lifecycle.PLANNING, judge_effort=effort.XHIGH, parallel=True,
+        cfg=_cfg(enabled=False), prompt="x",
+    )
+    assert rec is None
+
+
+def test_classify_never_returns_max():
+    for phase in (lifecycle.PLANNING, lifecycle.REVIEW, lifecycle.COMPLETE, None):
+        rec = effort.classify(
+            phase=phase, judge_effort=None, parallel=False, cfg=_cfg(), prompt="a b c d e f g"
+        )
+        assert rec is None or rec.level != effort.MAX

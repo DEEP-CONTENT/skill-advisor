@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 
@@ -119,3 +120,79 @@ def read_observed() -> tuple[str | None, str | None]:
         str(session_id) if isinstance(session_id, str) else None,
         level if level in OBSERVABLE else None,
     )
+
+
+# Phase → effort. Planning and review are reasoning-heavy; wrapping up is not.
+_PHASE_EFFORT: dict[str, str] = {
+    "planning": HIGH,
+    "parallelization_check": XHIGH,
+    "implementation": HIGH,
+    "review": HIGH,
+    "correction": MEDIUM,
+    "complete": LOW,
+}
+
+_TECHNICAL = re.compile(
+    r"\b(refactor|migrat\w*|debug|architect\w*|design|schema|auth|concurren\w*|"
+    r"race|deadlock|performance|optimi[sz]\w*|security|audit|integrat\w*)\b",
+    re.IGNORECASE,
+)
+
+
+def _heuristic(prompt: str) -> str:
+    """Cheapest rung: prompt shape only. Never returns MAX or ULTRACODE."""
+    words = len(prompt.split())
+    hits = len(_TECHNICAL.findall(prompt))
+    if words < 6 and hits == 0:
+        return LOW
+    if hits >= 2 or words >= 40:
+        return XHIGH
+    if hits >= 1 or words >= 15:
+        return HIGH
+    return MEDIUM
+
+
+def classify(
+    *,
+    phase: str | None,
+    judge_effort: str | None,
+    parallel: bool,
+    cfg,
+    prompt: str,
+) -> EffortRecommendation | None:
+    """Resolve a recommendation, or None to stay silent.
+
+    Adds no subprocess: `judge_effort` and `parallel` are results the caller
+    already obtained from round-trips it was making anyway.
+    """
+    if not cfg.effort.enabled:
+        return None
+
+    # Rung 1 — the parallelization detector already answered "does this
+    # decompose into independent sub-tasks?", which is the ultracode question.
+    if parallel and cfg.effort.ultracode_nudge:
+        return EffortRecommendation(
+            level=ULTRACODE,
+            reason="tasks decompose into parallel sub-agents",
+            source="parallelization",
+        )
+
+    # Rung 2 — the judge, when it ran and returned a valid level.
+    if judge_effort in RECOMMENDABLE:
+        return EffortRecommendation(
+            level=judge_effort, reason="judge assessment", source="judge"
+        )
+
+    # Rung 3 — lifecycle phase.
+    if phase and phase in _PHASE_EFFORT:
+        return EffortRecommendation(
+            level=_PHASE_EFFORT[phase], reason=f"{phase} phase", source="phase"
+        )
+
+    # Rung 4 — prompt shape.
+    if prompt.strip():
+        return EffortRecommendation(
+            level=_heuristic(prompt), reason="prompt shape", source="heuristic"
+        )
+
+    return None
