@@ -122,6 +122,16 @@ nudge or gently write back your launch-time default when the two keep disagreein
 It cannot set effort directly — Claude Code keeps that in AppState, which hooks
 can't write — so this is recommend/display/tune, not control.
 
+> **If your `--settings` file isn't named `claudeskill-settings.json`:** set
+> `SKILL_ADVISOR_SETTINGS_FILE` to its full path first. The status line
+> registration and the write-back below both target `paths.settings_file()`
+> (default: `~/.config/skill-advisor/claudeskill-settings.json`) — if that's
+> not the file you actually pass to `claude --settings`, both features run,
+> report success, and write into a file Claude Code never reads. No error,
+> no warning; it just silently does nothing. See the environment-variables
+> table in the [Configuration reference](README.md#configuration-reference)
+> section of the README for details.
+
 1. **Install `jq`.** The generated status line script shells out to it; without it
    the script exits 0 with empty output (silent, not broken).
 

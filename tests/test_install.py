@@ -252,6 +252,36 @@ def test_render_settings_preserves_foreign_statusline_with_matching_suffix(isola
     assert _settings()["statusLine"]["command"] == "/opt/other/user-statusline.sh"
 
 
+def test_render_settings_honors_settings_file_override_for_statusline(isolated_paths, monkeypatch, tmp_path):
+    """Regression test for the bug this feature exists to fix.
+
+    A real Claude Code `--settings` file is not always named
+    claudeskill-settings.json. Before SKILL_ADVISOR_SETTINGS_FILE existed, this
+    scenario made render_settings() silently write the statusLine registration
+    into a SECOND file the user's actual `claude` invocation never reads — no
+    error, no warning, the feature just did nothing. With the override set,
+    the write must land in the user's actual file, and no default-named file
+    may be created alongside it.
+    """
+    override = tmp_path / "custom-dir" / "claudew-settings.json"
+    monkeypatch.setenv("SKILL_ADVISOR_SETTINGS_FILE", str(override))
+    monkeypatch.setattr(
+        "skill_advisor.install.load_config",
+        lambda: _config(enabled=True, statusline=True),
+    )
+
+    result = install_mod.render_settings()
+
+    assert result == override
+    data = json.loads(override.read_text(encoding="utf-8"))
+    assert data["statusLine"]["type"] == "command"
+    assert data["statusLine"]["command"].endswith("statusline.sh")
+    assert "UserPromptSubmit" in data["hooks"]
+
+    default_named_file = isolated_paths["config_home"] / "claudeskill-settings.json"
+    assert not default_named_file.exists()
+
+
 def test_render_settings_preserves_foreign_statusline_with_embedded_suffix(isolated_paths, monkeypatch):
     """Same guard, for a command whose tail literally spells 'statusline.sh' without
     being our script at all — e.g. "/opt/other/notstatusline.sh".

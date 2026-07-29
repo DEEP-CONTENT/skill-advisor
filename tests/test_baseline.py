@@ -552,6 +552,30 @@ def test_write_settings_effort_aborts_before_touching_target_on_bad_serialisatio
     assert leftovers == []
 
 
+def test_maybe_write_honors_settings_file_override(monkeypatch, tmp_path):
+    """Regression test for the bug this feature exists to fix.
+
+    Before SKILL_ADVISOR_SETTINGS_FILE existed, a user whose real `claude
+    --settings` file wasn't named claudeskill-settings.json got write-back
+    that silently landed `effortLevel` in a SECOND file their actual `claude`
+    invocation never reads — no error, no warning, the feature just did
+    nothing. With the override set, the write must land in the user's actual
+    file, and no default-named file may be created alongside it.
+    """
+    override = tmp_path / "custom-dir" / "claudew-settings.json"
+    monkeypatch.setenv("SKILL_ADVISOR_SETTINGS_FILE", str(override))
+
+    _fill("low", 3)
+    written = baseline.maybe_write(_cfg(), launch_level="xhigh")
+    assert written == "low"
+
+    data = json.loads(override.read_text(encoding="utf-8"))
+    assert data["effortLevel"] == "low"
+
+    default_named_file = paths.config_dir() / "claudeskill-settings.json"
+    assert not default_named_file.exists()
+
+
 def test_maybe_write_survives_ensure_dirs_failure(monkeypatch):
     """A future caller could reach _write_settings_effort before config_dir exists.
 

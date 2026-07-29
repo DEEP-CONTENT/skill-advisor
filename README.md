@@ -677,6 +677,7 @@ setups):
 | `CLAUDE_CONFIG_DIR` | — | Claude Code's official env var. When set, `paths.claude_home()` resolves to it (e.g. `~/.claude-work` for work credentials). The catalog scans that dir's `skills/` first and falls back to `$HOME/.claude/skills` when the primary has nothing. |
 | `SKILL_ADVISOR_CONFIG_HOME` | `$XDG_CONFIG_HOME/skill-advisor` → `$HOME/.config/skill-advisor` | |
 | `SKILL_ADVISOR_CACHE_HOME` | `$XDG_CACHE_HOME/skill-advisor` → `$HOME/.cache/skill-advisor` | |
+| `SKILL_ADVISOR_SETTINGS_FILE` | `config_dir()/claudeskill-settings.json` | Full path (not just a filename) to the Claude Code settings file the installer renders and the effort feature writes back to. Set this if the file you actually pass to `claude --settings` is named something other than `claudeskill-settings.json` — without it, `install` and effort write-back target the default-named file while your `claude` invocation reads a different one, and the feature silently does nothing (no error, no warning). |
 | `SKILL_ADVISOR_BUNDLE` | — | Used by `sync-skills` as a fallback source directory when `--from` is not passed. |
 
 ### Work / private credential splits
