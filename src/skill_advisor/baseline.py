@@ -243,3 +243,55 @@ def maybe_write(cfg, *, launch_level: str | None) -> str | None:
     data["window"] = []  # consumed; start a fresh observation window
     _save(data)
     return target_level
+
+
+def first_observation(session_id: str) -> str | None:
+    data = _load()
+    firsts = data.get("first_observations", {})
+    value = firsts.get(session_id) if isinstance(firsts, dict) else None
+    return value if isinstance(value, str) else None
+
+
+def note_observation(session_id: str, level: str, cfg) -> bool:
+    """Record an observation. Returns True when this call detected a user veto.
+
+    A veto is any change from the session's FIRST observation — the user reached
+    for /effort mid-session. That signal is meaningful whether or not the advisor
+    has written anything, which is why it is defined relative to the session's own
+    launch value rather than to our settings file.
+    """
+    if not session_id or level not in effort.OBSERVABLE:
+        return False
+
+    data = _load()
+    firsts = data.setdefault("first_observations", {})
+    if not isinstance(firsts, dict):
+        firsts = {}
+        data["first_observations"] = firsts
+
+    previous = firsts.get(session_id)
+    if previous is None:
+        firsts[session_id] = level
+        _save(data)
+        return False
+
+    if previous == level:
+        return False
+
+    # Veto: reset the window so post-override evidence starts fresh, and hold
+    # off write-back for the cooldown.
+    data["veto_cooldown_remaining"] = max(int(cfg.effort.veto_cooldown_sessions), 0)
+    data["window"] = []
+    _save(data)
+    log.info("effort veto: session %s moved %s → %s", session_id, previous, level)
+    return True
+
+
+def decrement_cooldown() -> None:
+    """Tick the veto cooldown down by one session."""
+    data = _load()
+    remaining = int(data.get("veto_cooldown_remaining", 0))
+    if remaining <= 0:
+        return
+    data["veto_cooldown_remaining"] = remaining - 1
+    _save(data)

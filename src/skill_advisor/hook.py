@@ -157,24 +157,31 @@ def run() -> int:
             effort.write_recommendation(rec, session_id=session_id)
         except Exception as exc:  # pragma: no cover - defensive
             log.debug("effort write failed: %s", exc, exc_info=True)
-        if cfg.effort.nudge:
-            try:
-                obs_session, obs_level = effort.read_observed()
-                if obs_session == session_id:
-                    candidate = _nudge_message(obs_level, rec)
-                    # Check only — do NOT consume the slot here. It must not
-                    # be spent until we know the message actually reached the
-                    # user (see `_emit_nudged`); otherwise a turn that never
-                    # emits (empty picks) or fails mid-emit silently burns the
-                    # one shot this session gets for this (observed, level)
-                    # pair, and the user is never told.
-                    if candidate and not baseline.was_nudged(session_id, obs_level, rec.level):
-                        nudge = candidate
-                        observed = obs_level
-            except Exception as exc:  # pragma: no cover - defensive
-                log.debug("nudge computation failed: %s", exc, exc_info=True)
-                nudge = None
-                observed = None
+        try:
+            obs_session, observed = effort.read_observed()
+            if cfg.effort.nudge and obs_session == session_id:
+                candidate = _nudge_message(observed, rec)
+                # Check only — do NOT consume the slot here. It must not
+                # be spent until we know the message actually reached the
+                # user (see `_emit_nudged`); otherwise a turn that never
+                # emits (empty picks) or fails mid-emit silently burns the
+                # one shot this session gets for this (observed, level)
+                # pair, and the user is never told.
+                if candidate and not baseline.was_nudged(session_id, observed, rec.level):
+                    nudge = candidate
+            if observed and obs_session == session_id:
+                try:
+                    baseline.note_observation(session_id, observed, cfg)
+                except Exception as exc:  # pragma: no cover - defensive
+                    log.debug("baseline observation failed: %s", exc, exc_info=True)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("nudge computation failed: %s", exc, exc_info=True)
+            nudge = None
+            observed = None
+        try:
+            baseline.record(session_id or "", rec.level)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("baseline record failed: %s", exc, exc_info=True)
 
     if result is None or not result.picks:
         log.debug("no picks for prompt (%.2fs)", duration)

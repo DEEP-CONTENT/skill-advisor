@@ -381,3 +381,50 @@ def test_maybe_write_survives_ensure_dirs_failure(monkeypatch):
 
     monkeypatch.setattr(paths, "ensure_dirs", failing_ensure_dirs)
     assert baseline.maybe_write(_cfg(), launch_level="xhigh") is None
+
+
+# ---------------------------------------------------------------------------
+# note_observation / first_observation / decrement_cooldown: user veto
+# ---------------------------------------------------------------------------
+
+
+def test_first_observation_is_remembered():
+    baseline.note_observation("s1", "xhigh", _cfg())
+    assert baseline.first_observation("s1") == "xhigh"
+    baseline.note_observation("s1", "medium", _cfg())
+    assert baseline.first_observation("s1") == "xhigh"  # first, not latest
+
+
+def test_change_after_launch_is_a_veto():
+    assert baseline.note_observation("s1", "xhigh", _cfg()) is False
+    assert baseline.note_observation("s1", "medium", _cfg()) is True
+
+
+def test_repeated_same_observation_is_not_a_veto():
+    baseline.note_observation("s1", "high", _cfg())
+    assert baseline.note_observation("s1", "high", _cfg()) is False
+
+
+def test_veto_blocks_write_back_for_the_cooldown():
+    cfg = _cfg(veto_cooldown_sessions=2)
+    baseline.note_observation("s1", "xhigh", cfg)
+    baseline.note_observation("s1", "medium", cfg)  # veto
+    _fill("low", 3)
+    assert baseline.maybe_write(cfg, launch_level="xhigh") is None
+
+
+def test_cooldown_decrements_and_expires():
+    cfg = _cfg(veto_cooldown_sessions=1)
+    baseline.note_observation("s1", "xhigh", cfg)
+    baseline.note_observation("s1", "medium", cfg)  # veto → cooldown 1
+    baseline.decrement_cooldown()
+    _fill("low", 3)
+    assert baseline.maybe_write(cfg, launch_level="xhigh") == "low"
+
+
+def test_veto_resets_the_window():
+    _fill("low", 2)
+    cfg = _cfg()
+    baseline.note_observation("s9", "xhigh", cfg)
+    baseline.note_observation("s9", "high", cfg)  # veto
+    assert baseline.window() == []
