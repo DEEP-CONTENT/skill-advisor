@@ -1867,6 +1867,11 @@ def record(session_id: str, level: str) -> None:
         return
     data = _load()
     tallies = data.setdefault("tallies", {})
+    # Same guard the nudge ledger uses: baseline.json can be structurally
+    # corrupt (valid JSON, wrong shape) and this must never raise.
+    if not isinstance(tallies, dict):
+        tallies = {}
+        data["tallies"] = tallies
     tallies.setdefault(session_id, []).append(level)
     _save(data)
 
