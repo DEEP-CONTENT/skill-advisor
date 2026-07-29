@@ -30,9 +30,15 @@ session=$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null)
 model=$(printf '%s' "$input" | jq -r '.model.display_name // empty' 2>/dev/null)
 ctx=$(printf '%s' "$input" | jq -r '.context_window.used_percentage // empty' 2>/dev/null)
 
-# ctx must be numeric (digits + optional decimal point) or it is dropped
+# ctx must be numerically well-formed, not just the right character set:
+# digits with at most one decimal point, and at least one digit (reject "",
+# non-[0-9.] chars, "a.b.c"-style multi-dot, and a bare "." with no digits).
 case "$ctx" in
-  ''|*[!0-9.]*) ctx="" ;;
+  ''|*[!0-9.]*|*.*.*) ctx="" ;;
+esac
+case "$ctx" in
+  *[0-9]*) : ;;
+  *) ctx="" ;;
 esac
 
 # --- sensor: the only place live effort is visible ---

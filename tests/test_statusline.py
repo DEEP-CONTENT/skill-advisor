@@ -108,20 +108,65 @@ def test_sensor_file_survives_adversarial_session_id():
     assert data["level"] == "high"
 
 
-def test_non_numeric_ctx_is_dropped_not_errored():
-    """FINDING 3: an unvalidated non-numeric `used_percentage` must not reach
-    `printf '%.0f'` — the ctx segment is simply omitted, silently."""
+def _run_ctx_payload(used_percentage):
+    """Run the script with a specific (possibly malformed) ctx value, without
+    the strict `_run()` stderr assertion, so tests can inspect the raw
+    stdout/stderr themselves."""
     script = statusline.write_script()
     env = dict(os.environ)
     env["SKILL_ADVISOR_CACHE_HOME"] = str(paths.cache_dir())
     payload = _payload()
-    payload["context_window"]["used_percentage"] = "not-a-number"
-    out = subprocess.run(
+    payload["context_window"]["used_percentage"] = used_percentage
+    return subprocess.run(
         ["sh", str(script)], input=json.dumps(payload), capture_output=True, text=True, env=env
     )
+
+
+def test_non_numeric_ctx_is_dropped_not_errored():
+    """FINDING 3: an unvalidated non-numeric `used_percentage` must not reach
+    `printf '%.0f'` — the ctx segment is simply omitted, silently."""
+    out = _run_ctx_payload("not-a-number")
     assert out.returncode == 0
     assert out.stderr == ""
     assert "ctx" not in out.stdout
+
+
+def test_ctx_multiple_dots_is_dropped_not_errored():
+    """FINDING 3 (round 2): the round-1 guard `''|*[!0-9.]*` only checked the
+    character SET, not numeric well-formedness. `34.2.5` contains nothing but
+    digits and dots, so it passed the guard and still reached
+    `printf '%.0f'`, which refuses to convert it and leaks
+    `printf: 34.2.5: not completely converted` to stderr."""
+    out = _run_ctx_payload("34.2.5")
+    assert out.returncode == 0
+    assert out.stderr == ""
+    assert "ctx" not in out.stdout
+
+
+def test_ctx_lone_dot_is_dropped_not_errored():
+    """A bare `.` also passes the round-1 character-set guard (it contains
+    only `.`) but has no digits at all; printf rejects it with `expected
+    numeric value`. Found while fixing round 2's multi-dot case — same class
+    of bug, same fix."""
+    out = _run_ctx_payload(".")
+    assert out.returncode == 0
+    assert out.stderr == ""
+    assert "ctx" not in out.stdout
+
+
+def test_ctx_leading_dot_renders_without_stderr():
+    """`.5` is well-formed (a single dot, at least one digit) — it must
+    render cleanly with no stderr, whichever way the digit rounds."""
+    out = _run_ctx_payload(".5")
+    assert out.returncode == 0
+    assert out.stderr == ""
+
+
+def test_ctx_trailing_dot_renders_without_stderr():
+    """`5.` is likewise well-formed and must render cleanly with no stderr."""
+    out = _run_ctx_payload("5.")
+    assert out.returncode == 0
+    assert out.stderr == ""
 
 
 def test_unwritable_cache_dir_does_not_leak_stderr(tmp_path):
