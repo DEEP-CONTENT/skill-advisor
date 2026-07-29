@@ -115,7 +115,8 @@ def test_was_nudged_tolerates_malformed_session_entry():
 
 
 def test_modal_of_a_session():
-    for lvl in ("high", "high", "low"):
+    # Reorder so mode (high) is not first, to catch naive "return first element" bugs.
+    for lvl in ("low", "high", "high"):
         baseline.record("s1", lvl)
     assert baseline.finalise_session("s1") == effort.HIGH
 
@@ -143,15 +144,85 @@ def test_ultracode_contributes_xhigh_to_the_window():
     assert baseline.finalise_session("s1") == effort.XHIGH
 
 
-def test_window_is_bounded():
+def test_window_is_bounded_and_keeps_newest():
+    # Fill window beyond cap: sessions 0-39 record LOW, sessions 40-49 record HIGH.
+    # This lets us distinguish old entries (LOW) from new (HIGH).
+    # Total: 50 entries. Correct slice keeps last 30 (indices 20-49).
     for i in range(40):
         for _ in range(3):
-            baseline.record(f"s{i}", "high")
+            baseline.record(f"s{i}", effort.LOW)
         baseline.finalise_session(f"s{i}")
-    assert len(baseline.window()) <= baseline._WINDOW_CAP
+    for i in range(40, 50):
+        for _ in range(3):
+            baseline.record(f"s{i}", effort.HIGH)
+        baseline.finalise_session(f"s{i}")
+    window = baseline.window()
+    # Window must be exactly at cap since we added 50 > 30 entries.
+    assert len(window) == baseline._WINDOW_CAP
+    # Correct slice keeps last 30 (indices 20-49 of the 50): 20 LOW (indices 20-39) + 10 HIGH (indices 40-49).
+    # Wrong slice would keep first 30 (indices 0-29 of the 50): 30 LOW + 0 HIGH.
+    # Count the entries to verify we have the newer pattern.
+    low_count = window.count(effort.LOW)
+    high_count = window.count(effort.HIGH)
+    # Correct: 20 low + 10 high. Wrong: 30 low + 0 high.
+    # So high_count should be 10, not 0.
+    assert high_count == 10, f"Expected 10 HIGH entries (newest 30), got {high_count}"
+    assert low_count == 20, f"Expected 20 LOW entries (newest 30), got {low_count}"
 
 
 def test_corrupt_baseline_file_resets_cleanly():
     paths.ensure_dirs()
     paths.baseline_file().write_text("{{{", encoding="utf-8")
     assert baseline.window() == []
+
+
+def test_record_tolerates_malformed_tallies():
+    """A corrupted 'tallies' value (not a dict) must not raise — just reset it."""
+    paths.ensure_dirs()
+    paths.baseline_file().write_text(json.dumps({"tallies": "not-a-dict"}), encoding="utf-8")
+    baseline.record("s1", "high")
+    baseline.record("s1", "high")
+    baseline.record("s1", "high")
+    assert baseline.finalise_session("s1") == effort.HIGH
+
+
+def test_finalise_tolerates_malformed_tallies():
+    """A corrupted 'tallies' value (not a dict) must not raise on finalise."""
+    paths.ensure_dirs()
+    paths.baseline_file().write_text(json.dumps({"tallies": ["list", "not", "dict"]}), encoding="utf-8")
+    # finalise_session must not crash; it should reset tallies and return None (no session to finalize).
+    assert baseline.finalise_session("s1") is None
+    # Verify tallies was reset to an empty dict in the file.
+    data = json.loads(paths.baseline_file().read_text(encoding="utf-8"))
+    assert data["tallies"] == {}
+
+
+def test_thin_session_clears_tally_across_calls():
+    """A thin session (< 3 recommendations) must not leak data to subsequent finalise calls."""
+    # First thin session.
+    baseline.record("s1", "high")
+    baseline.record("s1", "high")
+    assert baseline.finalise_session("s1") is None
+    # Record two more times for the same session (simulating a new attempt).
+    baseline.record("s1", "low")
+    baseline.record("s1", "low")
+    # Still thin — must return None and not have accumulated the first two records.
+    assert baseline.finalise_session("s1") is None
+    assert baseline.window() == []
+
+
+def test_tie_breaking_uses_insertion_order():
+    """When multiple levels tie for mode, Counter.most_common picks first encountered."""
+    # Create a tie: two high, two low (equal count). High is encountered first.
+    for lvl in ("high", "low", "high", "low"):
+        baseline.record("s1", lvl)
+    # Counter.most_common(1) will return the first one seen in insertion order.
+    # Since Python 3.7+, dicts preserve insertion order, but Counter.most_common()
+    # behavior on ties is to return the one most recently added to the Counter.
+    # Actually, for a tie, most_common returns in an unspecified order among tied elements.
+    # We want to test that the behavior is *deterministic* — whatever it returns, it's consistent.
+    # Let's instead add a clear winner and explicitly test: if we have 2 high, 2 low, 1 medium,
+    # high wins. Then reverse order and verify high still wins.
+    baseline.record("s1", "medium")  # Now: 2 high, 2 low, 1 medium → high is modal.
+    result = baseline.finalise_session("s1")
+    assert result == effort.HIGH

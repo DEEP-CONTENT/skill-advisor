@@ -91,6 +91,9 @@ def record(session_id: str, level: str) -> None:
         return
     data = _load()
     tallies = data.setdefault("tallies", {})
+    if not isinstance(tallies, dict):
+        tallies = {}
+        data["tallies"] = tallies
     tallies.setdefault(session_id, []).append(level)
     _save(data)
 
@@ -99,6 +102,8 @@ def finalise_session(session_id: str) -> str | None:
     """Collapse a session's tally to its modal level and append to the window."""
     data = _load()
     tallies = data.get("tallies", {})
+    if not isinstance(tallies, dict):
+        tallies = {}
     levels = tallies.pop(session_id, [])
     if len(levels) < _MIN_RECOMMENDATIONS:
         data["tallies"] = tallies
