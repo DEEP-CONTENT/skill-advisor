@@ -162,6 +162,15 @@ def run() -> int:
         # a hook path and hook paths are silent on error.
         if cfg.telemetry.events_enabled:
             try:
+                # Only `failure` is stamped — `trace.ran` is left as the matcher
+                # set it. The alarm can fire AFTER the judge answered (during
+                # post-judge work in matcher.pick()), and `judge_used: true`
+                # alongside `judge_failure: "budget_exceeded"` is the intended
+                # record of exactly that: a completed verdict the alarm threw
+                # away. Forcing `ran` false here would tidy the row at the cost
+                # of the only signal that budget_seconds sits too close to the
+                # judge's own timeout. See test_budget_exceeded_after_a_
+                # completed_judge_keeps_both_facts.
                 trace.failure = judge.FAILURE_BUDGET_EXCEEDED
                 telemetry.record(
                     prompt=prompt,
