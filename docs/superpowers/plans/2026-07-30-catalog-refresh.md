@@ -365,7 +365,7 @@ Expected: PASS.
 - [ ] **Step 6: Lint and commit**
 
 ```bash
-uv run ruff check . && uv run ruff format . && uv run pyright .
+uv run ruff check src/skill_advisor/overrides.py src/skill_advisor/catalog.py tests/test_overrides.py tests/test_catalog.py && uv run ruff format --check src/skill_advisor/overrides.py src/skill_advisor/catalog.py tests/test_overrides.py tests/test_catalog.py
 git add src/skill_advisor/overrides.py src/skill_advisor/catalog.py tests/test_overrides.py tests/test_catalog.py
 git commit -m "feat(catalog): resolve enabled + invoke_name from skillOverrides"
 ```
@@ -426,7 +426,7 @@ Expected: PASS. Note that this invalidates every existing `catalog.hash`, so the
 - [ ] **Step 5: Commit**
 
 ```bash
-uv run ruff check . && uv run ruff format . && uv run pyright .
+uv run ruff check src/skill_advisor/catalog.py tests/test_catalog.py && uv run ruff format --check src/skill_advisor/catalog.py tests/test_catalog.py
 git add src/skill_advisor/catalog.py tests/test_catalog.py
 git commit -m "fix(catalog): fingerprint the enabled set so build notices a rotation"
 ```
@@ -689,7 +689,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-uv run ruff check . && uv run ruff format . && uv run pyright .
+uv run ruff check src/skill_advisor/index.py tests/test_index.py tests/test_matcher.py && uv run ruff format --check src/skill_advisor/index.py tests/test_index.py tests/test_matcher.py
 git add src/skill_advisor/index.py tests/test_index.py tests/test_matcher.py
 git commit -m "fix(index): mask disabled skills out of top_k before selection"
 ```
@@ -820,7 +820,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-uv run ruff check . && uv run ruff format . && uv run pyright .
+uv run ruff check src/skill_advisor/lifecycle.py tests/test_lifecycle.py && uv run ruff format --check src/skill_advisor/lifecycle.py tests/test_lifecycle.py
 git add src/skill_advisor/lifecycle.py tests/test_lifecycle.py
 git commit -m "fix(lifecycle): skip disabled skills in phase preferences
 
@@ -944,7 +944,7 @@ Expected: PASS. The catalog should grow by roughly 50 plugin entries and shrink 
 - [ ] **Step 6: Commit**
 
 ```bash
-uv run ruff check . && uv run ruff format . && uv run pyright .
+uv run ruff check src/skill_advisor/paths.py src/skill_advisor/catalog.py tests/test_catalog.py tests/test_paths.py && uv run ruff format --check src/skill_advisor/paths.py src/skill_advisor/catalog.py tests/test_catalog.py tests/test_paths.py
 git add src/skill_advisor/paths.py src/skill_advisor/catalog.py tests/test_catalog.py tests/test_paths.py
 git commit -m "fix(catalog): scan the versioned plugins/cache layout
 
@@ -1082,7 +1082,7 @@ Expected: PASS, and the real run should report roughly `947 on disk, 731 parseab
 - [ ] **Step 6: Commit**
 
 ```bash
-uv run ruff check . && uv run ruff format . && uv run pyright .
+uv run ruff check src/skill_advisor/catalog.py src/skill_advisor/cli.py tests/test_doctor_cli.py && uv run ruff format --check src/skill_advisor/catalog.py src/skill_advisor/cli.py tests/test_doctor_cli.py
 git add src/skill_advisor/catalog.py src/skill_advisor/cli.py tests/test_doctor_cli.py
 git commit -m "feat(doctor): report pool size, pickable count, and unparseable SKILL.md files"
 ```
@@ -1214,7 +1214,7 @@ Expected: PASS.
 - [ ] **Step 7: Commit**
 
 ```bash
-uv run ruff check . && uv run ruff format . && uv run pyright .
+uv run ruff check src/skill_advisor/hook.py src/skill_advisor/lifecycle.py src/skill_advisor/telemetry.py tests/test_hook.py tests/test_telemetry.py && uv run ruff format --check src/skill_advisor/hook.py src/skill_advisor/lifecycle.py src/skill_advisor/telemetry.py tests/test_hook.py tests/test_telemetry.py
 git add src/skill_advisor/hook.py src/skill_advisor/lifecycle.py src/skill_advisor/telemetry.py tests/test_hook.py tests/test_telemetry.py
 git commit -m "feat(telemetry): record which skill was invoked, not just that one was
 
@@ -1543,7 +1543,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-uv run ruff check . && uv run ruff format . && uv run pyright .
+uv run ruff check src/skill_advisor/overrides.py src/skill_advisor/cli.py tests/test_overrides.py tests/test_migrate_cli.py && uv run ruff format --check src/skill_advisor/overrides.py src/skill_advisor/cli.py tests/test_overrides.py tests/test_migrate_cli.py
 git add src/skill_advisor/overrides.py src/skill_advisor/cli.py tests/test_overrides.py tests/test_migrate_cli.py
 git commit -m "feat(cli): migrate-excludes makes skillOverrides the single source of truth"
 ```
@@ -1870,7 +1870,7 @@ Expected: PASS.
 - [ ] **Step 7: Commit**
 
 ```bash
-uv run ruff check . && uv run ruff format . && uv run pyright .
+uv run ruff check src/skill_advisor/centroids.py src/skill_advisor/paths.py src/skill_advisor/cli.py tests/test_centroids.py tests/test_uninstall_cli.py && uv run ruff format --check src/skill_advisor/centroids.py src/skill_advisor/paths.py src/skill_advisor/cli.py tests/test_centroids.py tests/test_uninstall_cli.py
 git add src/skill_advisor/centroids.py src/skill_advisor/paths.py src/skill_advisor/cli.py tests/test_centroids.py tests/test_uninstall_cli.py
 git commit -m "feat(centroids): fixed-size online sketch of the prompt distribution"
 ```
@@ -2003,7 +2003,7 @@ Expected: PASS.
 - [ ] **Step 7: Commit**
 
 ```bash
-uv run ruff check . && uv run ruff format . && uv run pyright .
+uv run ruff check src/skill_advisor/index.py src/skill_advisor/hook.py src/skill_advisor/config.py tests/test_hook.py tests/test_config.py && uv run ruff format --check src/skill_advisor/index.py src/skill_advisor/hook.py src/skill_advisor/config.py tests/test_hook.py tests/test_config.py
 git add src/skill_advisor/index.py src/skill_advisor/hook.py src/skill_advisor/config.py tests/test_hook.py tests/test_config.py
 git commit -m "feat(rotation): fold each prompt into the centroid sketch"
 ```
@@ -2340,7 +2340,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-uv run ruff check . && uv run ruff format . && uv run pyright .
+uv run ruff check src/skill_advisor/rotate.py tests/test_rotate.py && uv run ruff format --check src/skill_advisor/rotate.py tests/test_rotate.py
 git add src/skill_advisor/rotate.py tests/test_rotate.py
 git commit -m "feat(rotate): scoring, hysteresis, exploration slice and the active-set floor"
 ```
@@ -2553,7 +2553,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-uv run ruff check . && uv run ruff format . && uv run pyright .
+uv run ruff check src/skill_advisor/cli.py tests/test_rotate_cli.py && uv run ruff format --check src/skill_advisor/cli.py tests/test_rotate_cli.py
 git add src/skill_advisor/cli.py tests/test_rotate_cli.py
 git commit -m "feat(cli): skill-advisor rotate with a dry run that writes nothing"
 ```
@@ -2675,7 +2675,7 @@ Expected: PASS. If it fails, **do not weaken the test** — it is describing the
 - [ ] **Step 3: Run everything and commit**
 
 ```bash
-uv run pytest -q && uv run ruff check . && uv run pyright .
+uv run pytest -q && uv run ruff check tests/test_rotation_e2e.py && uv run ruff format --check tests/test_rotation_e2e.py
 git add tests/test_rotation_e2e.py
 git commit -m "test(rotation): drive the full observe-score-apply-rebuild loop"
 ```

@@ -586,11 +586,17 @@ max_candidates = 15
 # Max picks surfaced in additionalContext.
 max_picks = 3
 
-# Total hook budget in seconds. Hook exits silent if exceeded — your prompt always
-# goes through, even when the advisor can't answer in time.
-# Bump to ~15.0 if you enable use_judge = true, or ~25.0 if you enable
-# [parallelization] (judge_timeout_seconds 20 + ~3 s margin + subprocess startup).
-budget_seconds = 4.0
+# Whole-hook budget in seconds — signal.alarm() arms around the entire matcher
+# call (not just the judge). If the alarm itself fires, the hook exits silent
+# (no picks) so your prompt always goes through unaffected — but in practice
+# that's a rare last resort: the judge's own subprocess timeout is set to
+# budget_seconds - 0.5, so it always loses that race. A judge that times out
+# now falls back to the embedding ranking already computed ("embedding
+# fallback (0.NN)") instead of going silent.
+# Must be at least parallelization.judge_timeout_seconds + 3 if you enable
+# [parallelization]; `doctor` warns when it isn't.
+# Bump to ~15.0 if you enable use_judge = true.
+budget_seconds = 8.0
 
 # Minimum cosine score to surface a pick in embedding-only mode. Range 0-1;
 # 0.35 filters out weak matches on unrelated prompts.

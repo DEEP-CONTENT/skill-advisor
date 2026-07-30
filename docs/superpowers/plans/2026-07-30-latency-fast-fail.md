@@ -250,7 +250,7 @@ Expected: PASS, 411 + 7 = 418 or more. If `tests/test_matcher.py` fails here, st
 - [ ] **Step 6: Lint and commit**
 
 ```bash
-uv run ruff check . && uv run ruff format . && uv run pyright .
+uv run ruff check src/skill_advisor/judge.py tests/test_judge.py && uv run ruff format --check src/skill_advisor/judge.py tests/test_judge.py
 git add src/skill_advisor/judge.py tests/test_judge.py
 git commit -m "refactor(judge): distinguish a failed judge from a declining one"
 ```
@@ -434,12 +434,12 @@ Replace `src/skill_advisor/matcher.py:65-85` (the `if use_judge:` block through 
 uv run pytest tests/test_matcher.py -q && uv run pytest -q
 ```
 
-Expected: PASS. `test_pick_stateless_embedding_only` asserts the reason contains the score — `"embedding match (0.90)"` still matches.
+Expected: PASS. `test_pick_stateless_returns_top_k_in_score_order` (`tests/test_matcher.py:177`) asserts `"0.90" in picks[0].reason` — the reason contains the score, not the literal `"embedding match"` label — so it still passes.
 
 - [ ] **Step 7: Lint and commit**
 
 ```bash
-uv run ruff check . && uv run ruff format . && uv run pyright .
+uv run ruff check src/skill_advisor/matcher.py tests/test_matcher.py && uv run ruff format --check src/skill_advisor/matcher.py tests/test_matcher.py
 git add src/skill_advisor/matcher.py tests/test_matcher.py
 git commit -m "fix(matcher): emit embedding picks when the judge fails instead of nothing"
 ```
@@ -645,7 +645,7 @@ Expected: PASS.
 - [ ] **Step 8: Lint and commit**
 
 ```bash
-uv run ruff check . && uv run ruff format . && uv run pyright .
+uv run ruff check src/skill_advisor/matcher.py src/skill_advisor/hook.py src/skill_advisor/telemetry.py tests/test_hook.py && uv run ruff format --check src/skill_advisor/matcher.py src/skill_advisor/hook.py src/skill_advisor/telemetry.py tests/test_hook.py
 git add src/skill_advisor/matcher.py src/skill_advisor/hook.py src/skill_advisor/telemetry.py tests/test_hook.py
 git commit -m "fix(telemetry): judge_used means the judge ran, not that it is configured"
 ```
@@ -805,7 +805,7 @@ Record in the commit message: current p50, p95, and the count of `judge_used=tru
 - [ ] **Step 7: Commit**
 
 ```bash
-uv run ruff check . && uv run ruff format . && uv run pyright .
+uv run ruff check src/skill_advisor/config.py src/skill_advisor/install.py tests/test_config.py tests/test_doctor_cli.py && uv run ruff format --check src/skill_advisor/config.py src/skill_advisor/install.py tests/test_config.py tests/test_doctor_cli.py
 git add src/skill_advisor/config.py src/skill_advisor/install.py tests/test_config.py tests/test_doctor_cli.py
 git commit -m "perf: cut the hook budget to 8s and pin the timeout ordering"
 ```

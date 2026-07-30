@@ -66,6 +66,13 @@ close to self-defeating.
 
 ## Design
 
+> **Status 2026-07-30:** change 2 is implemented — see
+> `docs/superpowers/plans/2026-07-30-latency-fast-fail.md`. Change 1 (judge
+> escalation) is deferred behind the catalog refresh, because that work shrinks
+> the embedding index from 338 to ~93 entries and invalidates any confidence
+> threshold calibrated before it. See
+> `docs/superpowers/plans/2026-07-30-latency-judge-escalation.md`.
+
 Two changes, independent, either shippable alone.
 
 ### 1. Escalate to the judge only when the embedding result is ambiguous
@@ -125,9 +132,13 @@ would rather ship nothing than ship a number someone guessed.
 
 Two changes to the budget path, both small and both independent of the calibration work.
 
-**Cut `budget_seconds` from 25 to ~8.** The band table shows the judge answers usefully
-under 15 seconds or not at all — the ≥24s band produced 14 picks against 432 nothings. A
-tight budget forfeits very few real picks and eliminates the worst of the waste.
+**Cut `budget_seconds` from 25 to ~8.** (Correction, 2026-07-30: 25 was never the shipped
+default — it was the author's local `config.toml` override, which is what the telemetry
+above was measured against. The shipped default, `MatcherConfig.budget_seconds`, was 4.0.
+This change unifies both onto a single number: the shipped default is now 8.0.) The band
+table shows the judge answers usefully under 15 seconds or not at all — the ≥24s band
+produced 14 picks against 432 nothings. A tight budget forfeits very few real picks and
+eliminates the worst of the waste.
 
 The current 25-second default exists because the parallelization detector needs
 `judge_timeout_seconds + 3`. Reducing the budget therefore requires reducing
@@ -139,6 +150,15 @@ does not run under the shorter budget. `doctor` already warns when
 embedding ranking was already computed and is thrown away. Emit it instead. This alone
 converts 432 empty 25-second waits into 432 useful answers, and it holds regardless of what
 the calibration finds.
+
+(Implementation note, 2026-07-30: `judge.rank()` collapsed six distinct failure modes — no
+candidates, `claude` missing from `PATH`, subprocess timeout, subprocess error, non-zero
+exit, unparseable reply — into a single `None` return. The fallback above could not be
+built against that signature: nothing distinguished "the judge failed to produce a verdict"
+from "the judge ran and deliberately returned zero picks," and falling back on the latter
+would silently overrule a real decline. The return contract had to change first —
+`judge.rank()` now always returns a `JudgeResult`, whose `failure` field is `None` only
+when the judge ran and answered.)
 
 ---
 
@@ -169,6 +189,7 @@ even if change 1 proves infeasible.
 | Confidence rule mis-classifies a prompt as confident | A weaker pick is surfaced. Quality regression, not a failure — must be quantified during calibration, not discovered in use. |
 | `budget_seconds` set below `judge_timeout_seconds + 3` | `doctor` warns, as today. |
 | Embedding index missing | Unchanged: log and exit silent. |
+| `hook.py`'s whole-hook `signal.alarm(budget_seconds)` fires | A second, independent timeout layer from the judge's own subprocess timeout — it wraps the entire `matcher.pick()` call, not just the judge. If it fires, the hook exits silent (no picks at all), unlike the judge-timeout fallback above. The judge's own subprocess timeout must stay strictly below this ceiling so the fallback is what actually fires in practice. |
 
 ---
 

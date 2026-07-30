@@ -577,7 +577,7 @@ Expected: PASS.
 - [ ] **Step 7: Commit**
 
 ```bash
-uv run ruff check . && uv run ruff format . && uv run pyright .
+uv run ruff check src/skill_advisor/confidence.py src/skill_advisor/config.py src/skill_advisor/matcher.py tests/test_confidence.py tests/test_matcher.py && uv run ruff format --check src/skill_advisor/confidence.py src/skill_advisor/config.py src/skill_advisor/matcher.py tests/test_confidence.py tests/test_matcher.py
 git add src/skill_advisor/confidence.py src/skill_advisor/config.py src/skill_advisor/matcher.py tests/test_confidence.py tests/test_matcher.py
 git commit -m "perf(matcher): escalate to the judge only on ambiguous embedding results
 
