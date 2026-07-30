@@ -352,30 +352,56 @@ def note_observation(session_id: str, level: str, cfg) -> bool:
         return False
 
     # Veto: reset the window so post-override evidence starts fresh, and hold
-    # off write-back for the cooldown. `veto_cooldown_last_session` records the
-    # session that ARMED the cooldown, so `decrement_cooldown` never charges
-    # this same session against its own cooldown (see there for why).
+    # off write-back for the cooldown. `veto_cooldown_charged` is the set of
+    # sessions that have already consumed a unit of THIS cooldown, seeded with
+    # the arming session so it never charges its own cooldown (see
+    # `decrement_cooldown`). Re-arming replaces the list outright: a fresh veto
+    # starts a fresh cooldown, and a session that charged the previous one must
+    # be able to charge this one too.
     data["veto_cooldown_remaining"] = max(int(cfg.effort.veto_cooldown_sessions), 0)
-    data["veto_cooldown_last_session"] = session_id
+    data["veto_cooldown_charged"] = [session_id]
+    data.pop("veto_cooldown_last_session", None)  # superseded; see decrement_cooldown
     data["window"] = []
     _save(data)
     log.info("effort veto: session %s moved %s → %s", session_id, previous, level)
     return True
 
 
+def _charged_sessions(data: dict) -> list[str]:
+    """Sessions that have already consumed a unit of the current cooldown.
+
+    Falls back to the legacy single-id key so a cooldown armed by an older
+    version keeps exempting its arming session across the upgrade. A malformed
+    value degrades to "nobody has charged yet" rather than raising — this runs
+    on the Stop hook path, which must never fail.
+    """
+    charged = data.get("veto_cooldown_charged")
+    if isinstance(charged, list):
+        return [s for s in charged if isinstance(s, str)]
+    legacy = data.get("veto_cooldown_last_session")
+    return [legacy] if isinstance(legacy, str) else []
+
+
 def decrement_cooldown(session_id: str) -> None:
-    """Tick the veto cooldown down by one SESSION, not one turn.
+    """Tick the veto cooldown down by one DISTINCT session, not one turn.
 
     The Stop hook fires once per turn, so naively decrementing on every call
     drains an N-session cooldown in N turns of a single session — with
     veto_cooldown_sessions=1, the very Stop of the turn that armed the
-    cooldown would drain it to zero, giving no protection at all (F1).
+    cooldown would drain it to zero, giving no protection at all.
 
-    Track the session id that last consumed a unit (`veto_cooldown_last_session`,
-    seeded to the arming session by `note_observation`) and only decrement
-    again once a DIFFERENT session id shows up — i.e. once per session
-    boundary. Repeated Stop events (turns) within the same session, including
-    the arming session itself, are no-ops.
+    Tracking only the *last* session id fixed that but left a second hole: it
+    counted session CHANGES rather than distinct sessions, so two sessions
+    interleaving (`s1,s2,s1,s2,...`) charged on every single Stop, because the
+    previous id always differed from the current one. Measured: 20 alternating
+    turns across 2 distinct sessions drained a 10-session cooldown to zero.
+    Concurrent Claude Code sessions across repos produce exactly that pattern,
+    so the documented "suppressed for N sessions" guarantee did not hold.
+
+    Hence a set: each session id charges at most once per cooldown, in any
+    order, however many turns it takes. The list cannot outgrow the cooldown it
+    belongs to — once `remaining` reaches 0 this returns before recording
+    anything — and `note_observation` replaces it wholesale on re-arm.
     """
     if not session_id:
         return
@@ -383,10 +409,13 @@ def decrement_cooldown(session_id: str) -> None:
     remaining = int(data.get("veto_cooldown_remaining", 0))
     if remaining <= 0:
         return
-    if data.get("veto_cooldown_last_session") == session_id:
-        return  # same session already charged (or is the arming session)
+    charged = _charged_sessions(data)
+    if session_id in charged:
+        return  # already charged this cooldown (or is the arming session)
+    charged.append(session_id)
     data["veto_cooldown_remaining"] = remaining - 1
-    data["veto_cooldown_last_session"] = session_id
+    data["veto_cooldown_charged"] = charged
+    data.pop("veto_cooldown_last_session", None)  # migrated into the list above
     _save(data)
 
 
