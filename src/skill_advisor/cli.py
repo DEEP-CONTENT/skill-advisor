@@ -149,12 +149,25 @@ def _cmd_replay(args: argparse.Namespace) -> int:
             prompt = raw
 
         started = time.monotonic()
-        picks = matcher.pick(prompt, cfg)
+        result = matcher.pick(prompt, cfg)
         elapsed = time.monotonic() - started
         durations.append(elapsed)
 
-        if picks:
-            rendered = ", ".join(f"{p.entry.name} ({p.entry.kind})" for p in picks)
+        # matcher.pick() returns a PickResult (or None), not a list — the
+        # prior `picks = matcher.pick(...)` / `for p in picks` iterated the
+        # PickResult object itself, which has no __iter__ and raises
+        # `TypeError: 'PickResult' object is not iterable` for any prompt
+        # that actually produces picks. `replay` exists specifically so a
+        # user can see what the pipeline would recommend across a batch of
+        # prompts; it was non-functional on the one case that matters.
+        if result and result.picks:
+            # invoke_name (falling back to name) — the string the Skill
+            # tool actually accepts. Same fix as inject.py / the `match`
+            # renderer.
+            rendered = ", ".join(
+                f"{p.entry.invoke_name or p.entry.name} ({p.entry.kind})"
+                for p in result.picks
+            )
         else:
             rendered = "<skip>"
         print(f"[{elapsed:6.2f}s] {prompt[:70]!r:72s} -> {rendered}")
