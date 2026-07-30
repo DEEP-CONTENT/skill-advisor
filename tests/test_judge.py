@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 from skill_advisor import effort, judge
 from skill_advisor.catalog import CatalogEntry
-from skill_advisor.config import Config
+from skill_advisor.config import Config, MatcherConfig
 
 
 def _candidates():
@@ -234,3 +234,38 @@ def test_rank_on_timeout_yields_no_picks():
         ),
     ):
         assert judge.rank("anything", _candidates(), Config()).picks == []
+
+
+def test_judge_timeout_is_strictly_under_the_hook_alarm():
+    """Two independent timeout layers guard the hot path:
+
+      * judge.py:106-109  subprocess timeout = max(budget_seconds - 0.5, 0.5)
+      * hook.py:133       SIGALRM            = max(int(budget_seconds + 0.5), 1)
+
+    The alarm aborts the whole hook and returns silent, bypassing the embedding
+    fallback entirely. If it ever fires first, the fallback is dead code. Pin the
+    ordering by capturing the real timeout passed to subprocess.run.
+    """
+    import subprocess
+
+    captured = {}
+
+    def _spy(*a, timeout=None, **k):
+        captured["t"] = timeout
+        raise subprocess.TimeoutExpired(cmd=["claude"], timeout=timeout)
+
+    for budget in (1.0, 4.0, 8.0, 25.0):
+        captured.clear()
+        cfg = Config(matcher=MatcherConfig(budget_seconds=budget))
+        with (
+            patch("skill_advisor.judge.shutil.which", return_value="/usr/bin/claude"),
+            patch("skill_advisor.judge.subprocess.run", side_effect=_spy),
+        ):
+            judge.rank("prompt", _candidates(), cfg)
+
+        # hook.py's real formula at line 133
+        hook_alarm = max(int(budget + 0.5), 1)
+        assert captured["t"] < hook_alarm, (
+            f"judge timeout {captured['t']} must be strictly less than "
+            f"hook alarm {hook_alarm} for budget {budget}"
+        )

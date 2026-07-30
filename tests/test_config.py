@@ -99,24 +99,6 @@ def test_effort_section_absent_yields_defaults(tmp_path):
     assert cfg.effort.enabled is False
 
 
-def test_judge_subprocess_timeout_is_strictly_under_the_hook_alarm():
-    """Two independent timeout layers guard the hot path:
-
-      * judge.py:78    subprocess timeout = max(budget_seconds - 0.5, 0.5)
-      * hook.py:133    SIGALRM            = int(budget_seconds + 0.5)
-
-    The alarm aborts the whole hook and returns silent, bypassing the
-    embedding fallback entirely. If it ever fires first, the fallback added in
-    this plan is dead code. Pin the ordering.
-    """
-    from skill_advisor.config import Config
-
-    budget = Config().matcher.budget_seconds
-    judge_timeout = max(budget - 0.5, 0.5)
-    hook_alarm = max(int(budget + 0.5), 1)
-    assert judge_timeout < hook_alarm
-
-
 def test_shipped_defaults_keep_doctor_quiet():
     """budget_seconds must cover judge_timeout_seconds + 3 at the shipped values,
     or a fresh install warns on its first `doctor` run."""
