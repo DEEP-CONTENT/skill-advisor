@@ -32,6 +32,32 @@ class PickResult:
 class StatelessResult:
     picks: list[ResolvedPick]
     judge_effort: str | None = None
+    # True ⟺ the judge subprocess ran and returned a verdict this call.
+    judge_ran: bool = False
+    # Non-None ⟺ the judge was asked but produced nothing usable; see judge.FAILURE_*.
+    judge_failure: str | None = None
+
+
+def _embedding_picks(
+    ranked: list[tuple[CatalogEntry, float]],
+    k_picks: int,
+    min_score: float,
+    *,
+    fallback: bool = False,
+) -> list[ResolvedPick]:
+    """Turn a cosine ranking into picks, stopping at the score floor.
+
+    `ranked` is already sorted descending, so the first sub-threshold entry
+    ends the list. `fallback` only changes the reason string, so the event log
+    can tell a confident embedding pick from a judge-failure rescue.
+    """
+    label = "embedding fallback" if fallback else "embedding match"
+    out: list[ResolvedPick] = []
+    for entry, score in ranked[:k_picks]:
+        if score < min_score:
+            break
+        out.append(ResolvedPick(entry=entry, reason=f"{label} ({score:.2f})"))
+    return out
 
 
 def pick_stateless(
@@ -67,22 +93,25 @@ def pick_stateless(
         if not cand_entries:
             return StatelessResult(picks=[])
         raw = judge.rank(prompt, cand_entries, cfg)
-        if raw is None:
-            return StatelessResult(picks=[])
+        if raw.failure is not None:
+            # The judge produced no verdict. The embedding ranking is already in
+            # hand and cost nothing extra — emitting it beats going silent.
+            log.info("judge unavailable (%s); using embedding fallback", raw.failure)
+            return StatelessResult(
+                picks=_embedding_picks(ranked, k_picks, min_score, fallback=True),
+                judge_ran=False,
+                judge_failure=raw.failure,
+            )
         by_name = {e.name: e for e in cand_entries}
         out: list[ResolvedPick] = []
         for p in raw.picks[:k_picks]:
             entry = by_name.get(p.name)
             if entry is not None:
                 out.append(ResolvedPick(entry=entry, reason=p.reason))
-        return StatelessResult(picks=out, judge_effort=raw.effort)
+        # An empty `out` here is the judge declining. Respect it — do not fall back.
+        return StatelessResult(picks=out, judge_effort=raw.effort, judge_ran=True)
 
-    out: list[ResolvedPick] = []
-    for entry, score in ranked[:k_picks]:
-        if score < min_score:
-            break
-        out.append(ResolvedPick(entry=entry, reason=f"embedding match ({score:.2f})"))
-    return StatelessResult(picks=out)
+    return StatelessResult(picks=_embedding_picks(ranked, k_picks, min_score))
 
 
 def _parallelization_picks(
