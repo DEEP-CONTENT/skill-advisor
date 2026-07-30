@@ -154,15 +154,38 @@ def propose(scored: list[Scored], cfg: RotationConfig) -> Proposal:
         key=lambda s: s.total,
     )
     prop.demote = candidates[:n_demote]
+
+    # Determine which incumbents would rank in the top target by merit alone.
+    # This is used to distinguish between demotions due to exploration reserves
+    # vs demotions due to low merit score.
+    top_target_names = {ranked[i].entry.name for i in range(min(target, len(ranked)))}
+
+    # Identify exploration promotions for use in demotion reasons.
+    explore_demotions = [e for e in prop.promote if e.entry.name in explore_names]
+
     for s in prop.demote:
         last = (
             f"last invoked {s.last_invoked_days:.0f}d ago"
             if s.last_invoked_days is not None
             else "never invoked"
         )
-        prop.reason_by_name[s.entry.name] = (
-            f"total={s.total:.3f}, outside the top {target}; {last}"
-        )
+
+        # If this incumbent ranks in the top target but is demoted, it was
+        # displaced by an exploration slot (a reserved discovery slot that
+        # takes priority over merit ranking). Distinguish this from the
+        # normal "low merit score" case.
+        if s.entry.name in top_target_names and explore_demotions:
+            lowest_explore = min(explore_demotions, key=lambda e: e.total)
+            prop.reason_by_name[s.entry.name] = (
+                f"displaced by exploration slot ({lowest_explore.entry.name}: "
+                f"semantic_fit={lowest_explore.semantic_fit:.3f}); "
+                f"incumbent scores {s.total:.3f}; {last}"
+            )
+        else:
+            # Displaced on merit: incumbent's score is outside the top target.
+            prop.reason_by_name[s.entry.name] = (
+                f"total={s.total:.3f}, outside the top {target}; {last}"
+            )
 
     # The recency shield can legitimately leave the set above target — a skill
     # used yesterday is never demoted whatever it scores. That overshoot is

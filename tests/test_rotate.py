@@ -104,3 +104,52 @@ def test_every_proposal_carries_a_reason():
     prop = rotate.propose(scored, cfg)
     for s in prop.promote + prop.demote:
         assert prop.reason_by_name[s.entry.name]
+
+
+def test_exploration_driven_demotion_reason_distinguishes_cause():
+    """When exploration picks cause a demotion of an incumbent ranking in the
+    top N by merit, the reason must not falsely claim it is 'outside the top N'."""
+    cfg = RotationConfig(
+        target_active=10, min_active=0, hysteresis=0.0,
+        exploration_fraction=0.20,  # 2 exploration slots, 8 merit slots
+        recency_days=0
+    )
+
+    # 11 incumbents, 1 exploration pick
+    # All incumbents have equal semantic fit (0.5)
+    # Exploration pick has higher semantic fit (0.95)
+    entries = [_entry(f"inc{i:02d}", enabled=True) for i in range(11)]
+    entries.append(_entry("exp-pick", enabled=False))
+
+    stats = {f"inc{i:02d}": {"picks": 10, "invocations": 1, "last_invoked_days": None} for i in range(11)}
+    # All incumbents score 0.5 semantic fit, exploration pick 0.95
+    emb = _emb([0.5] * 11 + [0.95])
+
+    scored = rotate.score_pool(entries, emb, _sketch(), stats, cfg)
+    prop = rotate.propose(scored, cfg)
+
+    # Verify preconditions: exploration pick promoted
+    assert "exp-pick" in [s.entry.name for s in prop.promote]
+    assert len(prop.demote) > 0
+
+    # Get rank of each skill (0-indexed)
+    sorted_by_total = sorted(scored, key=lambda s: s.total, reverse=True)
+    rank_by_name = {s.entry.name: i for i, s in enumerate(sorted_by_total)}
+
+    # Check demoted incumbents
+    for demoted in prop.demote:
+        rank = rank_by_name[demoted.entry.name]
+        reason = prop.reason_by_name[demoted.entry.name]
+
+        # If this incumbent ranks in the top 10 (rank < 10, 0-indexed)
+        if rank < 10:
+            # Then the reason must NOT claim it's "outside the top 10"
+            assert "outside the top 10" not in reason, (
+                f"{demoted.entry.name} ranks #{rank + 1} of 12 but falsely claims "
+                f"'outside the top 10' in reason: {reason}"
+            )
+            # And it SHOULD mention that it's displaced by exploration
+            assert "exploration" in reason.lower(), (
+                f"{demoted.entry.name} ranks #{rank + 1} (top 10) but doesn't mention "
+                f"exploration in reason: {reason}"
+            )
