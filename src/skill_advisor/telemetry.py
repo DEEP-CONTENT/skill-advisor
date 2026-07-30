@@ -133,6 +133,7 @@ def record_stop(
     session_id: str | None,
     tools: Iterable[str],
     subagents: Iterable[str],
+    skills: Iterable[str] = (),
     config: TelemetryConfig,
 ) -> None:
     """Append a `kind=stop` event with the turn's tool sequence.
@@ -154,6 +155,7 @@ def record_stop(
         "session_sha256": _hash(session_id, salt) if session_id else None,
         "tools": [str(t) for t in tools],
         "subagents": [str(s) for s in subagents],
+        "skills": [str(s) for s in skills],
     }
 
     paths.ensure_dirs()

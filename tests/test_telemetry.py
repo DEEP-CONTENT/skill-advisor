@@ -314,3 +314,22 @@ def test_record_stop_session_id_hashed_not_raw(isolated_paths):
     )
     contents = (isolated_paths["cache_home"] / "advisor.events.jsonl").read_text()
     assert "raw-sess-id-DO-NOT-LOG" not in contents
+
+
+def test_stop_event_records_invoked_skills(isolated_paths):
+    import json as _json
+
+    from skill_advisor import paths, telemetry
+    from skill_advisor.config import TelemetryConfig
+
+    telemetry.record_stop(
+        session_id="s1", tools=["Skill"], subagents=[],
+        skills=["superpowers:writing-plans"],
+        config=TelemetryConfig(events_enabled=True),
+    )
+    events = [
+        _json.loads(line)
+        for line in paths.events_file().read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert events[-1]["skills"] == ["superpowers:writing-plans"]

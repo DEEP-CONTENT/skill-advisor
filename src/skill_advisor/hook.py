@@ -326,14 +326,18 @@ def run_posttooluse() -> int:
         return 0
 
     subagent_type = None
+    skill_name = None
     tool_input = event.get("tool_input") or {}
     if isinstance(tool_input, dict):
         raw_subagent = tool_input.get("subagent_type")
         if raw_subagent is not None:
             subagent_type = str(raw_subagent).strip() or None
+        raw_skill = tool_input.get("skill")
+        if raw_skill is not None:
+            skill_name = str(raw_skill).strip() or None
 
     try:
-        lifecycle.record_tool(session_id, tool_name, subagent_type=subagent_type)
+        lifecycle.record_tool(session_id, tool_name, subagent_type=subagent_type, skill_name=skill_name)
     except Exception as exc:  # pragma: no cover - defensive
         log.debug("posttooluse record failed: %s", exc, exc_info=True)
 
@@ -413,6 +417,7 @@ def run_stop() -> int:
                 session_id=session_id,
                 tools=turn.tool_names,
                 subagents=turn.subagents_invoked,
+                skills=turn.skills_invoked,
                 config=cfg.telemetry,
             )
         except Exception as exc:

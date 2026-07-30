@@ -415,6 +415,42 @@ def test_posttooluse_taskcreate_missing_subject_is_silent(monkeypatch):
     assert turn.todo_write is None
 
 
+def test_posttooluse_captures_the_invoked_skill_name(monkeypatch):
+    """`tools` records only the string "Skill" — 1,482 times across 3,971 stop
+    events, never which one. invocation_rate is uncomputable without this."""
+    import io
+    import json as _json
+    from skill_advisor import hook, lifecycle
+
+    event = {
+        "session_id": "sess-1",
+        "tool_name": "Skill",
+        "tool_input": {"skill": "superpowers:writing-plans"},
+    }
+    monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps(event)))
+    assert hook.run_posttooluse() == 0
+
+    turn = lifecycle.load_turn("sess-1")   # lifecycle.py:453, returns TurnState | None
+    assert turn is not None
+    assert turn.skills_invoked == ["superpowers:writing-plans"]
+    assert turn.tool_names == ["Skill"]    # existing path still records the tool
+
+
+def test_posttooluse_ignores_a_missing_skill_field(monkeypatch):
+    """Non-Skill tools carry no `skill` key; that must not append an empty name."""
+    import io
+    import json as _json
+    from skill_advisor import hook, lifecycle
+
+    event = {"session_id": "sess-2", "tool_name": "Read", "tool_input": {"file_path": "/x"}}
+    monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps(event)))
+    assert hook.run_posttooluse() == 0
+
+    turn = lifecycle.load_turn("sess-2")
+    assert turn is not None
+    assert turn.skills_invoked == []
+
+
 # ---------------------------------------------------------------------------
 # Effort: nudge builder + rate-limited state
 # ---------------------------------------------------------------------------

@@ -443,6 +443,7 @@ class TurnState:
     turn_started_at: float = field(default_factory=time.time)
     tool_names: list[str] = field(default_factory=list)
     subagents_invoked: list[str] = field(default_factory=list)
+    skills_invoked: list[str] = field(default_factory=list)
     todo_write: dict | None = None  # {"count": int, "titles": list[str]} or None
 
     def to_json(self) -> dict:
@@ -455,6 +456,7 @@ class TurnState:
             turn_started_at=float(data.get("turn_started_at") or time.time()),
             tool_names=list(data.get("tool_names") or []),
             subagents_invoked=list(data.get("subagents_invoked") or []),
+            skills_invoked=list(data.get("skills_invoked") or []),
             todo_write=data.get("todo_write") if isinstance(data.get("todo_write"), dict) else None,
         )
 
@@ -492,6 +494,7 @@ def record_tool(
     tool_name: str,
     *,
     subagent_type: str | None = None,
+    skill_name: str | None = None,
 ) -> TurnState:
     """Accumulate tool usage into the current turn's state file."""
     turn = load_turn(session_id) or TurnState(session_id=session_id)
@@ -499,6 +502,9 @@ def record_tool(
     # Claude Code's `Task` tool exposes the chosen subagent via tool_input.subagent_type.
     if tool_name == "Task" and subagent_type:
         turn.subagents_invoked.append(subagent_type)
+    # Claude Code's `Skill` tool exposes the invoked skill via tool_input.skill.
+    if tool_name == "Skill" and skill_name:
+        turn.skills_invoked.append(skill_name)
     save_turn(turn)
     return turn
 
