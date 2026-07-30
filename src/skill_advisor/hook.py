@@ -154,6 +154,31 @@ def run() -> int:
 
     try:
         result = matcher.pick(prompt, cfg, session_id=session_id, trace=trace)
+
+        # Fold this prompt into the centroid sketch (Task 10) so rotation can
+        # score skills that have never been used. Must run here, before the
+        # `finally` below disarms the alarm — NOT after the alarm is already
+        # off, where it previously lived. embed_one() builds a fastembed
+        # model with no bound on construction/inference time, so an unguarded
+        # call downstream of the alarm can hang the hook well past
+        # budget_seconds (proven by test_sketch_update_is_bounded_by_the_
+        # hook_alarm, which pins this with a real sleep + real SIGALRM rather
+        # than a raising mock — a mock can't prove an alarm exists).
+        # A _BudgetExceeded raised by the alarm firing mid-embed is caught by
+        # the inner except below, not the outer one: matcher.pick() already
+        # succeeded, so this is an interrupted sketch update, not a failed
+        # pick, and must not be reported as "budget exceeded" telemetry.
+        # Single gate: cfg.telemetry.events_enabled is the only check that
+        # decides whether this runs, so the privacy claim (no prompt text, no
+        # per-prompt vectors ever stored) holds by construction — there is no
+        # second, independently-maintained flag that could drift out of sync.
+        if cfg.telemetry.events_enabled:
+            try:
+                sketch = centroids.load()
+                centroids.observe(sketch, index_mod.embed_one(prompt))
+                centroids.save(sketch)
+            except Exception as exc:  # pragma: no cover - defensive; hooks never raise
+                log.debug("centroid update failed: %s", exc, exc_info=True)
     except _BudgetExceeded:
         duration = time.monotonic() - started
         log.info("budget exceeded after %.2fs; falling back silent", duration)
@@ -297,19 +322,6 @@ def run() -> int:
             )
         except Exception as exc:
             log.debug("telemetry record failed: %s", exc, exc_info=True)
-
-        # Fold this prompt into the centroid sketch (Task 10) so rotation can
-        # score skills that have never been used. Lives inside this same
-        # telemetry gate — not a second parallel gate — so the privacy claim
-        # (no prompt text, no per-prompt vectors ever stored) holds by
-        # construction rather than by two gates agreeing. Never allowed to
-        # cost the user their picks: this runs after the emit above.
-        try:
-            sketch = centroids.load()
-            centroids.observe(sketch, index_mod.embed_one(prompt))
-            centroids.save(sketch)
-        except Exception as exc:  # pragma: no cover - defensive; hooks never raise
-            log.debug("centroid update failed: %s", exc, exc_info=True)
     return 0
 
 

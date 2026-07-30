@@ -157,6 +157,46 @@ def test_a_failing_sketch_update_never_breaks_the_hook(isolated_paths):
     assert "brainstorming" in out
 
 
+def test_sketch_update_is_bounded_by_the_hook_alarm(isolated_paths):
+    """A hang inside embed_one() must be interrupted by the SIGALRM budget the
+    hook already arms around matcher.pick(), not run unbounded past it.
+
+    A raising mock (like the other sketch tests here) can prove the failure
+    path is caught, but can never prove an alarm actually exists — only a
+    real sleep racing the real signal can. This is exactly the gap that let
+    an earlier version of this wiring ship with the sketch update running
+    after signal.alarm(0) had already disarmed the timer: every test used
+    side_effect=RuntimeError, which is indistinguishable from "the alarm
+    caught it" even when there was no alarm at all.
+    """
+    import time as time_mod
+
+    import numpy as np
+
+    cfg_path = isolated_paths["config_home"] / "config.toml"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(
+        "[telemetry]\nevents_enabled = true\n\n[matcher]\nbudget_seconds = 2.0\n"
+    )
+
+    def _hang(text):
+        time_mod.sleep(12)
+        return np.zeros(384, dtype=np.float32)
+
+    with patch("skill_advisor.hook.matcher.pick", return_value=None), \
+         patch("skill_advisor.hook.index_mod.embed_one", side_effect=_hang):
+        started = time_mod.monotonic()
+        _run_with_stdin(
+            {"prompt": "why is this pod crashlooping in sydcdev", "session_id": "s1"}
+        )
+        elapsed = time_mod.monotonic() - started
+
+    assert elapsed < 6.0, (
+        f"hook.run() took {elapsed:.1f}s against a 2.0s budget; "
+        "the sketch update escaped the alarm"
+    )
+
+
 def test_hook_records_event_even_when_no_picks(isolated_paths):
     _enable_telemetry_in_config(isolated_paths)
     with patch("skill_advisor.hook.matcher.pick", return_value=None):

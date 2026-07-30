@@ -6,6 +6,7 @@ Cold load off disk (mmap'd npz + JSON) is ~20 ms on SSD.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import numpy as np
 
@@ -26,8 +27,16 @@ class Index:
     pickable: np.ndarray | None = None
 
 
+@lru_cache(maxsize=1)
 def _embed_model():
     # Lazy import — fastembed import is slow (~500 ms) and we don't want it on triage-skip paths.
+    # Cached at process scope (lru_cache, not a warm-model claim): a single hook
+    # invocation is one short-lived process that can call this more than once —
+    # e.g. top_k() during matching, then embed_one() again for the centroid
+    # sketch — and constructing TextEmbedding, not running inference, is the
+    # expensive part. Caching removes that duplicate construction; it does not
+    # make any one call fast, and does not remove the need for the SIGALRM
+    # budget around callers of embed_one()/top_k().
     from fastembed import TextEmbedding
     return TextEmbedding(model_name=_MODEL_NAME)
 
