@@ -711,6 +711,12 @@ def test_rearming_the_cooldown_clears_previously_charged_sessions():
 
     assert baseline._load()["veto_cooldown_remaining"] == 1
 
+    # ...and the NEW arming session is exempt from the cooldown it just armed.
+    # Without this, seeding the list as [] instead of [session_id] on re-arm
+    # would pass every other test in the suite.
+    baseline.decrement_cooldown("s9")
+    assert baseline._load()["veto_cooldown_remaining"] == 1
+
 
 def test_charged_session_list_stays_bounded():
     """The list is per-cooldown and cannot outgrow the cooldown it belongs to:

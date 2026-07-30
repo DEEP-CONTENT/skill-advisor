@@ -374,6 +374,12 @@ def _charged_sessions(data: dict) -> list[str]:
     version keeps exempting its arming session across the upgrade. A malformed
     value degrades to "nobody has charged yet" rather than raising — this runs
     on the Stop hook path, which must never fail.
+
+    The legacy key is dropped only when a charge is actually recorded, not on
+    the no-op paths, so a freshly upgraded file whose only Stop events come
+    from the arming session keeps the bare legacy key until a second session
+    appears or the next veto re-arms. Harmless: this fallback still reads it,
+    and the two keys are never written to disk in a conflicting state.
     """
     charged = data.get("veto_cooldown_charged")
     if isinstance(charged, list):
