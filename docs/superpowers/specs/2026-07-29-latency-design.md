@@ -66,11 +66,14 @@ close to self-defeating.
 
 ## Design
 
-> **Status 2026-07-30:** change 2 is implemented — see
-> `docs/superpowers/plans/2026-07-30-latency-fast-fail.md`. Change 1 (judge
-> escalation) is deferred behind the catalog refresh, because that work shrinks
-> the embedding index from 338 to ~93 entries and invalidates any confidence
-> threshold calibrated before it. See
+> **Status 2026-07-30:** change 2 is **shipped** — PR #2 (`judge.rank()` failure
+> taxonomy, embedding fallback on judge failure, honest `judge_used` telemetry)
+> and PR #7 (`budget_exceeded` event semantics). Its implementation plan has been
+> retired now that the work is merged; `git log` and those PRs are the record.
+>
+> Change 1 (judge escalation) is deferred behind the catalog refresh, because that
+> work shrinks the embedding index from 338 to ~93 entries and invalidates any
+> confidence threshold calibrated before it. See
 > `docs/superpowers/plans/2026-07-30-latency-judge-escalation.md`.
 
 Two changes, independent, either shippable alone.

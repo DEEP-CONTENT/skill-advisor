@@ -50,7 +50,7 @@ Every `superpowers:*` preference entry resolves to *not in catalog* because of t
 
 ### Cross-plan dependency
 
-This plan shrinks the embedding index from 338 entries to roughly 93 (56 parseable-and-enabled user skills + ~22 plugin skills + 15 builtins, before Task 5 recovers more). Every cosine ranking changes. **`docs/superpowers/plans/2026-07-30-latency-judge-escalation.md` must be calibrated after this plan lands, not before.** The fast-fail plan (`2026-07-30-latency-fast-fail.md`) is unaffected and ships independently.
+This plan shrinks the embedding index from 338 entries to roughly 93 (56 parseable-and-enabled user skills + ~22 plugin skills + 15 builtins, before Task 5 recovers more). Every cosine ranking changes. **`docs/superpowers/plans/2026-07-30-latency-judge-escalation.md` must be calibrated after this plan lands, not before.** The latency fast-fail work (change 2) was unaffected and already shipped, in PR #2 and PR #7.
 
 ---
 
