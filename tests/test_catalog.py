@@ -140,3 +140,113 @@ def test_hash_changes_when_a_skill_is_disabled(fake_claude_home):
     on = catalog.scan(Config(), overrides_table={})
     off = catalog.scan(Config(), overrides_table={"demo-skill": "off"})
     assert catalog.compute_hash(on) != catalog.compute_hash(off)
+
+
+def test_scan_finds_versioned_plugin_cache_skills(isolated_paths):
+    """55 SKILL.md files live under plugins/cache/<marketplace>/<plugin>/<version>/skills/,
+    a layout the marketplaces glob never matched. The whole superpowers plugin
+    was invisible, which is why every `superpowers:*` phase preference missed."""
+    from skill_advisor import catalog
+    from skill_advisor.config import Config
+
+    d = (
+        isolated_paths["claude_home"]
+        / "plugins"
+        / "cache"
+        / "official"
+        / "superpowers"
+        / "6.2.0"
+        / "skills"
+        / "writing-plans"
+    )
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(
+        '---\nname: writing-plans\ndescription: "Use when you have a spec."\n---\n',
+        encoding="utf-8",
+    )
+
+    entries = catalog.scan(Config(), overrides_table={})
+    got = next(e for e in entries if e.name == "writing-plans")
+    assert got.namespace == "plugin:superpowers"
+    assert got.invoke_name == "superpowers:writing-plans"
+
+
+def test_scan_keeps_both_user_and_plugin_skills_with_same_name(isolated_paths):
+    """User skill 'foo' and plugin skill 'foo' are distinct, invocable, and both
+    survive scan() because the dedup key is invoke_name, not frontmatter name.
+    Before the fix, the second would be discarded."""
+    from skill_advisor import catalog
+    from skill_advisor.config import Config
+
+    # Create user skill named 'brainstorming'
+    user_d = isolated_paths["claude_home"] / "skills" / "brainstorming"
+    user_d.mkdir(parents=True)
+    (user_d / "SKILL.md").write_text(
+        '---\nname: brainstorming\ndescription: "User brainstorming skill."\n---\n',
+        encoding="utf-8",
+    )
+
+    # Create plugin cache skill also named 'brainstorming'
+    plugin_d = (
+        isolated_paths["claude_home"]
+        / "plugins"
+        / "cache"
+        / "official"
+        / "superpowers"
+        / "6.2.0"
+        / "skills"
+        / "brainstorming"
+    )
+    plugin_d.mkdir(parents=True)
+    (plugin_d / "SKILL.md").write_text(
+        '---\nname: brainstorming\ndescription: "Plugin brainstorming skill."\n---\n',
+        encoding="utf-8",
+    )
+
+    entries = catalog.scan(Config(), overrides_table={})
+    entries_by_invoke = {e.invoke_name: e for e in entries}
+
+    # Both should be in the catalog with different invoke_names
+    assert "brainstorming" in entries_by_invoke
+    assert "superpowers:brainstorming" in entries_by_invoke
+
+    user_entry = entries_by_invoke["brainstorming"]
+    plugin_entry = entries_by_invoke["superpowers:brainstorming"]
+
+    assert user_entry.namespace == "user"
+    assert user_entry.name == "brainstorming"
+    assert plugin_entry.namespace == "plugin:superpowers"
+    assert plugin_entry.name == "brainstorming"
+
+
+def test_scan_dedupes_multiple_versions_of_same_plugin_skill(isolated_paths):
+    """Multiple installed versions of the same plugin skill collapse to one entry,
+    with the lowest version string winning due to sorted() in the glob."""
+    from skill_advisor import catalog
+    from skill_advisor.config import Config
+
+    # Create two versions of the same skill
+    for version in ("5.0.0", "6.2.0"):
+        d = (
+            isolated_paths["claude_home"]
+            / "plugins"
+            / "cache"
+            / "official"
+            / "superpowers"
+            / version
+            / "skills"
+            / "writing-plans"
+        )
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            f'---\nname: writing-plans\ndescription: "Plan skill v{version}."\n---\n',
+            encoding="utf-8",
+        )
+
+    entries = catalog.scan(Config(), overrides_table={})
+    writing_plans = [e for e in entries if e.invoke_name == "superpowers:writing-plans"]
+
+    # Only one entry should survive; the lowest version string wins
+    assert len(writing_plans) == 1
+    assert writing_plans[0].namespace == "plugin:superpowers"
+    assert writing_plans[0].name == "writing-plans"

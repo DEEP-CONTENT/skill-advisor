@@ -45,9 +45,17 @@ def skill_roots() -> list[Path]:
     """
     primary = claude_home()
     default = _home() / ".claude"
-    roots = [primary / "skills", primary / "plugins" / "marketplaces"]
+    roots = [
+        primary / "skills",
+        primary / "plugins" / "marketplaces",
+        primary / "plugins" / "cache",
+    ]
     if primary.resolve() != default.resolve():
-        for extra in (default / "skills", default / "plugins" / "marketplaces"):
+        for extra in (
+            default / "skills",
+            default / "plugins" / "marketplaces",
+            default / "plugins" / "cache",
+        ):
             if extra not in roots:
                 roots.append(extra)
     return roots

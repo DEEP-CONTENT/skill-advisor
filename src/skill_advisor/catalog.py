@@ -110,6 +110,27 @@ def _scan_plugin_skills(root: Path, table: dict[str, str]) -> Iterable[CatalogEn
             yield entry
 
 
+def _scan_plugin_cache_skills(
+    root: Path, table: dict[str, str]
+) -> Iterable[CatalogEntry]:
+    """Installed-plugin layout: <marketplace>/<plugin>/<version>/skills/<skill>/SKILL.md.
+
+    Distinct from `plugins/marketplaces/`, which is the *catalogue* of available
+    plugins. The cache is what is actually installed and invocable, and it
+    interposes a version segment — so the marketplaces glob misses it entirely.
+    """
+    if not root.is_dir():
+        return
+    for skill_md in sorted(root.glob("*/*/*/skills/*/SKILL.md")):
+        try:
+            plugin_name = skill_md.parents[3].name
+        except IndexError:
+            plugin_name = "unknown"
+        entry = _entries_from_skill_file(skill_md, f"plugin:{plugin_name}", table)
+        if entry:
+            yield entry
+
+
 def _scan_extra_root(root: Path, table: dict[str, str]) -> Iterable[CatalogEntry]:
     if not root.is_dir():
         return
@@ -151,7 +172,7 @@ def scan(
     def _accept(entry: CatalogEntry) -> None:
         if entry.name in exclude:
             return
-        key = (entry.kind, entry.name)
+        key = (entry.kind, entry.invoke_name or entry.name)
         if key in seen:
             return
         seen.add(key)
@@ -159,13 +180,17 @@ def scan(
 
     # skill_roots() returns an ordered list of candidate roots — primary
     # Claude home first, then ~/.claude fallback if primary differs. Each root
-    # is either a skills/ dir or a plugins/marketplaces dir; detect by name.
+    # is either a skills/ dir, a plugins/marketplaces dir, or a plugins/cache dir;
+    # detect by name.
     for root in paths.skill_roots():
         if root.name == "skills":
             for entry in _scan_user_skills(root, table):
                 _accept(entry)
         elif root.name == "marketplaces":
             for entry in _scan_plugin_skills(root, table):
+                _accept(entry)
+        elif root.name == "cache":
+            for entry in _scan_plugin_cache_skills(root, table):
                 _accept(entry)
 
     for extra in cfg.catalog.extra_roots:
