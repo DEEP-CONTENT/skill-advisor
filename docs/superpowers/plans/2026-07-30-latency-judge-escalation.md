@@ -22,7 +22,7 @@
 
 | Prerequisite | Why | Status |
 |---|---|---|
-| `docs/superpowers/plans/2026-07-30-latency-fast-fail.md` complete | Provides `JudgeResult.failure` (so a calibration run can tell a timeout from a decline) and honest `judge_used` telemetry (so the escalation rate is measurable at all — today the field records `cfg.matcher.use_judge`, not whether the judge ran). | required |
+| Latency fast-fail (change 2) shipped — PR #2 + PR #7 | Provides `judge.JudgeResult.failure` (so a calibration run can tell a timeout from a decline) and honest `judge_used` telemetry (so the escalation rate is measurable at all — the field previously recorded `cfg.matcher.use_judge`, not whether the judge ran). | ✅ **met** |
 | `docs/superpowers/plans/2026-07-30-catalog-refresh.md` complete | **Shrinks the embedding index from 338 entries to roughly 93.** Every cosine ranking changes, so any threshold calibrated before it is invalid. The two specs claim to be independent and can ship in either order; on this point they are wrong. | required |
 
 Both specs' "Deliberately out of scope" lists still hold: no async judge, no model swap, no verdict caching.
@@ -728,7 +728,7 @@ git commit -m "docs: measured outcome of judge escalation"
 
 ## Self-Review
 
-**Spec coverage (change 1 only).** "Escalate only when ambiguous" → Task 4. "The confidence rule is NOT yet determined" → Tasks 1-3, with an explicit stop at Task 3. All four numbered calibration requirements → Task 1 (≥200 prompts from `history.jsonl`, embedding top-K with scores plus the judge's verdict per prompt), Task 2 (a rule separating agreed from disagreed-or-declined, with precision and recall), Task 3 (say so and stop). "Do not ship a hardcoded threshold that was not derived from measured data" → the Task 3 gate and the `<THRESHOLD>` placeholder in Task 4, which is deliberately un-fillable until the note exists. "Escalation gating" test with the judge stubbed and asserting call count → Task 4 Step 1. "Latency has a regression test" → Task 5. "Measure the outcome on real data" → Task 6. Change 2 is in `2026-07-30-latency-fast-fail.md`.
+**Spec coverage (change 1 only).** "Escalate only when ambiguous" → Task 4. "The confidence rule is NOT yet determined" → Tasks 1-3, with an explicit stop at Task 3. All four numbered calibration requirements → Task 1 (≥200 prompts from `history.jsonl`, embedding top-K with scores plus the judge's verdict per prompt), Task 2 (a rule separating agreed from disagreed-or-declined, with precision and recall), Task 3 (say so and stop). "Do not ship a hardcoded threshold that was not derived from measured data" → the Task 3 gate and the `<THRESHOLD>` placeholder in Task 4, which is deliberately un-fillable until the note exists. "Escalation gating" test with the judge stubbed and asserting call count → Task 4 Step 1. "Latency has a regression test" → Task 5. "Measure the outcome on real data" → Task 6. Change 2 shipped separately in PR #2 and PR #7.
 
 **Placeholder scan.** `<SIGNAL>`, `<THRESHOLD>`, `<N>`, `<R>`, `<E>` in Task 4 are the one intentional exception, and they are the point: the plan is structured so those values cannot be invented, only measured. Everything else carries real code. Task 1 Step 2 flags that `history.jsonl`'s field names must be confirmed rather than assumed.
 
