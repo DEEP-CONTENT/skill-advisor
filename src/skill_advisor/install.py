@@ -302,10 +302,10 @@ prompt_hash_salt = ""
 # TodoWrite events during the planning phase and asks `claude -p` whether the
 # tasks can be executed as parallel subagents in isolated worktrees. Off by
 # default. Enabling requires matcher.budget_seconds >= judge_timeout_seconds + 3.
-# judge_timeout_seconds = 5.0
 # [parallelization]
 # enabled = false
 # min_tasks = 3
+# judge_timeout_seconds = 5.0
 
 [effort]
 # Master toggle. When false, nothing in this feature runs: no classification, no

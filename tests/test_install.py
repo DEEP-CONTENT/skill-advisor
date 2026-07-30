@@ -127,6 +127,28 @@ def test_default_config_text_effort_section_matches_effortconfig_defaults():
     assert parsed["effort"] == expected
 
 
+def test_uncommenting_the_parallelization_example_keeps_judge_timeout_in_section():
+    """Regression: `judge_timeout_seconds` previously sat above `# [parallelization]`,
+    still inside the preceding [telemetry] section's comment block. A user who
+    uncommented the example as shipped would have TOML silently parse the key into
+    [telemetry], where config.load() ignores unknown keys -- no error, no effect."""
+    import tomllib
+
+    text = install_mod._default_config_text()
+    commented_block = (
+        "# [parallelization]\n"
+        "# enabled = false\n"
+        "# min_tasks = 3\n"
+        "# judge_timeout_seconds = 5.0\n"
+    )
+    assert commented_block in text, "shipped [parallelization] example text changed; update this test"
+    uncommented_block = "[parallelization]\nenabled = false\nmin_tasks = 3\njudge_timeout_seconds = 5.0\n"
+
+    parsed = tomllib.loads(text.replace(commented_block, uncommented_block))
+    assert parsed["parallelization"]["judge_timeout_seconds"] == 5.0
+    assert "judge_timeout_seconds" not in parsed.get("telemetry", {})
+
+
 def test_install_alias_is_idempotent(isolated_paths, monkeypatch):
     monkeypatch.setenv("SHELL", "/bin/bash")
     shell = install_mod.detect_shell()
