@@ -702,12 +702,22 @@ def _cmd_sync_skills(args: argparse.Namespace) -> int:
 
 
 _MIGRATE_BACKUP_SUFFIX = ".pre-migrate.bak"
-# Sentinel written next to the settings backup when the settings file did NOT
-# exist before this migration wrote it. Lets --revert tell "restore from
-# backup bytes" apart from "delete the file this migration itself created" —
-# without it, a first-ever migrate (no pre-existing settings file, the
-# common first-run case) has no backup to restore, so --revert silently left
-# the freshly-created file — and its migrated `"off"` entries — in place.
+# Marker written next to the settings backup when the settings file did NOT
+# exist before this migration wrote it — a small JSON document recording
+# exactly the skillOverrides keys THIS migration added, e.g.
+# `{"keys": ["alpha", "beta"]}`. Lets --revert tell "restore from backup
+# bytes" apart from "no bytes to restore, so undo exactly what I added".
+#
+# It is NOT a blanket "delete the file" sentinel: the settings file is not
+# exclusively ours to delete just because we created it. The ordinary Stop
+# hook write-back (`baseline._write_settings_effort`, entirely automatic, no
+# user action) and `install.render_settings()` both do their own independent
+# read-modify-write of this same file, and can add `effortLevel`,
+# `statusLine`, etc. to it after we create it but before a revert. Deleting
+# the whole file on revert would destroy that too. So revert instead removes
+# exactly the recorded keys from skillOverrides via `overrides.remove_keys()`
+# and deletes the file only if what's left is PROVABLY still just our own
+# artifact — `skillOverrides` empty and no other top-level key at all.
 _MIGRATE_ABSENT_SUFFIX = ".pre-migrate.absent"
 
 
@@ -853,9 +863,10 @@ def _cmd_migrate_excludes(args: argparse.Namespace) -> int:
       * if the resolved settings file doesn't exist yet, `--create-settings`
         is required to proceed — see `_do_migrate_excludes`.
       * if THIS run is the one that creates it, a `.pre-migrate.absent`
-        marker is written next to the (nonexistent) backup so `--revert` can
-        tell "restore bytes" apart from "delete what I created" and remove
-        the file rather than leaving its migrated `off` entries in place.
+        marker records exactly which keys it added, so `--revert` can undo
+        precisely that — see the module-level comment on
+        `_MIGRATE_ABSENT_SUFFIX` for why it's a surgical key-removal and not
+        a "delete the file" sentinel.
 
     A CLI verb, so it fails loudly: the whole verb is wrapped so any
     unexpected failure (including a `ValueError` from `overrides.write()`,
@@ -882,17 +893,11 @@ def _cmd_migrate_excludes(args: argparse.Namespace) -> int:
             settings_bak.unlink()
             restored.append(str(settings_path))
         elif settings_absent.is_file():
-            # This migration created settings_path from nothing — there's no
-            # backup to restore, so reverting means deleting what we made.
-            # Only ever acts when the marker (written solely by THIS
-            # command, only when the file was absent beforehand) says so —
-            # never touches a settings file we didn't create.
-            if settings_path.is_file():
-                settings_path.unlink()
-            settings_absent.unlink()
-            restored.append(
-                f"{settings_path} (removed — did not exist before migration)"
-            )
+            outcome = _revert_absent_settings(settings_path, settings_absent)
+            if outcome is None:
+                return 1
+            if outcome:
+                restored.append(outcome)
         if not restored:
             print("nothing to revert: no .pre-migrate.bak files found")
             return 1
@@ -905,12 +910,74 @@ def _cmd_migrate_excludes(args: argparse.Namespace) -> int:
         )
     except Exception as exc:
         print(f"ERROR: migrate-excludes failed: {exc}")
-        if cfg_bak.is_file() or settings_bak.is_file() or settings_absent.is_file():
+        present = [p for p in (cfg_bak, settings_bak, settings_absent) if p.is_file()]
+        if present:
             print("Backups from this run may still be present:")
-            print(f"  {cfg_bak}")
-            print(f"  {settings_bak}")
+            for p in present:
+                print(f"  {p}")
             print("Revert with: skill-advisor migrate-excludes --revert")
         return 1
+
+
+def _revert_absent_settings(settings_path: Path, settings_absent: Path) -> str | None:
+    """Undo exactly what a migration added when it created `settings_path`
+    from nothing, using the `.pre-migrate.absent` marker's recorded keys.
+
+    Returns a human-readable description of what happened, for `restored`;
+    `""`/falsy if there was nothing to do (the file is already gone); `None`
+    on a hard failure (already reported), signalling the caller to exit 1
+    without unlinking the marker, so a retry remains possible.
+
+    Deletes `settings_path` only when what remains after removing exactly
+    the recorded keys is provably still nothing but this migration's own
+    artifact — an empty `skillOverrides` and no other top-level key. If
+    anything else is present (added by the Stop hook's effortLevel
+    write-back, `install.render_settings()`, a hand-added key, ...) the file
+    is kept and the message says so plainly.
+    """
+    try:
+        marker = json.loads(settings_absent.read_text(encoding="utf-8"))
+        migrated_keys = list(marker.get("keys", [])) if isinstance(marker, dict) else []
+    except (OSError, json.JSONDecodeError):
+        # Corrupt/legacy marker: don't guess which keys to remove — remove
+        # none, so the "only_ours" check below almost certainly keeps the
+        # file instead of risking deleting something we didn't add.
+        migrated_keys = []
+
+    if not settings_path.is_file():
+        # Already gone (deleted independently of this tool) — nothing to
+        # revert here beyond clearing the now-moot marker.
+        settings_absent.unlink()
+        return ""
+
+    if not overrides.remove_keys(migrated_keys, settings_path=settings_path):
+        print(
+            f"ERROR: could not update {settings_path} while reverting its "
+            "migrated skillOverrides keys; left unchanged. The marker is "
+            "kept so --revert can be retried."
+        )
+        return None
+
+    try:
+        remaining = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        remaining = None
+    only_ours = (
+        isinstance(remaining, dict)
+        and not remaining.get("skillOverrides")
+        and set(remaining.keys()) <= {"skillOverrides"}
+    )
+
+    settings_absent.unlink()
+    if only_ours:
+        settings_path.unlink()
+        return f"{settings_path} (removed — nothing else had been written to it)"
+
+    removed_desc = ", ".join(migrated_keys) if migrated_keys else "(none recorded)"
+    return (
+        f"{settings_path} (kept — another writer had added to it since "
+        f"migration; removed migrated keys: {removed_desc})"
+    )
 
 
 def _do_migrate_excludes(
@@ -963,7 +1030,13 @@ def _do_migrate_excludes(
         if settings_absent.is_file():
             settings_absent.unlink()
     else:
-        settings_absent.write_text("", encoding="utf-8")
+        # Record exactly which keys THIS migration is about to add, so
+        # --revert can remove precisely those later rather than assuming the
+        # whole file is safe to delete (see the module-level comment on
+        # _MIGRATE_ABSENT_SUFFIX).
+        settings_absent.write_text(
+            json.dumps({"keys": sorted(migratable)}) + "\n", encoding="utf-8"
+        )
         if settings_bak.is_file():
             settings_bak.unlink()
 
@@ -1003,7 +1076,11 @@ def _do_migrate_excludes(
     settings_backup_note = (
         str(settings_bak)
         if settings_bak.is_file()
-        else f"{settings_absent} (marker — settings file didn't exist; --revert deletes it)"
+        else (
+            f"{settings_absent} (marker — settings file didn't exist; --revert "
+            "removes just these keys, deleting the file only if nothing else "
+            "was written to it since)"
+        )
     )
     print(f"backups: {cfg_bak}\n         {settings_backup_note}")
     print("revert with: skill-advisor migrate-excludes --revert")

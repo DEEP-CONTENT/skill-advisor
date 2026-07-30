@@ -294,3 +294,116 @@ def test_write_config_toml_returns_false_when_replace_raises(
 
     assert cfg_path.read_bytes() == before
     assert list(cfg_path.parent.glob("*.toml.tmp.*")) == []
+
+
+# --- round 3: revert must remove ONLY the keys it added, never the whole
+# file, once anything else has legitimately written to it ---
+
+
+def test_revert_survives_an_effort_writeback_between_migrate_and_revert(
+    isolated_paths,
+):
+    """Reproduces the reviewer's live finding: the ordinary Stop-hook
+    effortLevel write-back (`baseline._write_settings_effort`, entirely
+    automatic — no user action) can add `effortLevel` to the settings file
+    THIS migration created, between the migrate and the revert. --revert
+    must not delete the file (and effortLevel with it) — it must remove only
+    the migrated skillOverrides keys and keep the file."""
+    from skill_advisor import baseline
+
+    _write_user_skill(isolated_paths["claude_home"], "mu")
+    _write_config(isolated_paths["config_home"], ["mu"])
+    assert not paths.settings_file().is_file()
+
+    assert cli._cmd_migrate_excludes(_ns(create_settings=True)) == 0
+    settings = json.loads(paths.settings_file().read_text(encoding="utf-8"))
+    assert settings["skillOverrides"] == {"mu": "off"}
+
+    # An ordinary, fully automatic write-back unrelated to migrate-excludes.
+    assert baseline._write_settings_effort("high") is True
+
+    assert cli._cmd_migrate_excludes(_ns(revert=True)) == 0
+
+    assert paths.settings_file().is_file()
+    settings = json.loads(paths.settings_file().read_text(encoding="utf-8"))
+    assert settings["effortLevel"] == "high"
+    assert settings["skillOverrides"] == {}
+    assert "mu" not in settings["skillOverrides"]
+
+
+def test_revert_deletes_the_file_when_nothing_else_touched_it(isolated_paths):
+    """The clean case must keep working: nothing else wrote to the file
+    between migrate and revert, so it's provably still just our own
+    artifact and --revert deletes it."""
+    _write_user_skill(isolated_paths["claude_home"], "nu")
+    _write_config(isolated_paths["config_home"], ["nu"])
+    cfg_original = (isolated_paths["config_home"] / "config.toml").read_bytes()
+
+    assert cli._cmd_migrate_excludes(_ns(create_settings=True)) == 0
+    assert paths.settings_file().is_file()
+
+    assert cli._cmd_migrate_excludes(_ns(revert=True)) == 0
+
+    assert not paths.settings_file().is_file()
+    assert (isolated_paths["config_home"] / "config.toml").read_bytes() == cfg_original
+
+
+def test_revert_keeps_a_hand_added_skill_override_and_only_drops_migrated_ones(
+    isolated_paths,
+):
+    """A foreign skillOverrides key added by hand (or any other writer)
+    after migrate must survive revert; only the keys THIS migration added
+    are removed."""
+    _write_user_skill(isolated_paths["claude_home"], "xi")
+    _write_config(isolated_paths["config_home"], ["xi"])
+
+    assert cli._cmd_migrate_excludes(_ns(create_settings=True)) == 0
+
+    settings_path = paths.settings_file()
+    data = json.loads(settings_path.read_text(encoding="utf-8"))
+    data["skillOverrides"]["hand-added-by-someone-else"] = "off"
+    settings_path.write_text(json.dumps(data), encoding="utf-8")
+
+    assert cli._cmd_migrate_excludes(_ns(revert=True)) == 0
+
+    assert settings_path.is_file()
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert settings["skillOverrides"] == {"hand-added-by-someone-else": "off"}
+
+
+def test_stacked_migrate_then_revert_restores_from_real_backup_byte_identical(
+    isolated_paths,
+):
+    """Migrate twice without reverting in between: the second run must
+    observe the settings file (created by the first run) as pre-existing,
+    take a REAL .bak snapshot of it, and clear the stale .absent marker from
+    run 1 — not keep treating the file as still-absent. --revert after the
+    second run must then restore from that real backup byte-identically,
+    not fall into the surgical-removal/delete-if-empty path. The reviewer
+    confirmed this already works; this is its first dedicated test."""
+    _write_user_skill(isolated_paths["claude_home"], "omicron")
+    _write_config(isolated_paths["config_home"], ["omicron"])
+
+    assert cli._cmd_migrate_excludes(_ns(create_settings=True)) == 0
+    settings_bak_path = paths.settings_file().with_name(
+        paths.settings_file().name + ".pre-migrate.bak"
+    )
+    settings_absent_path = paths.settings_file().with_name(
+        paths.settings_file().name + ".pre-migrate.absent"
+    )
+    assert not settings_bak_path.is_file()
+    assert settings_absent_path.is_file()
+
+    after_first_migrate = paths.settings_file().read_bytes()
+
+    _write_user_skill(isolated_paths["claude_home"], "pi")
+    _write_config(isolated_paths["config_home"], ["pi"])
+
+    assert cli._cmd_migrate_excludes(_ns(create_settings=True)) == 0
+    assert settings_bak_path.is_file()  # real backup taken this time
+    assert not settings_absent_path.is_file()  # stale marker cleared
+
+    assert cli._cmd_migrate_excludes(_ns(revert=True)) == 0
+
+    assert paths.settings_file().is_file()
+    assert paths.settings_file().read_bytes() == after_first_migrate
