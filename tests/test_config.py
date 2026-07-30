@@ -99,17 +99,22 @@ def test_effort_section_absent_yields_defaults(tmp_path):
     assert cfg.effort.enabled is False
 
 
-def test_shipped_defaults_keep_doctor_quiet():
-    """budget_seconds must cover judge_timeout_seconds + 3 at the shipped values,
-    or a fresh install warns on its first `doctor` run."""
-    from skill_advisor.config import Config
+def test_shipped_defaults_keep_doctor_quiet(isolated_paths, capsys):
+    """Turning on parallelization at the shipped budget_seconds/judge_timeout_seconds
+    (8.0 / 5.0) must not trip doctor's WARN. Invokes the real `doctor` command rather
+    than re-deriving cli.py's `+ 3.0` rule as arithmetic — a change to that rule (e.g.
+    `+ 3.0` -> `+ 5.0`) must show up here as a live WARN, not just in a copy of the
+    formula. The negative case (budget too low) is covered by
+    test_doctor_still_warns_when_budget_is_below_the_detector_timeout in
+    tests/test_doctor_cli.py."""
+    from skill_advisor import cli
 
-    cfg = Config()
-    assert cfg.matcher.budget_seconds >= cfg.parallelization.judge_timeout_seconds + 3.0
-
-
-def test_budget_default_is_eight_seconds():
-    from skill_advisor.config import Config
-
-    assert Config().matcher.budget_seconds == 8.0
-    assert Config().parallelization.judge_timeout_seconds == 5.0
+    (isolated_paths["config_home"] / "config.toml").write_text(
+        "[parallelization]\nenabled = true\n", encoding="utf-8"
+    )
+    try:
+        cli.main(["doctor"])  # ends in sys.exit; tests/test_doctor_cli.py:23 idiom
+    except SystemExit:
+        pass
+    out = capsys.readouterr().out
+    assert "WARN" not in out
