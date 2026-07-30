@@ -606,6 +606,60 @@ def _rotation_stats(events: list[dict]) -> dict[str, dict]:
     return out
 
 
+_DEFAULT_ROTATE_PRINT_LIMIT = 20
+
+
+def _rotatable_pool(catalog: list, embeddings):
+    """Filter the full catalog down to entries `overrides.override_key()`
+    can actually address, in lockstep with their embedding rows.
+
+    Subagents, slash commands, and plugin-namespaced skills are permanently
+    enabled — `override_key()` returns `None` for all three (verified live:
+    docs/superpowers/notes/2026-07-30-skilloverrides-verification.md, cases C
+    and D) — so neither promoting nor demoting one can ever change anything.
+    Excluding them HERE, before scoring, rather than only suppressing them at
+    print time, matters: a scored-but-unprintable entry would still distort
+    `pick_rate`'s max-picks normalisation and the target/active arithmetic in
+    `rotate.propose()`, even if the printed proposal hid it. Filtering first
+    is also what guarantees `proposal.promote`/`.demote` can never contain an
+    entry whose `override_key()` is `None` — the property that makes the
+    printed dry run honest about what `--apply` can actually do.
+
+    Returns `(pool_catalog, pool_embeddings, excluded_count)`.
+    """
+    keep = [
+        i
+        for i, e in enumerate(catalog)
+        if overrides.override_key(
+            kind=e.kind, namespace=e.namespace, path=e.path, name=e.name
+        )
+        is not None
+    ]
+    pool_catalog = [catalog[i] for i in keep]
+    pool_embeddings = embeddings[keep] if keep else embeddings[:0]
+    return pool_catalog, pool_embeddings, len(catalog) - len(keep)
+
+
+def _print_proposal_lines(
+    verb: str, noun: str, items: list, reason_by_name: dict, limit: int
+) -> None:
+    """Print up to `limit` lines for one direction of the proposal.
+
+    `limit <= 0` means show everything. A list longer than what fits is
+    still announced explicitly ("… +N more") rather than silently cut — a
+    silent cut reads as "that's everything" to the human deciding whether to
+    apply this, which is worse than not printing the tail at all.
+    """
+    shown = items if limit <= 0 else items[:limit]
+    for s in shown:
+        name = s.entry.invoke_name or s.entry.name
+        print(f"  {verb} {name:45} {reason_by_name[s.entry.name]}")
+    remaining = len(items) - len(shown)
+    if remaining > 0:
+        plural = noun if remaining == 1 else f"{noun}s"
+        print(f"  … +{remaining} more {plural}")
+
+
 def _cmd_rotate(args: argparse.Namespace) -> int:
     """Propose (or, with --apply, write) active-skill-set rotation.
 
@@ -629,6 +683,7 @@ def _cmd_rotate(args: argparse.Namespace) -> int:
     rot = cfg.rotation
     if args.target is not None:
         rot = dataclasses.replace(rot, target_active=int(args.target))
+    limit = args.limit if args.limit is not None else _DEFAULT_ROTATE_PRINT_LIMIT
 
     try:
         idx = index_mod.load()
@@ -636,14 +691,20 @@ def _cmd_rotate(args: argparse.Namespace) -> int:
         print(f"ERROR: {exc}")
         return 1
 
+    pool_catalog, pool_embeddings, excluded = _rotatable_pool(
+        idx.catalog, idx.embeddings
+    )
+
     sketch = centroids.load()
     events = list(telemetry.iter_events())  # cutoff=None: the whole log
     stats = _rotation_stats(events)
 
-    active = sum(1 for e in idx.catalog if e.enabled)
+    active = sum(1 for e in pool_catalog if e.enabled)
     print(
-        f"pool {len(idx.catalog)} · active {active} · target {rot.target_active} "
-        f"· sketch {sketch.observed} prompts"
+        f"catalog {len(idx.catalog)} entries · excluded {excluded} unrotatable "
+        "(subagents, slash commands, plugin skills — not addressable via "
+        f"skillOverrides) · pool {len(pool_catalog)} · active {active} · "
+        f"target {rot.target_active} · sketch {sketch.observed} prompts"
     )
     if not cfg.telemetry.events_enabled:
         print(
@@ -652,7 +713,7 @@ def _cmd_rotate(args: argparse.Namespace) -> int:
         )
 
     try:
-        scored = rotate.score_pool(idx.catalog, idx.embeddings, sketch, stats, rot)
+        scored = rotate.score_pool(pool_catalog, pool_embeddings, sketch, stats, rot)
         proposal = rotate.propose(scored, rot)
     except rotate.RotationRefused as exc:
         print(f"rotation refused: {exc}")
@@ -662,23 +723,32 @@ def _cmd_rotate(args: argparse.Namespace) -> int:
         print("no changes proposed")
         return 0
 
-    for s in proposal.promote:
-        name = s.entry.invoke_name or s.entry.name
-        print(f"  PROMOTE {name:45} {proposal.reason_by_name[s.entry.name]}")
-    for s in proposal.demote:
-        name = s.entry.invoke_name or s.entry.name
-        print(f"  DEMOTE  {name:45} {proposal.reason_by_name[s.entry.name]}")
+    resulting_active = active + len(proposal.promote) - len(proposal.demote)
+    print(
+        f"proposal: {len(proposal.promote)} promotion(s), "
+        f"{len(proposal.demote)} demotion(s) → {resulting_active} active"
+    )
+    _print_proposal_lines(
+        "PROMOTE", "promotion", proposal.promote, proposal.reason_by_name, limit
+    )
+    _print_proposal_lines(
+        "DEMOTE ", "demotion", proposal.demote, proposal.reason_by_name, limit
+    )
 
     if not args.apply:
         print("\n(dry run — nothing written; rerun with --apply)")
         return 0
 
     # `overrides.override_key()` returns None for entries skillOverrides
-    # cannot address (plugin-namespaced skills, verified live — see
+    # cannot address (subagents, slash commands, plugin-namespaced skills —
+    # verified live, see
     # docs/superpowers/notes/2026-07-30-skilloverrides-verification.md).
-    # Skip those rather than inventing a key: writing a namespaced key would
-    # be silently ignored by Claude Code, so `rotate --apply` would report
-    # success while changing nothing for that entry.
+    # `_rotatable_pool()` above already excludes every such entry from
+    # scoring, so this can't actually fire today — kept as defense in depth
+    # rather than trusting that invariant to hold forever. Skip rather than
+    # invent a key: writing a namespaced key would be silently ignored by
+    # Claude Code, so `rotate --apply` would report success while changing
+    # nothing for that entry.
     updates: dict[str, str] = {}
     for s in proposal.promote:
         key = overrides.override_key(
@@ -1471,6 +1541,15 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="override rotation.target_active for this run",
+    )
+    p_rotate.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help=(
+            f"max PROMOTE/DEMOTE lines to print per direction "
+            f"(default {_DEFAULT_ROTATE_PRINT_LIMIT}; 0 = show all)"
+        ),
     )
     p_rotate.set_defaults(func=_cmd_rotate)
 

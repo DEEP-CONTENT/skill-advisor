@@ -15,7 +15,7 @@ from skill_advisor.catalog import CatalogEntry
 
 def _ns(**kw):
     """Namespace stub matching what the `rotate` parser produces."""
-    base = {"apply": False, "target": None, "verbose": False}
+    base = {"apply": False, "target": None, "limit": None, "verbose": False}
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -234,3 +234,171 @@ def test_rotate_target_override(isolated_paths, capsys):
     assert cli._cmd_rotate(_ns(target=3)) == 0
     out = capsys.readouterr().out
     assert "target 3" in out
+
+
+def _prime_state_with_unrotatable_entries(
+    isolated_paths, *, observed: int = 1000
+) -> None:
+    """Same shape as `_prime_rotatable_state`, plus a subagent, a slash
+    command, and a plugin-namespaced skill mixed into the catalog. None of
+    the three has an `overrides.override_key()` — proves the rotation pool
+    excludes them entirely rather than merely hiding them at print time.
+
+    The subagent and command get very LOW fit while `enabled=True` — if the
+    pool filter were missing, they'd be unmistakable DEMOTE candidates. The
+    plugin skill gets very HIGH fit while `enabled=False` — if the filter
+    were missing, it would be an unmistakable PROMOTE candidate.
+    """
+    entries: list[CatalogEntry] = []
+    fits: list[float] = []
+    for i in range(5):
+        entries.append(
+            CatalogEntry(
+                kind="skill",
+                name=f"active{i}",
+                namespace="user",
+                description=f"active skill {i}",
+                path=f"/skills/active{i}/SKILL.md",
+                enabled=True,
+            )
+        )
+        fits.append(0.10 + i * 0.01)
+    for i in range(5):
+        entries.append(
+            CatalogEntry(
+                kind="skill",
+                name=f"cand{i}",
+                namespace="user",
+                description=f"candidate skill {i}",
+                path=f"/skills/cand{i}/SKILL.md",
+                enabled=False,
+            )
+        )
+        fits.append(0.95 - i * 0.01)
+
+    entries.append(
+        CatalogEntry(
+            kind="subagent",
+            name="my-subagent",
+            namespace="builtin",
+            description="a builtin subagent",
+            path="",
+            enabled=True,
+        )
+    )
+    fits.append(0.01)
+    entries.append(
+        CatalogEntry(
+            kind="command",
+            name="/my-command",
+            namespace="builtin",
+            description="a builtin slash command",
+            path="",
+            enabled=True,
+        )
+    )
+    fits.append(0.01)
+    entries.append(
+        CatalogEntry(
+            kind="skill",
+            name="plugin-skill",
+            namespace="plugin:demo",
+            description="a plugin-namespaced skill",
+            path="/plugins/demo/skills/plugin-skill/SKILL.md",
+            enabled=False,
+        )
+    )
+    fits.append(0.99)
+
+    embeddings = _emb(fits)
+    source_hash = catalog_mod.compute_hash(entries)
+    index_mod.save(entries, embeddings, source_hash)
+
+    sketch = centroids.empty(k=2)
+    v = np.zeros(centroids.DIM, dtype=np.float32)
+    v[0] = 1.0
+    sketch.vectors[0] = v
+    sketch.counts[0] = observed
+    sketch.observed = observed
+    centroids.save(sketch)
+
+    _write_rotation_config()
+
+
+def test_unrotatable_entries_are_excluded_from_the_pool(isolated_paths, capsys):
+    """A subagent, a slash command, and a plugin skill sit in the catalog
+    alongside user skills. `overrides.override_key()` is None for all three,
+    so none is addressable via skillOverrides — none may appear in either
+    direction of the proposal, and the exclusion must be visible in the
+    printed summary so the pool count reconciles with the catalog size."""
+    from skill_advisor import cli
+
+    _prime_state_with_unrotatable_entries(isolated_paths)
+    assert cli._cmd_rotate(_ns()) == 0
+    out = capsys.readouterr().out
+
+    assert "my-subagent" not in out
+    assert "/my-command" not in out
+    assert "plugin-skill" not in out
+    assert "excluded 3" in out
+
+
+def _prime_large_pool(isolated_paths, *, n: int = 30, observed: int = 1000) -> None:
+    """`n` enabled skills with a small fit spread, zero disabled candidates.
+    With target_active well below `n`, this produces `n - target_active`
+    demotions and zero promotions — comfortably more than a small --limit,
+    to exercise the print cap and its explicit truncation."""
+    entries: list[CatalogEntry] = []
+    fits: list[float] = []
+    for i in range(n):
+        entries.append(
+            CatalogEntry(
+                kind="skill",
+                name=f"skill{i:02d}",
+                namespace="user",
+                description=f"skill {i}",
+                path=f"/skills/skill{i:02d}/SKILL.md",
+                enabled=True,
+            )
+        )
+        fits.append(0.05 + i * 0.001)
+
+    embeddings = _emb(fits)
+    source_hash = catalog_mod.compute_hash(entries)
+    index_mod.save(entries, embeddings, source_hash)
+
+    sketch = centroids.empty(k=2)
+    v = np.zeros(centroids.DIM, dtype=np.float32)
+    v[0] = 1.0
+    sketch.vectors[0] = v
+    sketch.counts[0] = observed
+    sketch.observed = observed
+    centroids.save(sketch)
+
+    paths.ensure_dirs()
+    paths.config_file().write_text(
+        "[rotation]\n"
+        "target_active = 5\n"
+        "min_active = 2\n"
+        "hysteresis = 0.0\n"
+        "exploration_fraction = 0.0\n"
+        "recency_days = 0\n"
+        "min_observed_prompts = 200\n",
+        encoding="utf-8",
+    )
+
+
+def test_proposal_list_is_capped_with_explicit_truncation(isolated_paths, capsys):
+    """30 active skills, target_active=5 → 25 demotions. --limit 5 must still
+    print complete summary counts, cap the printed lines at 5, and state the
+    truncation explicitly rather than silently cutting the list."""
+    from skill_advisor import cli
+
+    _prime_large_pool(isolated_paths, n=30)
+    assert cli._cmd_rotate(_ns(limit=5)) == 0
+    out = capsys.readouterr().out
+
+    assert "25 demotion(s)" in out
+    assert "5 active" in out  # resulting active-set size in the summary
+    assert out.count("DEMOTE") == 5  # printed lines capped
+    assert "+20 more demotions" in out
