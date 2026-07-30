@@ -702,6 +702,13 @@ def _cmd_sync_skills(args: argparse.Namespace) -> int:
 
 
 _MIGRATE_BACKUP_SUFFIX = ".pre-migrate.bak"
+# Sentinel written next to the settings backup when the settings file did NOT
+# exist before this migration wrote it. Lets --revert tell "restore from
+# backup bytes" apart from "delete the file this migration itself created" —
+# without it, a first-ever migrate (no pre-existing settings file, the
+# common first-run case) has no backup to restore, so --revert silently left
+# the freshly-created file — and its migrated `"off"` entries — in place.
+_MIGRATE_ABSENT_SUFFIX = ".pre-migrate.absent"
 
 
 def _classify_exclude_names(
@@ -840,6 +847,16 @@ def _cmd_migrate_excludes(args: argparse.Namespace) -> int:
     Hence the backups and the printed revert command — read the first
     `rotate --dry-run` after migrating rather than applying it blind.
 
+    Two safety rails, both because `paths.settings_file()` can silently
+    resolve to a file Claude Code never reads (wrong/unset
+    `SKILL_ADVISOR_SETTINGS_FILE`):
+      * if the resolved settings file doesn't exist yet, `--create-settings`
+        is required to proceed — see `_do_migrate_excludes`.
+      * if THIS run is the one that creates it, a `.pre-migrate.absent`
+        marker is written next to the (nonexistent) backup so `--revert` can
+        tell "restore bytes" apart from "delete what I created" and remove
+        the file rather than leaving its migrated `off` entries in place.
+
     A CLI verb, so it fails loudly: the whole verb is wrapped so any
     unexpected failure (including a `ValueError` from `overrides.write()`,
     which should be unreachable now that only addressable names are ever
@@ -850,14 +867,32 @@ def _cmd_migrate_excludes(args: argparse.Namespace) -> int:
     settings_path = paths.settings_file()
     cfg_bak = cfg_path.with_name(cfg_path.name + _MIGRATE_BACKUP_SUFFIX)
     settings_bak = settings_path.with_name(settings_path.name + _MIGRATE_BACKUP_SUFFIX)
+    settings_absent = settings_path.with_name(
+        settings_path.name + _MIGRATE_ABSENT_SUFFIX
+    )
 
     if args.revert:
         restored = []
-        for bak, live in ((cfg_bak, cfg_path), (settings_bak, settings_path)):
-            if bak.is_file():
-                live.write_bytes(bak.read_bytes())
-                bak.unlink()
-                restored.append(str(live))
+        if cfg_bak.is_file():
+            cfg_path.write_bytes(cfg_bak.read_bytes())
+            cfg_bak.unlink()
+            restored.append(str(cfg_path))
+        if settings_bak.is_file():
+            settings_path.write_bytes(settings_bak.read_bytes())
+            settings_bak.unlink()
+            restored.append(str(settings_path))
+        elif settings_absent.is_file():
+            # This migration created settings_path from nothing — there's no
+            # backup to restore, so reverting means deleting what we made.
+            # Only ever acts when the marker (written solely by THIS
+            # command, only when the file was absent beforehand) says so —
+            # never touches a settings file we didn't create.
+            if settings_path.is_file():
+                settings_path.unlink()
+            settings_absent.unlink()
+            restored.append(
+                f"{settings_path} (removed — did not exist before migration)"
+            )
         if not restored:
             print("nothing to revert: no .pre-migrate.bak files found")
             return 1
@@ -865,10 +900,12 @@ def _cmd_migrate_excludes(args: argparse.Namespace) -> int:
         return 0
 
     try:
-        return _do_migrate_excludes(cfg_path, settings_path, cfg_bak, settings_bak)
+        return _do_migrate_excludes(
+            cfg_path, settings_path, cfg_bak, settings_bak, settings_absent, args
+        )
     except Exception as exc:
         print(f"ERROR: migrate-excludes failed: {exc}")
-        if cfg_bak.is_file() or settings_bak.is_file():
+        if cfg_bak.is_file() or settings_bak.is_file() or settings_absent.is_file():
             print("Backups from this run may still be present:")
             print(f"  {cfg_bak}")
             print(f"  {settings_bak}")
@@ -877,7 +914,12 @@ def _cmd_migrate_excludes(args: argparse.Namespace) -> int:
 
 
 def _do_migrate_excludes(
-    cfg_path: Path, settings_path: Path, cfg_bak: Path, settings_bak: Path
+    cfg_path: Path,
+    settings_path: Path,
+    cfg_bak: Path,
+    settings_bak: Path,
+    settings_absent: Path,
+    args: argparse.Namespace,
 ) -> int:
     cfg = load_config()
     names = list(cfg.catalog.exclude_names)
@@ -898,11 +940,32 @@ def _do_migrate_excludes(
             print(f"  retained: {name} — {reasons[name]}")
         return 0
 
+    if not settings_path.is_file() and not args.create_settings:
+        print(f"ERROR: settings file does not exist: {settings_path}")
+        print(
+            "A missing target usually means SKILL_ADVISOR_SETTINGS_FILE isn't "
+            "pointed at the file your `claude --settings ...` invocation "
+            "actually reads — writing skillOverrides here would be silently "
+            "inert (see paths.settings_file()'s own docstring on this trap)."
+        )
+        print(
+            "If a fresh settings file at this exact path is intentional (e.g. "
+            "a brand-new install), re-run with --create-settings."
+        )
+        return 1
+
     paths.ensure_dirs()
     if cfg_path.is_file():
         cfg_bak.write_bytes(cfg_path.read_bytes())
+
     if settings_path.is_file():
         settings_bak.write_bytes(settings_path.read_bytes())
+        if settings_absent.is_file():
+            settings_absent.unlink()
+    else:
+        settings_absent.write_text("", encoding="utf-8")
+        if settings_bak.is_file():
+            settings_bak.unlink()
 
     try:
         wrote = overrides.write(migratable)
@@ -919,8 +982,10 @@ def _do_migrate_excludes(
     if not _write_config_toml(cfg_path, new_text):
         print(
             "ERROR: could not write config.toml; skillOverrides was already "
-            "updated with the entries below, but config.toml is unchanged."
+            "updated with the following entries, but config.toml is unchanged:"
         )
+        for name in migratable:
+            print(f"  {name}")
         print(f"config.toml backup: {cfg_bak}")
         print("Revert with: skill-advisor migrate-excludes --revert")
         return 1
@@ -935,7 +1000,12 @@ def _do_migrate_excludes(
         )
         for name in retained:
             print(f"  {name} — {reasons[name]}")
-    print(f"backups: {cfg_bak}\n         {settings_bak}")
+    settings_backup_note = (
+        str(settings_bak)
+        if settings_bak.is_file()
+        else f"{settings_absent} (marker — settings file didn't exist; --revert deletes it)"
+    )
+    print(f"backups: {cfg_bak}\n         {settings_backup_note}")
     print("revert with: skill-advisor migrate-excludes --revert")
     print(
         "NEXT: run `skill-advisor build`, then read `skill-advisor rotate` "
@@ -1150,6 +1220,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="move catalog.exclude_names into skillOverrides (one-time, reversible)",
     )
     p_migrate.add_argument("--revert", action="store_true", help="restore the pre-migration backups")
+    p_migrate.add_argument(
+        "--create-settings",
+        action="store_true",
+        help=(
+            "allow creating the settings file at the resolved "
+            "SKILL_ADVISOR_SETTINGS_FILE path if it doesn't exist yet. "
+            "Required so a wrong/unset env var can't silently write "
+            "skillOverrides to a file Claude Code never reads."
+        ),
+    )
     p_migrate.set_defaults(func=_cmd_migrate_excludes)
 
     return parser
