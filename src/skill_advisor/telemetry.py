@@ -76,6 +76,7 @@ def record(
     phase: str = "none",
     phase_source: str = "user",
     judge_used: bool = False,
+    judge_failure: str | None = None,
     triage_skipped: bool = False,
     duration_ms: int = 0,
     config: TelemetryConfig,
@@ -116,6 +117,7 @@ def record(
         "phase": phase or "none",
         "phase_source": phase_source,
         "judge_used": bool(judge_used),
+        "judge_failure": str(judge_failure) if judge_failure else None,
         "picks": pick_records,
     }
 

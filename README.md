@@ -586,11 +586,17 @@ max_candidates = 15
 # Max picks surfaced in additionalContext.
 max_picks = 3
 
-# Total hook budget in seconds. Hook exits silent if exceeded — your prompt always
-# goes through, even when the advisor can't answer in time.
-# Bump to ~15.0 if you enable use_judge = true, or ~25.0 if you enable
-# [parallelization] (judge_timeout_seconds 20 + ~3 s margin + subprocess startup).
-budget_seconds = 4.0
+# Whole-hook budget in seconds — signal.alarm() arms around the entire matcher
+# call (not just the judge). If the alarm itself fires, the hook exits silent
+# (no picks) so your prompt always goes through unaffected — but in practice
+# that's a rare last resort: the judge's own subprocess timeout is set to
+# budget_seconds - 0.5, so it always loses that race. A judge that times out
+# now falls back to the embedding ranking already computed ("embedding
+# fallback (0.NN)") instead of going silent.
+# Must be at least parallelization.judge_timeout_seconds + 3 if you enable
+# [parallelization]; `doctor` warns when it isn't.
+# Bump to ~15.0 if you enable use_judge = true.
+budget_seconds = 8.0
 
 # Minimum cosine score to surface a pick in embedding-only mode. Range 0-1;
 # 0.35 filters out weak matches on unrelated prompts.
@@ -798,8 +804,10 @@ hook failure.
 
 ### Safety rails
 
-- **`signal.alarm(budget_seconds + 0.5)`** — hard wall-clock budget; any overrun exits 0
-  silent via a `_BudgetExceeded` exception caught in `hook.run()`.
+- **`signal.alarm(hook.alarm_seconds(cfg))`**, i.e. `max(int(budget_seconds + 0.5), 1)`
+  — hard wall-clock budget, rounded to a whole second since `signal.alarm()` only
+  takes an int; any overrun exits 0 silent via a `_BudgetExceeded` exception caught
+  in `hook.run()`.
 - **Broad try/except in `hook.run()`** — any unexpected error exits 0 silent and logs
   to `advisor.log`.
 - **Hallucination guard in `judge._parse_judge_reply()`** — LLM-returned names are
@@ -960,7 +968,7 @@ review = ["subagent:feature-dev:code-reviewer", "skill:security-audit"]
 # be bumped to >= judge_timeout_seconds + 3.
 enabled = false
 min_tasks = 3
-judge_timeout_seconds = 20.0
+judge_timeout_seconds = 5.0
 
 [lifecycle.auto_advance]
 # Opt-in Stop/PostToolUse hooks that push phases forward without a user prompt.
@@ -1165,10 +1173,19 @@ doctor` will warn if `budget_seconds < judge_timeout_seconds + 3`.
 
 #### Why it's opt-in
 
-The detector uses `claude -p`, which carries Claude Code's ~15 s session-startup
-cost. That's why `budget_seconds` must be bumped well above the default 4.0 —
-the `doctor` check enforces `>= judge_timeout_seconds + 3` so the subprocess
-has room to actually return a verdict.
+The detector makes its own `claude -p` call (`parallelization.detect()`, the same
+subprocess mechanism as the main judge), carrying the same session-startup cost —
+elsewhere in this doc measured at roughly 7-12 s for the main judge. `doctor` enforces
+`matcher.budget_seconds >= parallelization.judge_timeout_seconds + 3` whenever
+`[parallelization]` is enabled, and the shipped defaults (`budget_seconds = 8.0`,
+`judge_timeout_seconds = 5.0`) already satisfy that relationship exactly, so a fresh
+install won't trigger the warning. But 5 s is tight against a ~7-12 s subprocess: at the
+shipped defaults the detector will often time out and return `None` before it gets an
+answer. That's an accepted trade, not a bug — a timeout here degrades gracefully (no
+parallelization picks; the lifecycle still advances to `implementation` normally) rather
+than blocking anything. It's why the example above bumps both `budget_seconds` and
+`judge_timeout_seconds` well past the shipped defaults — giving the detector real room to
+answer is something you opt into deliberately, not what you get out of the box.
 
 #### Turning it off
 
@@ -1519,6 +1536,7 @@ Each line is one JSON object with this schema:
   "phase": "planning",
   "phase_source": "user",
   "judge_used": false,
+  "judge_failure": null,
   "picks": [
     {"rank": 1, "name": "Plan", "kind": "subagent", "score": null},
     {"rank": 2, "name": "writing-plans", "kind": "skill", "score": null}
@@ -1529,6 +1547,19 @@ Each line is one JSON object with this schema:
 `score` is `null` for lifecycle-phase picks (which come from a preference list,
 not embeddings) and the LLM judge mode (where scores aren't returned).
 `phase_source` is `"auto"` when the previous Stop handler advanced the phase.
+
+`judge_used` means the judge subprocess actually ran and returned a verdict this
+turn (declining with zero picks still counts). Before the latency fast-fail change
+it echoed `matcher.use_judge` instead — whether the judge was *configured*, not
+whether it ran — so a triage-skipped or judge-disabled turn could still claim
+`judge_used: true`. `judge_failure` is `null` when the judge ran (or wasn't asked),
+and otherwise names why it produced nothing: one of `judge.py`'s `FAILURE_*`
+values (`no_candidates`, `cli_missing`, `timeout`, `subprocess_error`,
+`exit_nonzero`, `unparseable`), or `budget_exceeded` when the hook's own SIGALRM
+fired before the judge could answer. Rows written before this change have no
+`judge_failure` key at all — `"judge_failure" in row` is an exact discriminator
+between the two eras, and a more reliable one than filtering by timestamp, which
+is fragile against clock skew and replayed logs.
 
 ### Disabling and wiping
 

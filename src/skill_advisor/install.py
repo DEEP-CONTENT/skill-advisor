@@ -1,4 +1,5 @@
 """`skill-advisor install` / `uninstall` — wires the framework into the user's shell."""
+
 from __future__ import annotations
 
 import json
@@ -27,7 +28,7 @@ class RenderSettingsError(RuntimeError):
 
 @dataclass(frozen=True)
 class ShellTarget:
-    name: str           # "bash" | "zsh" | "fish"
+    name: str  # "bash" | "zsh" | "fish"
     rc_file: Path
     alias_line: str
 
@@ -120,10 +121,12 @@ def _merge_hook_entry(
                 }
                 return
 
-    blocks.append({
-        "matcher": "",
-        "hooks": [{"type": "command", "command": command, "timeout": timeout_ms}],
-    })
+    blocks.append(
+        {
+            "matcher": "",
+            "hooks": [{"type": "command", "command": command, "timeout": timeout_ms}],
+        }
+    )
 
 
 def render_settings() -> Path:
@@ -147,7 +150,11 @@ def render_settings() -> Path:
         paths.ensure_dirs()
     except OSError as exc:
         override = os.environ.get("SKILL_ADVISOR_SETTINGS_FILE")
-        source = f"SKILL_ADVISOR_SETTINGS_FILE={override!r}" if override else "the default config directory"
+        source = (
+            f"SKILL_ADVISOR_SETTINGS_FILE={override!r}"
+            if override
+            else "the default config directory"
+        )
         raise RenderSettingsError(
             f"could not prepare the directory for the settings file at {target} "
             f"(from {source}): {exc}"
@@ -216,7 +223,7 @@ max_picks = 3
 # Total hook budget in seconds. Hook exits silent if exceeded — your prompt
 # always goes through, even when the advisor can't answer in time.
 # Bump to ~15.0 if you enable use_judge = true.
-budget_seconds = 4.0
+budget_seconds = 8.0
 
 # Minimum cosine score to surface a pick in embedding-only mode.
 # Range 0-1; 0.35 filters out weak matches on unrelated prompts.
@@ -294,11 +301,11 @@ prompt_hash_salt = ""
 # Parallelization-check feature. When enabled, the advisor watches for multi-item
 # TodoWrite events during the planning phase and asks `claude -p` whether the
 # tasks can be executed as parallel subagents in isolated worktrees. Off by
-# default. Enabling requires matcher.budget_seconds >= 23.
+# default. Enabling requires matcher.budget_seconds >= judge_timeout_seconds + 3.
 # [parallelization]
 # enabled = false
 # min_tasks = 3
-# judge_timeout_seconds = 20.0
+# judge_timeout_seconds = 5.0
 
 [effort]
 # Master toggle. When false, nothing in this feature runs: no classification, no
@@ -367,7 +374,11 @@ def install_alias(shell: ShellTarget) -> bool:
     original = _read_rc(shell.rc_file)
     stripped = _strip_block(original)
     block = f"\n{ALIAS_BEGIN}\n{shell.alias_line}\n{ALIAS_END}\n"
-    updated = (stripped.rstrip("\n") + "\n" + block) if stripped.strip() else block.lstrip("\n")
+    updated = (
+        (stripped.rstrip("\n") + "\n" + block)
+        if stripped.strip()
+        else block.lstrip("\n")
+    )
     if updated == original:
         return False
     shell.rc_file.write_text(updated, encoding="utf-8")

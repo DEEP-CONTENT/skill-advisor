@@ -12,8 +12,8 @@ import sys
 import time
 from typing import Any
 
-from . import baseline, effort, inject, lifecycle, matcher, paths, telemetry, triage
-from .config import load as load_config
+from . import baseline, effort, inject, judge, lifecycle, matcher, paths, telemetry, triage
+from .config import Config, load as load_config
 
 
 class _BudgetExceeded(Exception):
@@ -22,6 +22,18 @@ class _BudgetExceeded(Exception):
 
 def _alarm_handler(signum, frame):  # pragma: no cover - signal path
     raise _BudgetExceeded()
+
+
+def alarm_seconds(cfg: Config) -> int:
+    """Whole-hook SIGALRM budget, in whole seconds.
+
+    Must stay strictly greater than judge.rank()'s own subprocess timeout
+    (`max(cfg.matcher.budget_seconds - 0.5, 0.5)`, judge.py:106-110) — otherwise
+    the alarm kills the hook before matcher.py's embedding fallback ever runs.
+    A named function (rather than an inline expression) so tests can pin the
+    ordering against the real formula instead of a restated copy of it.
+    """
+    return max(int(cfg.matcher.budget_seconds + 0.5), 1)
 
 
 def _setup_logging() -> None:
@@ -130,14 +142,41 @@ def run() -> int:
         return 0
 
     cfg = load_config()
-    budget = max(int(cfg.matcher.budget_seconds + 0.5), 1)
+    budget = alarm_seconds(cfg)
+    # Created before the alarm is armed: it costs nothing, and it must already
+    # exist before anything below can raise (matcher.pick(), or the alarm
+    # itself) so any handler that wants to read or annotate it — like the
+    # budget-exceeded branch below — finds a live object, not a NameError.
+    trace = matcher.JudgeTrace()
     signal.signal(signal.SIGALRM, _alarm_handler)
     signal.alarm(budget)
 
     try:
-        result = matcher.pick(prompt, cfg, session_id=session_id)
+        result = matcher.pick(prompt, cfg, session_id=session_id, trace=trace)
     except _BudgetExceeded:
-        log.info("budget exceeded after %.2fs; falling back silent", time.monotonic() - started)
+        duration = time.monotonic() - started
+        log.info("budget exceeded after %.2fs; falling back silent", duration)
+        # The alarm kill is otherwise invisible in events.jsonl — no row at
+        # all, indistinguishable from a hook that never fired. Record one,
+        # marked distinctly, so it's countable. Must not itself raise: this is
+        # a hook path and hook paths are silent on error.
+        if cfg.telemetry.events_enabled:
+            try:
+                trace.failure = judge.FAILURE_BUDGET_EXCEEDED
+                telemetry.record(
+                    prompt=prompt,
+                    session_id=session_id,
+                    picks=[],
+                    phase="none",
+                    phase_source="user",
+                    judge_used=trace.ran,
+                    judge_failure=trace.failure,
+                    triage_skipped=triage.should_skip(prompt, cfg),
+                    duration_ms=int(duration * 1000),
+                    config=cfg.telemetry,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                log.debug("budget-exceeded telemetry record failed: %s", exc, exc_info=True)
         return 0
     except Exception as exc:  # pragma: no cover - defensive
         log.warning("hook exception: %s", exc, exc_info=True)
@@ -240,7 +279,8 @@ def run() -> int:
                 picks=picks,
                 phase=phase,
                 phase_source="user",
-                judge_used=cfg.matcher.use_judge,
+                judge_used=trace.ran,
+                judge_failure=trace.failure,
                 triage_skipped=triage.should_skip(prompt, cfg),
                 duration_ms=int(duration * 1000),
                 config=cfg.telemetry,

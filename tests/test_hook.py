@@ -67,6 +67,17 @@ def _enable_telemetry_in_config(isolated_paths):
     cfg.write_text("[telemetry]\nevents_enabled = true\nprompt_hash_salt = \"fixed\"\n")
 
 
+def _enable_telemetry_and_judge(isolated_paths):
+    """Telemetry on AND use_judge on — so `judge_used` echoing the config is
+    distinguishable from `judge_used` reporting what actually happened."""
+    cfg = isolated_paths["config_home"] / "config.toml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(
+        "[telemetry]\nevents_enabled = true\nprompt_hash_salt = \"fixed\"\n"
+        "\n[matcher]\nuse_judge = true\n"
+    )
+
+
 def test_hook_writes_telemetry_event_when_enabled(isolated_paths):
     _enable_telemetry_in_config(isolated_paths)
     entry = CatalogEntry(kind="skill", name="brainstorming", namespace="user", description="...")
@@ -120,6 +131,85 @@ def test_hook_records_event_even_when_no_picks(isolated_paths):
     lines = [json.loads(l) for l in events_path.read_text().splitlines() if l.strip()]
     assert len(lines) == 1
     assert lines[0]["picks"] == []
+
+
+def test_judge_used_is_false_when_the_judge_never_ran(isolated_paths):
+    """Today `judge_used` records cfg.matcher.use_judge, so 830 triage-skipped
+    events on the live log claim the judge ran. It must report what happened."""
+    _enable_telemetry_and_judge(isolated_paths)
+    with patch("skill_advisor.hook.matcher.pick", return_value=None):
+        _run_with_stdin({"prompt": "a substantive prompt that should match", "session_id": "s1"})
+
+    events_path = isolated_paths["cache_home"] / "advisor.events.jsonl"
+    lines = [json.loads(l) for l in events_path.read_text().splitlines() if l.strip()]
+    assert lines[-1]["judge_used"] is False
+
+
+def test_judge_failure_is_recorded(isolated_paths):
+    _enable_telemetry_and_judge(isolated_paths)
+
+    def _fake_pick(prompt, cfg, session_id=None, *, trace=None):
+        if trace is not None:
+            trace.ran = False
+            trace.failure = "timeout"
+        return None
+
+    with patch("skill_advisor.hook.matcher.pick", _fake_pick):
+        _run_with_stdin({"prompt": "a substantive prompt that should match", "session_id": "s1"})
+
+    events_path = isolated_paths["cache_home"] / "advisor.events.jsonl"
+    lines = [json.loads(l) for l in events_path.read_text().splitlines() if l.strip()]
+    assert lines[-1]["judge_failure"] == "timeout"
+    assert lines[-1]["judge_used"] is False
+
+
+def test_budget_exceeded_records_a_countable_telemetry_event(isolated_paths):
+    """An alarm kill must not be invisible in events.jsonl — no row at all is
+    indistinguishable from the hook never firing. It needs its own marker,
+    distinct from every judge.FAILURE_* value."""
+    _enable_telemetry_in_config(isolated_paths)
+    with patch("skill_advisor.hook.matcher.pick", side_effect=hook_mod._BudgetExceeded):
+        out = _run_with_stdin({"prompt": "a substantive prompt that should match", "session_id": "s1"})
+
+    assert out == ""
+    events_path = isolated_paths["cache_home"] / "advisor.events.jsonl"
+    assert events_path.is_file()
+    lines = [
+        json.loads(line) for line in events_path.read_text().splitlines() if line.strip()
+    ]
+    assert len(lines) == 1
+    assert lines[-1]["judge_failure"] == "budget_exceeded"
+    assert lines[-1]["judge_used"] is False
+    assert lines[-1]["picks"] == []
+
+
+def test_budget_exceeded_writes_no_event_when_telemetry_disabled(isolated_paths):
+    # No config.toml → events_enabled defaults to False.
+    with patch("skill_advisor.hook.matcher.pick", side_effect=hook_mod._BudgetExceeded):
+        out = _run_with_stdin({"prompt": "a substantive prompt that should match", "session_id": "s1"})
+
+    assert out == ""
+    events_path = isolated_paths["cache_home"] / "advisor.events.jsonl"
+    assert not events_path.exists()
+
+
+def test_judge_used_is_true_when_the_judge_actually_ran(isolated_paths):
+    _enable_telemetry_and_judge(isolated_paths)
+    entry = CatalogEntry(kind="skill", name="brainstorming", namespace="user", description="...")
+    result = PickResult(picks=[ResolvedPick(entry=entry, reason="judge said so")], state=None)
+
+    def _fake_pick(prompt, cfg, session_id=None, *, trace=None):
+        if trace is not None:
+            trace.ran = True
+        return result
+
+    with patch("skill_advisor.hook.matcher.pick", _fake_pick):
+        _run_with_stdin({"prompt": "a substantive prompt that should match", "session_id": "s1"})
+
+    events_path = isolated_paths["cache_home"] / "advisor.events.jsonl"
+    lines = [json.loads(l) for l in events_path.read_text().splitlines() if l.strip()]
+    assert lines[-1]["judge_used"] is True
+    assert lines[-1]["judge_failure"] is None
 
 
 def test_posttooluse_records_todowrite_when_enabled(monkeypatch, tmp_path):

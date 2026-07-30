@@ -4,6 +4,7 @@ Uses `--output-format json` to get a structured envelope. Validates the model's
 inner JSON against a tiny schema and rejects names that weren't in the candidate
 list (hallucination guard — known `claude -p` rough edge).
 """
+
 from __future__ import annotations
 
 import json
@@ -18,6 +19,22 @@ from . import effort as effort_mod
 
 log = logging.getLogger(__name__)
 
+# Why the judge produced no verdict. `None` means it ran and answered —
+# including answering "nothing fits", which is a verdict, not a failure.
+FAILURE_NO_CANDIDATES = "no_candidates"
+FAILURE_CLI_MISSING = "cli_missing"
+FAILURE_TIMEOUT = "timeout"
+FAILURE_SUBPROCESS = "subprocess_error"
+FAILURE_EXIT = "exit_nonzero"
+FAILURE_UNPARSEABLE = "unparseable"
+
+# Not produced by rank() itself — set by hook.py when the whole-hook SIGALRM
+# fires before the judge (or anything else downstream of it) returns a
+# verdict. Defined here, alongside the judge's own FAILURE_* values, so every
+# string that can land in the `judge_failure` telemetry field lives in one
+# place and is guaranteed not to collide.
+FAILURE_BUDGET_EXCEEDED = "budget_exceeded"
+
 
 @dataclass(frozen=True)
 class Pick:
@@ -29,6 +46,14 @@ class Pick:
 class JudgeResult:
     picks: list[Pick]
     effort: str | None = None
+    # None ⟺ the judge ran and returned a usable verdict. Callers use this to
+    # tell a 24-second timeout apart from a deliberate "nothing fits" — the
+    # first should fall back to the embedding ranking, the second must not.
+    failure: str | None = None
+
+    @property
+    def ran(self) -> bool:
+        return self.failure is None
 
 
 _JUDGE_TEMPLATE = """You are a skill router for Claude Code. Given the user's message and a candidate list, pick 0-3 catalog entries that best apply. Return ONLY JSON matching this schema (no prose, no code fences):
@@ -63,23 +88,44 @@ def _render_candidates(candidates: list[CatalogEntry]) -> str:
 
 
 def rank(
-    prompt: str, candidates: list[CatalogEntry], config: Config, timeout: float | None = None
-) -> JudgeResult | None:
+    prompt: str,
+    candidates: list[CatalogEntry],
+    config: Config,
+    timeout: float | None = None,
+) -> JudgeResult:
+    """Rank `candidates` with `claude -p`.
+
+    Never returns None. A result with `failure is None` means the judge ran and
+    answered; `picks == []` in that case is a deliberate decline and callers
+    must respect it. A non-None `failure` means no verdict was obtained and the
+    caller should fall back to whatever it already has.
+    """
     if not candidates:
-        return None
+        return JudgeResult(picks=[], failure=FAILURE_NO_CANDIDATES)
     if shutil.which("claude") is None:
         log.warning("claude CLI not on PATH; judge skipped")
-        return None
+        return JudgeResult(picks=[], failure=FAILURE_CLI_MISSING)
 
     judge_prompt = _JUDGE_TEMPLATE.format(
         prompt=prompt.strip(),
         candidates=_render_candidates(candidates),
     )
-    budget = timeout if timeout is not None else max(config.matcher.budget_seconds - 0.5, 0.5)
+    budget = (
+        timeout
+        if timeout is not None
+        else max(config.matcher.budget_seconds - 0.5, 0.5)
+    )
 
     try:
         completed = subprocess.run(
-            ["claude", "-p", "--model", config.matcher.model, "--output-format", "json"],
+            [
+                "claude",
+                "-p",
+                "--model",
+                config.matcher.model,
+                "--output-format",
+                "json",
+            ],
             input=judge_prompt,
             capture_output=True,
             text=True,
@@ -88,19 +134,24 @@ def rank(
         )
     except subprocess.TimeoutExpired:
         log.info("judge timed out after %.2fs", budget)
-        return None
+        return JudgeResult(picks=[], failure=FAILURE_TIMEOUT)
     except (OSError, ValueError) as exc:
         log.warning("judge subprocess failed: %s", exc)
-        return None
+        return JudgeResult(picks=[], failure=FAILURE_SUBPROCESS)
 
     if completed.returncode != 0:
         log.warning("judge exit %s: %s", completed.returncode, completed.stderr[:200])
-        return None
+        return JudgeResult(picks=[], failure=FAILURE_EXIT)
 
-    return _parse_judge_reply(completed.stdout, candidates)
+    parsed = _parse_judge_reply(completed.stdout, candidates)
+    if parsed is None:
+        return JudgeResult(picks=[], failure=FAILURE_UNPARSEABLE)
+    return parsed
 
 
-def _parse_judge_reply(stdout: str, candidates: list[CatalogEntry]) -> JudgeResult | None:
+def _parse_judge_reply(
+    stdout: str, candidates: list[CatalogEntry]
+) -> JudgeResult | None:
     stdout = stdout.strip()
     if not stdout:
         return None

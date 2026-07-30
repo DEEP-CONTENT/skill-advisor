@@ -32,6 +32,45 @@ class PickResult:
 class StatelessResult:
     picks: list[ResolvedPick]
     judge_effort: str | None = None
+    # True ⟺ the judge subprocess ran and returned a verdict this call.
+    judge_ran: bool = False
+    # Non-None ⟺ the judge was asked but produced nothing usable; see judge.FAILURE_*.
+    judge_failure: str | None = None
+
+
+@dataclass
+class JudgeTrace:
+    """Mutable out-parameter recording what the judge actually did this call.
+
+    Deliberately not folded into the return value: `_pick_inner` returns None
+    whenever there are no picks, and the most important case to count — the
+    judge running and declining — produces exactly that. A collector survives
+    the None.
+    """
+    ran: bool = False
+    failure: str | None = None
+
+
+def _embedding_picks(
+    ranked: list[tuple[CatalogEntry, float]],
+    k_picks: int,
+    min_score: float,
+    *,
+    fallback: bool = False,
+) -> list[ResolvedPick]:
+    """Turn a cosine ranking into picks, stopping at the score floor.
+
+    `ranked` is already sorted descending, so the first sub-threshold entry
+    ends the list. `fallback` only changes the reason string, so the event log
+    can tell a confident embedding pick from a judge-failure rescue.
+    """
+    label = "embedding fallback" if fallback else "embedding match"
+    out: list[ResolvedPick] = []
+    for entry, score in ranked[:k_picks]:
+        if score < min_score:
+            break
+        out.append(ResolvedPick(entry=entry, reason=f"{label} ({score:.2f})"))
+    return out
 
 
 def pick_stateless(
@@ -43,11 +82,15 @@ def pick_stateless(
     top_k: int | None = None,
     candidates: int | None = None,
     index: index_mod.Index | None = None,
+    trace: "JudgeTrace | None" = None,
 ) -> StatelessResult:
     """Match a prompt against the catalog without consulting lifecycle state.
 
     Shared between `matcher.pick()` (hot path) and `skill-advisor match` (CLI).
     Overrides default to config values when None; `index` is injectable for tests.
+
+    `trace`, if given, is populated with what the judge actually did this call
+    — see `JudgeTrace` for why this can't just be read off the return value.
     """
     idx = index if index is not None else _load_index()
     if idx is None:
@@ -67,22 +110,31 @@ def pick_stateless(
         if not cand_entries:
             return StatelessResult(picks=[])
         raw = judge.rank(prompt, cand_entries, cfg)
-        if raw is None:
-            return StatelessResult(picks=[])
-        by_name = {e.name: e for e in cand_entries}
-        out: list[ResolvedPick] = []
-        for p in raw.picks[:k_picks]:
-            entry = by_name.get(p.name)
-            if entry is not None:
-                out.append(ResolvedPick(entry=entry, reason=p.reason))
-        return StatelessResult(picks=out, judge_effort=raw.effort)
+        if raw.failure is not None:
+            # The judge produced no verdict. The embedding ranking is already in
+            # hand and cost nothing extra — emitting it beats going silent.
+            log.info("judge unavailable (%s); using embedding fallback", raw.failure)
+            result = StatelessResult(
+                picks=_embedding_picks(ranked, k_picks, min_score, fallback=True),
+                judge_ran=False,
+                judge_failure=raw.failure,
+            )
+        else:
+            by_name = {e.name: e for e in cand_entries}
+            out: list[ResolvedPick] = []
+            for p in raw.picks[:k_picks]:
+                entry = by_name.get(p.name)
+                if entry is not None:
+                    out.append(ResolvedPick(entry=entry, reason=p.reason))
+            # An empty `out` here is the judge declining. Respect it — do not fall back.
+            result = StatelessResult(picks=out, judge_effort=raw.effort, judge_ran=True)
+    else:
+        result = StatelessResult(picks=_embedding_picks(ranked, k_picks, min_score))
 
-    out: list[ResolvedPick] = []
-    for entry, score in ranked[:k_picks]:
-        if score < min_score:
-            break
-        out.append(ResolvedPick(entry=entry, reason=f"embedding match ({score:.2f})"))
-    return StatelessResult(picks=out)
+    if trace is not None:
+        trace.ran = result.judge_ran
+        trace.failure = result.judge_failure
+    return result
 
 
 def _parallelization_picks(
@@ -124,8 +176,10 @@ def _phase_picks(phase: str, catalog: list[CatalogEntry], cfg: Config) -> list[R
     ]
 
 
-def _default_picks(prompt: str, cfg: Config, idx: index_mod.Index) -> "StatelessResult":
-    return pick_stateless(prompt, cfg, index=idx)
+def _default_picks(
+    prompt: str, cfg: Config, idx: index_mod.Index, trace: "JudgeTrace | None" = None
+) -> "StatelessResult":
+    return pick_stateless(prompt, cfg, index=idx, trace=trace)
 
 
 def _load_index() -> index_mod.Index | None:
@@ -142,6 +196,7 @@ def _pick_inner(
     prompt: str,
     cfg: Config,
     session_id: str | None,
+    trace: "JudgeTrace | None" = None,
 ) -> PickResult | None:
     """Return picks for a prompt. None means the advisor should stay silent.
 
@@ -188,7 +243,7 @@ def _pick_inner(
         if lifecycle.is_cancel_signal(text):
             lifecycle.cancel(state, note="user cancelled")
             # Route the actual prompt through the normal matcher too.
-            sr = _default_picks(text, cfg, idx)
+            sr = _default_picks(text, cfg, idx, trace)
             return PickResult(picks=sr.picks, state=None, judge_effort=sr.judge_effort) if sr.picks else None
 
         if lifecycle.is_complete_signal(text) and state.phase in {lifecycle.REVIEW, lifecycle.CORRECTION}:
@@ -196,7 +251,7 @@ def _pick_inner(
             complete_picks = _phase_picks(lifecycle.COMPLETE, idx.catalog, cfg)
             judge_effort = None
             if not complete_picks:
-                sr = _default_picks(text, cfg, idx)
+                sr = _default_picks(text, cfg, idx, trace)
                 complete_picks = sr.picks
                 judge_effort = sr.judge_effort
             return PickResult(picks=complete_picks, state=state, judge_effort=judge_effort)
@@ -211,7 +266,7 @@ def _pick_inner(
             picks = _phase_picks(state.phase, idx.catalog, cfg)
             judge_effort = None
             if not picks:
-                sr = _default_picks(state.original_prompt, cfg, idx)
+                sr = _default_picks(state.original_prompt, cfg, idx, trace)
                 picks = sr.picks
                 judge_effort = sr.judge_effort
             return PickResult(picks=picks, state=state, judge_effort=judge_effort) if picks else None
@@ -220,7 +275,7 @@ def _pick_inner(
         # treat as off-topic; silently cancel the lifecycle and route normally.
         if len(text.split()) >= 4:
             lifecycle.cancel(state, note="off-topic follow-up")
-            sr = _default_picks(text, cfg, idx)
+            sr = _default_picks(text, cfg, idx, trace)
             return PickResult(picks=sr.picks, state=None, judge_effort=sr.judge_effort) if sr.picks else None
 
         # Short prompt, no signal matched — stay silent, don't advance.
@@ -237,13 +292,13 @@ def _pick_inner(
         picks = _phase_picks(new_state.phase, idx.catalog, cfg)
         judge_effort = None
         if not picks:
-            sr = _default_picks(new_state.original_prompt, cfg, idx)
+            sr = _default_picks(new_state.original_prompt, cfg, idx, trace)
             picks = sr.picks
             judge_effort = sr.judge_effort
         return PickResult(picks=picks, state=new_state, judge_effort=judge_effort) if picks else None
 
     # -------- Default: stateless matcher --------
-    sr = _default_picks(text, cfg, idx)
+    sr = _default_picks(text, cfg, idx, trace)
     return PickResult(picks=sr.picks, state=None, judge_effort=sr.judge_effort) if sr.picks else None
 
 
@@ -251,10 +306,12 @@ def pick(
     prompt: str,
     config: Config | None = None,
     session_id: str | None = None,
+    *,
+    trace: JudgeTrace | None = None,
 ) -> PickResult | None:
     """Return picks for a prompt, with an effort recommendation attached."""
     cfg = config or load_config()
-    result = _pick_inner(prompt, cfg, session_id)
+    result = _pick_inner(prompt, cfg, session_id, trace)
     if result is None or not cfg.effort.enabled:
         return result
 

@@ -375,3 +375,74 @@ def test_judge_verdict_returned_explicitly_not_via_module_state():
     assert not hasattr(matcher, "_LAST_JUDGE_EFFORT")
     assert "judge_effort" in matcher.StatelessResult.__dataclass_fields__
     assert "judge_effort" in matcher.PickResult.__dataclass_fields__
+
+
+def test_judge_timeout_falls_back_to_embedding_picks(isolated_paths):
+    """The 432-empty-timeouts bug. Must fail against today's code."""
+    from skill_advisor.config import Config
+    from skill_advisor.judge import FAILURE_TIMEOUT, JudgeResult
+
+    stub = _prime_stateless_index([0.9, 0.7, 0.5])
+    with patch.object(index_mod, "_embed_model", return_value=stub), \
+         patch("skill_advisor.matcher.judge.rank") as mock_rank:
+        mock_rank.return_value = JudgeResult(picks=[], failure=FAILURE_TIMEOUT)
+        result = matcher.pick_stateless(
+            "q", Config(), force_judge=True, top_k=3, candidates=3, threshold=0.0,
+        )
+
+    assert [p.entry.name for p in result.picks] == ["alpha", "beta", "gamma"]
+    assert result.judge_failure == FAILURE_TIMEOUT
+    assert result.judge_ran is False
+    assert "fallback" in result.picks[0].reason
+
+
+def test_judge_decline_still_returns_nothing(isolated_paths):
+    """The judge's 1,251 real declines are its value. Do not convert them to picks."""
+    from skill_advisor.config import Config
+    from skill_advisor.judge import JudgeResult
+
+    stub = _prime_stateless_index([0.9, 0.7, 0.5])
+    with patch.object(index_mod, "_embed_model", return_value=stub), \
+         patch("skill_advisor.matcher.judge.rank") as mock_rank:
+        mock_rank.return_value = JudgeResult(picks=[], failure=None)
+        result = matcher.pick_stateless(
+            "q", Config(), force_judge=True, top_k=3, candidates=3, threshold=0.0,
+        )
+
+    assert result.picks == []
+    assert result.judge_ran is True
+    assert result.judge_failure is None
+
+
+def test_fallback_respects_min_embedding_score(isolated_paths):
+    """A fallback must not surface junk the confident path would have suppressed."""
+    from skill_advisor.config import Config
+    from skill_advisor.judge import FAILURE_TIMEOUT, JudgeResult
+
+    stub = _prime_stateless_index([0.9, 0.1, 0.05])
+    with patch.object(index_mod, "_embed_model", return_value=stub), \
+         patch("skill_advisor.matcher.judge.rank") as mock_rank:
+        mock_rank.return_value = JudgeResult(picks=[], failure=FAILURE_TIMEOUT)
+        result = matcher.pick_stateless(
+            "q", Config(), force_judge=True, top_k=3, candidates=3, threshold=0.35,
+        )
+
+    assert [p.entry.name for p in result.picks] == ["alpha"]
+
+
+def test_judge_success_marks_judge_ran(isolated_paths):
+    from skill_advisor.config import Config
+    from skill_advisor.judge import JudgeResult
+    from skill_advisor.judge import Pick as JudgePick
+
+    stub = _prime_stateless_index([0.9, 0.7, 0.5])
+    with patch.object(index_mod, "_embed_model", return_value=stub), \
+         patch("skill_advisor.matcher.judge.rank") as mock_rank:
+        mock_rank.return_value = JudgeResult(picks=[JudgePick(name="beta", reason="fits")])
+        result = matcher.pick_stateless(
+            "q", Config(), force_judge=True, top_k=3, candidates=3, threshold=0.0,
+        )
+
+    assert result.judge_ran is True
+    assert result.judge_failure is None
+    assert [p.entry.name for p in result.picks] == ["beta"]
