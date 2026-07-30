@@ -781,9 +781,23 @@ def _cmd_rotate(args: argparse.Namespace) -> int:
         f"target {rot.target_active} · sketch {sketch.observed} prompts"
     )
     if not cfg.telemetry.events_enabled:
+        # F3: `events` above is read unconditionally — turning telemetry off
+        # stops the hook from RECORDING new prompts (the privacy toggle),
+        # it does not erase or blind rotate to an event log collected while
+        # telemetry was previously on. Scoring on that historical log is
+        # intentional: the data doesn't stop being real just because future
+        # collection was disabled, and rotate.score_pool()/_rotation_stats()
+        # are that log's only consumer of stale reads. The claim that used
+        # to print here — "pick_rate and invocation_rate are unavailable;
+        # scoring on semantic_fit alone" — was simply FALSE whenever a
+        # pre-existing event log was present: a user reading it would
+        # believe usage data played no part, while an incumbent could in
+        # fact still be surviving purely on pick_rate=1.0. Reworded to a
+        # claim that is actually true, rather than skipping the log, so
+        # `rotate`'s scoring behavior is unchanged by this fix.
         print(
-            "NOTE: telemetry is off — pick_rate and invocation_rate are "
-            "unavailable; scoring on semantic_fit alone."
+            "NOTE: telemetry is off — no new usage data is being recorded; "
+            "existing events (if any) are still scored."
         )
 
     try:

@@ -215,8 +215,16 @@ def test_dry_run_shows_pool_active_target_sketch(isolated_paths, capsys):
 
 
 def test_telemetry_disabled_note(isolated_paths, capsys):
-    """When telemetry is off, rotate must say plainly that pick_rate and
-    invocation_rate are unavailable."""
+    """When telemetry is off, rotate must plainly (and truthfully) say that
+    no NEW usage data is being recorded.
+
+    F10: the old assertions here (`"pick_rate" in out` and `"semantic_fit"
+    in out`) were vacuous — those substrings already appear in the ordinary
+    PROMOTE/DEMOTE reason text (`semantic_fit=... pick_rate=... total=...`)
+    regardless of whether the NOTE prints at all; deleting the NOTE entirely
+    still passed. Assert on text distinctive to the NOTE, and prove the
+    assertion is not itself vacuous by checking the NOTE's absence once
+    telemetry is enabled."""
     from skill_advisor import cli
 
     _prime_rotatable_state(isolated_paths)
@@ -224,8 +232,100 @@ def test_telemetry_disabled_note(isolated_paths, capsys):
     # defaults to False, matching the scenario this test targets.
     assert cli._cmd_rotate(_ns()) == 0
     out = capsys.readouterr().out
-    assert "pick_rate" in out
-    assert "semantic_fit" in out
+    assert "telemetry is off" in out
+    assert "no new usage data is being recorded" in out
+
+    cfg_text = paths.config_file().read_text(encoding="utf-8")
+    paths.config_file().write_text(
+        cfg_text + "\n[telemetry]\nevents_enabled = true\n", encoding="utf-8"
+    )
+    assert cli._cmd_rotate(_ns()) == 0
+    out_enabled = capsys.readouterr().out
+    assert "telemetry is off" not in out_enabled
+
+
+def test_telemetry_off_note_is_true_when_a_historical_log_still_decides(
+    isolated_paths, capsys
+):
+    """F3: `rotate` reads `telemetry.iter_events()` unconditionally — turning
+    telemetry off stops the hook from RECORDING new events, it does not
+    blind rotate to an event log collected while telemetry was previously
+    on. The banner must not claim usage data played no part when it
+    demonstrably did: here "incumbent" survives the cut ONLY because of one
+    recorded pick (pick_rate=1.0, total=0.46); on semantic_fit alone (0.06)
+    it loses decisively to "challenger" (0.30) and would be demoted."""
+    from datetime import datetime, timezone
+
+    from skill_advisor import cli
+
+    entries = [
+        CatalogEntry(
+            kind="skill",
+            name="incumbent",
+            namespace="user",
+            description="d",
+            path="/s/incumbent/SKILL.md",
+            enabled=True,
+        ),
+        CatalogEntry(
+            kind="skill",
+            name="challenger",
+            namespace="user",
+            description="d",
+            path="/s/challenger/SKILL.md",
+            enabled=False,
+        ),
+    ]
+    embeddings = _emb([0.10, 0.50])
+    source_hash = catalog_mod.compute_hash(catalog_mod.scan())
+    index_mod.save(entries, embeddings, source_hash)
+
+    sketch = centroids.empty(k=2)
+    v = np.zeros(centroids.DIM, dtype=np.float32)
+    v[0] = 1.0
+    sketch.vectors[0] = v
+    sketch.counts[0] = 1000
+    sketch.observed = 1000
+    centroids.save(sketch)
+
+    paths.ensure_dirs()
+    paths.config_file().write_text(
+        "[rotation]\n"
+        "target_active = 1\n"
+        "min_active = 0\n"
+        "hysteresis = 0.0\n"
+        "exploration_fraction = 0.0\n"
+        "recency_days = 0\n"
+        "min_observed_prompts = 200\n",
+        encoding="utf-8",
+    )
+    # telemetry.events_enabled left at its default (False) — the scenario
+    # under test — yet a pre-existing event log is present below.
+
+    now = datetime.now(timezone.utc)
+    paths.events_file().write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "kind": "prompt",
+                "ts": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "picks": [
+                    {"rank": 1, "name": "incumbent", "kind": "skill", "score": 0.5}
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert cli._cmd_rotate(_ns()) == 0
+    out = capsys.readouterr().out
+
+    assert "no new usage data is being recorded" in out
+    assert "unavailable" not in out
+    # Proof the historical log actually decided the outcome: on fit alone,
+    # "challenger" (0.30) beats "incumbent" (0.06) and a swap would occur.
+    assert "no changes proposed" in out
 
 
 def test_rotate_target_override(isolated_paths, capsys):
