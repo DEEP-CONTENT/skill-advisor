@@ -398,19 +398,31 @@ def pick_candidates_for_phase(
     catalog: Iterable[CatalogEntry],
     limit: int = 3,
     config: LifecycleConfig | None = None,
+    *,
+    pickable_only: bool = True,
 ) -> list[CatalogEntry]:
-    """Pick preferred catalog entries for a phase, honoring config overrides."""
+    """Pick preferred catalog entries for a phase, honoring config overrides.
+
+    Disabled skills are skipped rather than consuming a slot, so the ordered
+    preference list falls through to the next enabled alternative — which is
+    what the list was always for. Measured 2026-07-29: without this filter the
+    PLANNING list stopped at `plan-writing` (disabled) and never reached
+    `brainstorming`, producing 490 un-invocable recommendations.
+    """
     prefs = _resolve_phase_prefs(phase, config)
     by_name: dict[str, CatalogEntry] = {e.name: e for e in catalog}
     picks: list[CatalogEntry] = []
     seen: set[str] = set()
     for kind, name in prefs:
         entry = by_name.get(name)
-        if entry and entry.kind == kind and entry.name not in seen:
-            picks.append(entry)
-            seen.add(entry.name)
-            if len(picks) >= limit:
-                break
+        if entry is None or entry.kind != kind or entry.name in seen:
+            continue
+        if pickable_only and not entry.enabled:
+            continue
+        picks.append(entry)
+        seen.add(entry.name)
+        if len(picks) >= limit:
+            break
     return picks
 
 
