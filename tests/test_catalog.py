@@ -108,3 +108,24 @@ def test_scan_sets_invoke_name_for_plugin_skills(fake_claude_home):
     entries = catalog.scan(Config(), overrides_table={})
     plug = next(e for e in entries if e.namespace == "plugin:x")
     assert plug.invoke_name == "x:y"
+
+
+def test_scan_resolves_enabled_off_the_directory_not_the_frontmatter_name(
+    fake_claude_home,
+):
+    """`~/.claude/skills/xlsx/` declares `name: xlsx-official`. settings.json
+    keys skillOverrides by directory (`xlsx`), not by frontmatter `name`.
+    Both directions must hold, or a join on `entry.name` would slip through:
+    off-by-directory disables it, off-by-frontmatter-name does NOT."""
+    from skill_advisor import catalog
+    from skill_advisor.config import Config
+
+    off_by_dir = catalog.scan(Config(), overrides_table={"xlsx": "off"})
+    entry = next(e for e in off_by_dir if e.name == "xlsx-official")
+    assert entry.enabled is False
+
+    off_by_frontmatter_name = catalog.scan(
+        Config(), overrides_table={"xlsx-official": "off"}
+    )
+    entry2 = next(e for e in off_by_frontmatter_name if e.name == "xlsx-official")
+    assert entry2.enabled is True

@@ -50,6 +50,20 @@ def fake_claude_home(isolated_paths):
         encoding="utf-8",
     )
 
+    # Directory name diverges from frontmatter `name` — mirrors the real-world
+    # ~/.claude/skills/xlsx/ (dir) declaring `name: xlsx-official`. Exists so
+    # tests can prove enabled/invoke_name resolution joins on the directory,
+    # not on `entry.name`.
+    diverging_skill_dir = home / "skills" / "xlsx"
+    diverging_skill_dir.mkdir(parents=True)
+    (diverging_skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: xlsx-official\n"
+        'description: "Diverging dir/name fixture for override resolution tests."\n'
+        "---\n",
+        encoding="utf-8",
+    )
+
     plugin_skill_dir = home / "plugins" / "marketplaces" / "demo" / "plugins" / "x" / "skills" / "y"
     plugin_skill_dir.mkdir(parents=True)
     (plugin_skill_dir / "SKILL.md").write_text(
