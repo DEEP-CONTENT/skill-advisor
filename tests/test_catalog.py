@@ -252,6 +252,55 @@ def test_scan_dedupes_multiple_versions_of_same_plugin_skill(isolated_paths):
     assert writing_plans[0].name == "writing-plans"
 
 
+def test_from_json_ignores_unknown_keys():
+    """A catalog.json written by a newer binary can carry keys an older
+    installed CatalogEntry doesn't know about. from_json must drop them
+    rather than blow up with a TypeError that hook.run() can't distinguish
+    from a real failure."""
+    data = {
+        "kind": "skill",
+        "name": "demo",
+        "namespace": "user",
+        "description": "A demo skill.",
+        "path": "",
+        "enabled": True,
+        "invoke_name": "demo",
+        "some_future_field": "unexpected",
+    }
+    entry = catalog.CatalogEntry.from_json(data)
+    assert entry.name == "demo"
+    assert not hasattr(entry, "some_future_field")
+
+
+def test_from_json_missing_optional_fields_uses_defaults():
+    data = {
+        "kind": "skill",
+        "name": "demo",
+        "namespace": "user",
+        "description": "A demo skill.",
+    }
+    entry = catalog.CatalogEntry.from_json(data)
+    assert entry.path == ""
+    assert entry.enabled is True
+    assert entry.invoke_name == ""
+
+
+def test_from_json_raises_on_missing_required_field():
+    data = {
+        "kind": "skill",
+        "namespace": "user",
+        "description": "A demo skill.",
+        # "name" is missing — this is corruption, not a schema drift, and
+        # must still raise rather than be silently swallowed.
+    }
+    try:
+        catalog.CatalogEntry.from_json(data)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("expected TypeError for missing required field")
+
+
 def test_pool_health_unparseable_count_is_per_file_not_deduped(isolated_paths, tmp_path):
     """When two roots contain unparseable files with the same directory name,
     the per-file count must be used for arithmetic, not the deduplicated count."""

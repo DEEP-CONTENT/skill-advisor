@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Iterable
 
@@ -34,7 +34,17 @@ class CatalogEntry:
 
     @classmethod
     def from_json(cls, data: dict) -> "CatalogEntry":
-        return cls(**data)
+        """Construct from a saved catalog.json entry, tolerating schema drift.
+
+        A newer binary can write fields an older installed CatalogEntry
+        doesn't know about (e.g. `enabled`, `invoke_name` were added after
+        the first release). Filter to this dataclass's own field names so a
+        forward-compatible cache never bricks an older binary with a
+        TypeError — but still raise if a field with no default (genuine
+        corruption) is missing.
+        """
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
 
     def embed_text(self) -> str:
         return f"{self.name}: {self.description}"
