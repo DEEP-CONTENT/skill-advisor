@@ -568,21 +568,53 @@ def _cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
-def _rotation_stats(events: list[dict]) -> dict[str, dict]:
+def _rotation_stats(
+    events: list[dict], *, catalog: list | None = None
+) -> dict[str, dict]:
     """Fold the event log into per-skill picks / invocations / recency.
 
-    `invocations` and `last_invoked_days` come from the `skills` key on
-    kind=stop events, which only started being written in this release —
-    expect zeros/None for a while on a fresh install. `picks` comes from
-    kind=prompt events, same as `_report_stats` above.
+    Keys are `CatalogEntry.name` (the frontmatter `name:`) — that's what
+    `rotate.score_pool()` looks up via `stats.get(entry.name, {})`, NOT
+    `invoke_name` (the directory name, or `plugin:dirname`, that Claude
+    Code's Skill tool actually accepts). The two event kinds don't agree on
+    which one they log natively:
+
+      * `kind=prompt` events' `picks` are already `entry.name`-keyed —
+        `telemetry.record()` stores `pick["name"] = entry.name` directly.
+      * `kind=stop` events' `skills` list is populated from
+        `tool_input.skill` (see `lifecycle.record_tool`), which is
+        `invoke_name` — the exact string the Skill tool was invoked with.
+
+    `invoke_name` differs from `name` for any skill whose frontmatter
+    `name:` diverges from its directory name (documented in overrides.py's
+    module docstring: 7 skills do this on the author's machine, e.g. the
+    `xlsx` dir declaring `name: xlsx-official`). Left untranslated, such a
+    skill's invocation count and `last_invoked_days` would silently land
+    under a key `score_pool()` never looks up — invisible to
+    `invocation_rate` (currently zero-weighted, so low stakes today) AND to
+    `rotate._shielded()`'s recency check (which reads the same per-entry
+    `last_invoked_days` slot picks populate), defeating the "never demote a
+    recently-invoked skill" guarantee for exactly the entries most likely to
+    need it.
+
+    `catalog`, if given, supplies the `invoke_name -> name` translation for
+    `kind=stop` events. Without it (the default), stop-event names are used
+    as-is — correct only when every entry's `invoke_name` equals its `name`,
+    which is the common case but not a guarantee, so callers that have a
+    catalog on hand should pass it.
     """
     from datetime import datetime, timezone
+
+    invoke_to_name: dict[str, str] = {}
+    for e in catalog or ():
+        invoke_to_name[e.invoke_name or e.name] = e.name
 
     now = datetime.now(timezone.utc)
     out: dict[str, dict] = {}
     for ev in events:
         if ev.get("kind") == "stop":
-            for name in ev.get("skills") or []:
+            for raw_name in ev.get("skills") or []:
+                name = invoke_to_name.get(raw_name, raw_name)
                 slot = out.setdefault(
                     name, {"picks": 0, "invocations": 0, "last_invoked_days": None}
                 )
@@ -625,19 +657,32 @@ def _rotatable_pool(catalog: list, embeddings):
     entry whose `override_key()` is `None` — the property that makes the
     printed dry run honest about what `--apply` can actually do.
 
-    Returns `(pool_catalog, pool_embeddings, excluded_count)`.
+    Returns `(pool_catalog, pool_embeddings, excluded_count, excluded_labels)`.
+    `excluded_labels` is the set of human-readable categories actually seen
+    among the excluded entries (a subset of {"subagents", "slash commands",
+    "plugin skills"}) — callers use it to describe the exclusion accurately
+    instead of always naming all three regardless of what was really excluded.
     """
-    keep = [
-        i
-        for i, e in enumerate(catalog)
-        if overrides.override_key(
+    keep: list[int] = []
+    excluded_labels: set[str] = set()
+    for i, e in enumerate(catalog):
+        key = overrides.override_key(
             kind=e.kind, namespace=e.namespace, path=e.path, name=e.name
         )
-        is not None
-    ]
+        if key is not None:
+            keep.append(i)
+            continue
+        if e.kind == "subagent":
+            excluded_labels.add("subagents")
+        elif e.kind == "command":
+            excluded_labels.add("slash commands")
+        elif e.kind == "skill" and e.namespace.startswith("plugin:"):
+            excluded_labels.add("plugin skills")
+        else:  # pragma: no cover - defensive; no known catalog shape hits this
+            excluded_labels.add("other unrotatable entries")
     pool_catalog = [catalog[i] for i in keep]
     pool_embeddings = embeddings[keep] if keep else embeddings[:0]
-    return pool_catalog, pool_embeddings, len(catalog) - len(keep)
+    return pool_catalog, pool_embeddings, len(catalog) - len(keep), excluded_labels
 
 
 def _print_proposal_lines(
@@ -683,6 +728,9 @@ def _cmd_rotate(args: argparse.Namespace) -> int:
     rot = cfg.rotation
     if args.target is not None:
         rot = dataclasses.replace(rot, target_active=int(args.target))
+    if args.limit is not None and args.limit < 0:
+        print("error: --limit must be >= 0 (0 shows the full list)", file=sys.stderr)
+        return 2
     limit = args.limit if args.limit is not None else _DEFAULT_ROTATE_PRINT_LIMIT
 
     try:
@@ -691,19 +739,38 @@ def _cmd_rotate(args: argparse.Namespace) -> int:
         print(f"ERROR: {exc}")
         return 1
 
-    pool_catalog, pool_embeddings, excluded = _rotatable_pool(
+    pool_catalog, pool_embeddings, excluded, excluded_labels = _rotatable_pool(
         idx.catalog, idx.embeddings
     )
+    pool_names = {e.name for e in pool_catalog}
 
     sketch = centroids.load()
     events = list(telemetry.iter_events())  # cutoff=None: the whole log
-    stats = _rotation_stats(events)
+    # _rotation_stats() normalises stop-event names to entry.name space (see
+    # its docstring), but its output still spans the WHOLE catalog — a
+    # subagent, slash command, or plugin skill genuinely accrues picks (they
+    # are always `enabled`, so the matcher recommends them like anything
+    # else) even though `_rotatable_pool()` above has already excluded them
+    # from scoring. Scoping to `pool_names` here, before score_pool() ever
+    # sees `stats`, is what stops those picks from inflating max_picks and
+    # silently deflating every real skill's pick_rate/total.
+    stats = {
+        name: s
+        for name, s in _rotation_stats(events, catalog=idx.catalog).items()
+        if name in pool_names
+    }
 
     active = sum(1 for e in pool_catalog if e.enabled)
+    if excluded:
+        exclusion_note = (
+            f"excluded {excluded} unrotatable ({', '.join(sorted(excluded_labels))} "
+            "— not addressable via skillOverrides)"
+        )
+    else:
+        exclusion_note = "excluded 0 unrotatable"
     print(
-        f"catalog {len(idx.catalog)} entries · excluded {excluded} unrotatable "
-        "(subagents, slash commands, plugin skills — not addressable via "
-        f"skillOverrides) · pool {len(pool_catalog)} · active {active} · "
+        f"catalog {len(idx.catalog)} entries · {exclusion_note} · "
+        f"pool {len(pool_catalog)} · active {active} · "
         f"target {rot.target_active} · sketch {sketch.observed} prompts"
     )
     if not cfg.telemetry.events_enabled:
@@ -723,7 +790,14 @@ def _cmd_rotate(args: argparse.Namespace) -> int:
         print("no changes proposed")
         return 0
 
-    resulting_active = active + len(proposal.promote) - len(proposal.demote)
+    # Read the pre-proposal active count back from `scored` — the exact list
+    # `rotate.propose()` computed `incumbents` from — rather than reusing the
+    # `active` variable computed above from `pool_catalog` before scoring.
+    # Both count the same thing (enabled entries in the pool) and agree by
+    # construction, but this ties the arithmetic to what actually produced
+    # the proposal instead of two independently-maintained call sites.
+    active_scored = sum(1 for s in scored if s.entry.enabled)
+    resulting_active = active_scored + len(proposal.promote) - len(proposal.demote)
     print(
         f"proposal: {len(proposal.promote)} promotion(s), "
         f"{len(proposal.demote)} demotion(s) → {resulting_active} active"

@@ -50,6 +50,20 @@ def score_pool(
     stats: dict[str, dict],
     cfg: RotationConfig,
 ) -> list[Scored]:
+    """Score every entry in `entries` against the sketch and usage `stats`.
+
+    `stats` SHOULD already be scoped to `entries` by the caller — see
+    `cli._cmd_rotate`, which filters telemetry-derived stats down to its
+    rotation pool before calling this, because an entry the matcher
+    recommends but that never belongs in THIS pool (e.g. a subagent or
+    plugin skill — always `enabled`, so it accrues real picks, but
+    `overrides.override_key()` can never address it) would otherwise
+    inflate `max_picks` below and silently deflate every real entry's
+    `pick_rate`. `max_picks` is nonetheless computed only over names present
+    in `entries` here, as a second, defensive layer — every other read of
+    `stats` already goes through `stats.get(entry.name, {})`, so this is the
+    one place an unscoped `stats` dict could otherwise leak in.
+    """
     if not entries:
         raise RotationRefused("rotation pool is empty; run `skill-advisor build`")
     fits = centroids_mod.fit(sketch, embeddings, min_observed=cfg.min_observed_prompts)
@@ -59,7 +73,14 @@ def score_pool(
             f"{cfg.min_observed_prompts} before the centroid sketch means anything"
         )
 
-    max_picks = max((int(s.get("picks", 0)) for s in stats.values()), default=0) or 1
+    pool_names = {e.name for e in entries}
+    max_picks = (
+        max(
+            (int(s.get("picks", 0)) for name, s in stats.items() if name in pool_names),
+            default=0,
+        )
+        or 1
+    )
     out: list[Scored] = []
     for i, entry in enumerate(entries):
         st = stats.get(entry.name, {})

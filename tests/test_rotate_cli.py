@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -402,3 +403,155 @@ def test_proposal_list_is_capped_with_explicit_truncation(isolated_paths, capsys
     assert "5 active" in out  # resulting active-set size in the summary
     assert out.count("DEMOTE") == 5  # printed lines capped
     assert "+20 more demotions" in out
+
+
+def test_rotate_rejects_negative_limit(isolated_paths, capsys):
+    from skill_advisor import cli
+
+    _prime_rotatable_state(isolated_paths)
+    assert cli._cmd_rotate(_ns(limit=-1)) == 2
+    err = capsys.readouterr().err
+    assert "--limit" in err
+
+
+_TOTAL_RE = re.compile(r"total=(-?\d+\.\d+)")
+
+
+def _parse_totals(out: str) -> dict[str, float]:
+    """Map each printed PROMOTE/DEMOTE name to its reported `total=` score."""
+    totals: dict[str, float] = {}
+    for line in out.splitlines():
+        stripped = line.strip()
+        if not (stripped.startswith("PROMOTE") or stripped.startswith("DEMOTE")):
+            continue
+        name = stripped.split(None, 2)[1]
+        m = _TOTAL_RE.search(stripped)
+        if m:
+            totals[name] = float(m.group(1))
+    return totals
+
+
+def _prime_pool_with_picks_and_noisy_excluded_entry(
+    isolated_paths, *, include_noisy: bool, observed: int = 1000
+) -> None:
+    """Same 10-entry pool skeleton as `_prime_rotatable_state` (5 active/low
+    fit, 5 candidates/high fit), except `cand0` also gets 2 real picks — so
+    its `total` is sensitive to `pick_rate`'s `max_picks` normalisation.
+
+    When `include_noisy` is True, a rotation-ineligible subagent (excluded
+    by `_rotatable_pool`, per its `kind`) also sits in the catalog and rack
+    up 100 picks in the SAME event log — mirroring the coordinator's report:
+    `index.pickable` is `entry.enabled`, and subagents/commands/plugin
+    skills are always enabled, so the matcher recommends them routinely and
+    they genuinely accrue picks. If `stats` were not scoped to the rotation
+    pool before `rotate.score_pool()` sees it, this subagent's 100 picks
+    would become `max_picks`, deflating `cand0`'s `pick_rate` from 2/2=1.0
+    down to 2/100=0.02 and changing its printed `total` — even though the
+    subagent itself never appears in the pool at all.
+    """
+    entries: list[CatalogEntry] = []
+    fits: list[float] = []
+    for i in range(5):
+        entries.append(
+            CatalogEntry(
+                kind="skill",
+                name=f"active{i}",
+                namespace="user",
+                description=f"active skill {i}",
+                path=f"/skills/active{i}/SKILL.md",
+                enabled=True,
+            )
+        )
+        fits.append(0.10 + i * 0.01)
+    for i in range(5):
+        entries.append(
+            CatalogEntry(
+                kind="skill",
+                name=f"cand{i}",
+                namespace="user",
+                description=f"candidate skill {i}",
+                path=f"/skills/cand{i}/SKILL.md",
+                enabled=False,
+            )
+        )
+        fits.append(0.95 - i * 0.01)
+    if include_noisy:
+        entries.append(
+            CatalogEntry(
+                kind="subagent",
+                name="noisy-subagent",
+                namespace="builtin",
+                description="a builtin subagent that the matcher recommends a lot",
+                path="",
+                enabled=True,
+            )
+        )
+        fits.append(0.5)  # irrelevant — excluded from the pool regardless of fit
+
+    embeddings = _emb(fits)
+    source_hash = catalog_mod.compute_hash(entries)
+    index_mod.save(entries, embeddings, source_hash)
+
+    sketch = centroids.empty(k=2)
+    v = np.zeros(centroids.DIM, dtype=np.float32)
+    v[0] = 1.0
+    sketch.vectors[0] = v
+    sketch.counts[0] = observed
+    sketch.observed = observed
+    centroids.save(sketch)
+
+    _write_rotation_config()
+
+    now = datetime.now(timezone.utc)
+    lines = [
+        json.dumps(
+            {
+                "schema": 1,
+                "kind": "prompt",
+                "ts": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "picks": [{"rank": 1, "name": "cand0", "kind": "skill", "score": 0.5}],
+            }
+        )
+        for _ in range(2)
+    ]
+    if include_noisy:
+        lines.extend(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "kind": "prompt",
+                    "ts": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "picks": [
+                        {
+                            "rank": 1,
+                            "name": "noisy-subagent",
+                            "kind": "subagent",
+                            "score": 0.5,
+                        }
+                    ],
+                }
+            )
+            for _ in range(100)
+        )
+    paths.events_file().write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_excluded_entry_picks_do_not_distort_pool_scoring(isolated_paths, capsys):
+    """A subagent excluded from the rotation pool racks up 100 picks in the
+    same telemetry log as a real pool entry (`cand0`, 2 picks). `cand0`'s
+    printed `total` must be identical whether or not the noisy excluded
+    entry is present — `stats` must be scoped to the pool before scoring,
+    not just the catalog/embeddings."""
+    from skill_advisor import cli
+
+    _prime_pool_with_picks_and_noisy_excluded_entry(isolated_paths, include_noisy=False)
+    assert cli._cmd_rotate(_ns()) == 0
+    baseline_totals = _parse_totals(capsys.readouterr().out)
+
+    _prime_pool_with_picks_and_noisy_excluded_entry(isolated_paths, include_noisy=True)
+    assert cli._cmd_rotate(_ns()) == 0
+    noisy_totals = _parse_totals(capsys.readouterr().out)
+
+    assert "cand0" in baseline_totals
+    assert "cand0" in noisy_totals
+    assert baseline_totals["cand0"] == noisy_totals["cand0"]
