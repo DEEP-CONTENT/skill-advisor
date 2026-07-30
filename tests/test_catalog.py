@@ -129,3 +129,14 @@ def test_scan_resolves_enabled_off_the_directory_not_the_frontmatter_name(
     )
     entry2 = next(e for e in off_by_frontmatter_name if e.name == "xlsx-official")
     assert entry2.enabled is True
+
+
+def test_hash_changes_when_a_skill_is_disabled(fake_claude_home):
+    """Toggling skillOverrides changes no file mtime. If the hash misses it,
+    `build` no-ops and `rotate --apply` silently does nothing."""
+    from skill_advisor import catalog
+    from skill_advisor.config import Config
+
+    on = catalog.scan(Config(), overrides_table={})
+    off = catalog.scan(Config(), overrides_table={"demo-skill": "off"})
+    assert catalog.compute_hash(on) != catalog.compute_hash(off)

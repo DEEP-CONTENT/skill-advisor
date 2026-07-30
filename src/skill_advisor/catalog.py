@@ -189,6 +189,8 @@ def compute_hash(entries: list[CatalogEntry]) -> str:
         h.update(b"\x00")
         h.update(e.name.encode())
         h.update(b"\x00")
+        h.update(b"1" if e.enabled else b"0")
+        h.update(b"\x00")
         if e.path:
             try:
                 mtime = Path(e.path).stat().st_mtime_ns
