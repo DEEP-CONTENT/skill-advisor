@@ -168,11 +168,22 @@ def run() -> int:
         # the inner except below, not the outer one: matcher.pick() already
         # succeeded, so this is an interrupted sketch update, not a failed
         # pick, and must not be reported as "budget exceeded" telemetry.
-        # Single gate: cfg.telemetry.events_enabled is the only check that
-        # decides whether this runs, so the privacy claim (no prompt text, no
-        # per-prompt vectors ever stored) holds by construction — there is no
-        # second, independently-maintained flag that could drift out of sync.
-        if cfg.telemetry.events_enabled:
+        # Two gates: cfg.telemetry.events_enabled (the privacy claim — no
+        # prompt text, no per-prompt vectors ever stored — holds by
+        # construction, since this is the only check that decides whether
+        # anything is embedded), AND triage.should_skip(). matcher.pick()
+        # already returns early for a triage-skipped prompt outside an
+        # active lifecycle ("ok"/"yes"/"go", slash commands, ...) without
+        # ever touching the index — but until this second gate was added,
+        # the sketch update below ran anyway, unconditionally, for that same
+        # class of prompt. Two harms: a latency regression on the path that
+        # exists specifically to be near-free (README promises ~0 ms for
+        # triage-skipped prompts), and sketch pollution — with only 8
+        # centroid slots (SEED_SIMILARITY=0.9), a trivial acknowledgement is
+        # dissimilar enough from real work to claim one of them outright and
+        # then accumulate count, making it sticky. The one signal able to
+        # score a never-used skill was losing capacity to chit-chat.
+        if cfg.telemetry.events_enabled and not triage.should_skip(prompt, cfg):
             try:
                 sketch = centroids.load()
                 centroids.observe(sketch, index_mod.embed_one(prompt))

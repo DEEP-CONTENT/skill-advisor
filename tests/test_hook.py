@@ -144,6 +144,34 @@ def test_hook_does_not_write_the_sketch_when_telemetry_is_off(isolated_paths):
     assert not paths.centroids_file().exists()
 
 
+def test_hook_skips_sketch_update_for_triage_skipped_prompts(isolated_paths):
+    """F4: the sketch update was gated only on events_enabled, so it ran even
+    for a prompt matcher.pick() itself never touches the index for —
+    triage.should_skip() rejects trivial acknowledgements like "ok" before
+    matcher.pick() does any real work (outside an active lifecycle). That
+    both wastes latency on a path meant to be near-free (README promises
+    ~0 ms for triage-skipped prompts) and pollutes the 8-slot centroid
+    sketch with chit-chat — a trivial prompt is dissimilar to real work, so
+    it claims one of only 8 slots and then accumulates count, becoming
+    sticky."""
+    import numpy as np
+
+    from skill_advisor import centroids, paths
+
+    _enable_telemetry_in_config(isolated_paths)
+    unit = np.zeros(centroids.DIM, dtype=np.float32)
+    unit[0] = 1.0
+
+    with patch("skill_advisor.hook.matcher.pick", return_value=None), \
+         patch(
+             "skill_advisor.hook.index_mod.embed_one", return_value=unit
+         ) as embed_mock:
+        _run_with_stdin({"prompt": "ok", "session_id": "s1"})
+
+    embed_mock.assert_not_called()
+    assert not paths.centroids_file().exists()
+
+
 def test_a_failing_sketch_update_never_breaks_the_hook(isolated_paths):
     """Hook paths are silent on error. A broken sketch must not cost a pick."""
     _enable_telemetry_in_config(isolated_paths)
