@@ -80,3 +80,31 @@ def test_parse_frontmatter_returns_none_without_frontmatter(tmp_path):
     f = tmp_path / "plain.md"
     f.write_text("# No frontmatter here\n", encoding="utf-8")
     assert catalog.parse_frontmatter(f) is None
+
+
+def test_scan_marks_disabled_skills(fake_claude_home):
+    from skill_advisor import catalog
+    from skill_advisor.config import Config
+
+    entries = catalog.scan(Config(), overrides_table={"demo-skill": "off"})
+    demo = next(e for e in entries if e.name == "demo-skill")
+    assert demo.enabled is False
+    # Still present — the rotation pool needs it.
+    assert demo in entries
+
+
+def test_scan_defaults_to_enabled_with_no_overrides(fake_claude_home):
+    from skill_advisor import catalog
+    from skill_advisor.config import Config
+
+    entries = catalog.scan(Config(), overrides_table={})
+    assert all(e.enabled for e in entries)
+
+
+def test_scan_sets_invoke_name_for_plugin_skills(fake_claude_home):
+    from skill_advisor import catalog
+    from skill_advisor.config import Config
+
+    entries = catalog.scan(Config(), overrides_table={})
+    plug = next(e for e in entries if e.namespace == "plugin:x")
+    assert plug.invoke_name == "x:y"

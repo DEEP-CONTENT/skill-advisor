@@ -1,4 +1,5 @@
 """Catalog of skills, subagents, and slash commands available to the advisor."""
+
 from __future__ import annotations
 
 import hashlib
@@ -11,6 +12,7 @@ from typing import Iterable
 import yaml
 
 from . import builtins as builtin_entries
+from . import overrides
 from . import paths
 from .config import Config, load as load_config
 
@@ -19,11 +21,13 @@ _FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
 @dataclass(frozen=True)
 class CatalogEntry:
-    kind: str         # "skill" | "subagent" | "command"
+    kind: str  # "skill" | "subagent" | "command"
     name: str
-    namespace: str    # "user" | "plugin:<name>" | "builtin"
+    namespace: str  # "user" | "plugin:<name>" | "builtin"
     description: str
-    path: str = ""    # SKILL.md path for skills; "" for builtins
+    path: str = ""  # SKILL.md path for skills; "" for builtins
+    enabled: bool = True  # resolved from skillOverrides at scan time
+    invoke_name: str = ""  # what the Skill tool accepts; "" ⟹ same as `name`
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -53,7 +57,9 @@ def parse_frontmatter(path: Path) -> dict | None:
     return data
 
 
-def _entries_from_skill_file(skill_md: Path, namespace: str) -> CatalogEntry | None:
+def _entries_from_skill_file(
+    skill_md: Path, namespace: str, table: dict[str, str]
+) -> CatalogEntry | None:
     fm = parse_frontmatter(skill_md)
     if not fm:
         return None
@@ -61,25 +67,34 @@ def _entries_from_skill_file(skill_md: Path, namespace: str) -> CatalogEntry | N
     description = fm.get("description")
     if not name or not description:
         return None
+    name = str(name).strip()
+    path = str(skill_md)
+    key = overrides.override_key(
+        kind="skill", namespace=namespace, path=path, name=name
+    )
     return CatalogEntry(
         kind="skill",
-        name=str(name).strip(),
+        name=name,
         namespace=namespace,
         description=str(description).strip(),
-        path=str(skill_md),
+        path=path,
+        enabled=overrides.is_enabled(key, table),
+        invoke_name=overrides.invoke_name(
+            kind="skill", namespace=namespace, path=path, name=name
+        ),
     )
 
 
-def _scan_user_skills(root: Path) -> Iterable[CatalogEntry]:
+def _scan_user_skills(root: Path, table: dict[str, str]) -> Iterable[CatalogEntry]:
     if not root.is_dir():
         return
     for skill_md in sorted(root.glob("*/SKILL.md")):
-        entry = _entries_from_skill_file(skill_md, namespace="user")
+        entry = _entries_from_skill_file(skill_md, namespace="user", table=table)
         if entry:
             yield entry
 
 
-def _scan_plugin_skills(root: Path) -> Iterable[CatalogEntry]:
+def _scan_plugin_skills(root: Path, table: dict[str, str]) -> Iterable[CatalogEntry]:
     if not root.is_dir():
         return
     # Pattern: <marketplace>/plugins/<plugin>/skills/<skill>/SKILL.md
@@ -88,17 +103,19 @@ def _scan_plugin_skills(root: Path) -> Iterable[CatalogEntry]:
             plugin_name = skill_md.parents[2].name
         except IndexError:
             plugin_name = "unknown"
-        entry = _entries_from_skill_file(skill_md, namespace=f"plugin:{plugin_name}")
+        entry = _entries_from_skill_file(
+            skill_md, namespace=f"plugin:{plugin_name}", table=table
+        )
         if entry:
             yield entry
 
 
-def _scan_extra_root(root: Path) -> Iterable[CatalogEntry]:
+def _scan_extra_root(root: Path, table: dict[str, str]) -> Iterable[CatalogEntry]:
     if not root.is_dir():
         return
     # Accept either a flat skills/<name>/SKILL.md layout or a single SKILL.md file.
     for skill_md in sorted(root.rglob("SKILL.md")):
-        entry = _entries_from_skill_file(skill_md, namespace="extra")
+        entry = _entries_from_skill_file(skill_md, namespace="extra", table=table)
         if entry:
             yield entry
 
@@ -120,8 +137,13 @@ def _builtin_entries() -> Iterable[CatalogEntry]:
         )
 
 
-def scan(config: Config | None = None) -> list[CatalogEntry]:
+def scan(
+    config: Config | None = None,
+    *,
+    overrides_table: dict[str, str] | None = None,
+) -> list[CatalogEntry]:
     cfg = config or load_config()
+    table = overrides_table if overrides_table is not None else overrides.read()
     exclude = set(cfg.catalog.exclude_names)
     seen: set[tuple[str, str]] = set()
     out: list[CatalogEntry] = []
@@ -140,14 +162,14 @@ def scan(config: Config | None = None) -> list[CatalogEntry]:
     # is either a skills/ dir or a plugins/marketplaces dir; detect by name.
     for root in paths.skill_roots():
         if root.name == "skills":
-            for entry in _scan_user_skills(root):
+            for entry in _scan_user_skills(root, table):
                 _accept(entry)
         elif root.name == "marketplaces":
-            for entry in _scan_plugin_skills(root):
+            for entry in _scan_plugin_skills(root, table):
                 _accept(entry)
 
     for extra in cfg.catalog.extra_roots:
-        for entry in _scan_extra_root(Path(extra).expanduser()):
+        for entry in _scan_extra_root(Path(extra).expanduser(), table):
             _accept(entry)
 
     for entry in _builtin_entries():
