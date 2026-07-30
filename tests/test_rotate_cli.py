@@ -88,7 +88,13 @@ def _prime_rotatable_state(isolated_paths, *, observed: int = 1000) -> None:
         fits.append(0.95 - i * 0.01)
 
     embeddings = _emb(fits)
-    source_hash = catalog_mod.compute_hash(entries)
+    # F5: `_cmd_rotate`'s freshness check re-scans the real filesystem and
+    # compares against the hash recorded alongside catalog.json — it has no
+    # way to know `entries` here are synthetic. Hash what a fresh
+    # `catalog_mod.scan()` of this (empty) test environment actually
+    # returns, not `entries`, so the freshness check sees "unchanged"
+    # rather than "stale" for every test in this file.
+    source_hash = catalog_mod.compute_hash(catalog_mod.scan())
     index_mod.save(entries, embeddings, source_hash)
 
     sketch = centroids.empty(k=2)
@@ -337,6 +343,33 @@ def test_rotate_target_override(isolated_paths, capsys):
     assert "target 3" in out
 
 
+def test_rotate_refuses_on_a_stale_catalog(isolated_paths, capsys):
+    """F5: `rotate` never checked catalog freshness the way `doctor` does
+    (re-scan the disk, compare against the hash recorded at the last
+    `build`). The sharp case is an upgrade: an old catalog.json can load
+    with `enabled=True` defaulted for entries the schema change never
+    recorded a real value for, so `rotate --apply` before `build` would
+    score and write from a fabricated starting state. Simulated here
+    directly by corrupting the recorded hash — the same signal `doctor`
+    already uses to declare "STALE"."""
+    from skill_advisor import cli
+
+    _prime_rotatable_state(isolated_paths)
+    paths.catalog_hash_file().write_text(
+        "deliberately-wrong-hash", encoding="utf-8"
+    )
+    settings_existed_before = paths.settings_file().is_file()
+
+    assert cli._cmd_rotate(_ns(apply=True)) == 1
+    out = capsys.readouterr().out
+    assert "stale" in out.lower()
+    assert "skill-advisor build" in out
+
+    # A refusal must not write, exactly like the cold-start refusal already
+    # guarantees.
+    assert paths.settings_file().is_file() == settings_existed_before
+
+
 def _prime_state_with_unrotatable_entries(
     isolated_paths, *, observed: int = 1000
 ) -> None:
@@ -412,7 +445,13 @@ def _prime_state_with_unrotatable_entries(
     fits.append(0.99)
 
     embeddings = _emb(fits)
-    source_hash = catalog_mod.compute_hash(entries)
+    # F5: `_cmd_rotate`'s freshness check re-scans the real filesystem and
+    # compares against the hash recorded alongside catalog.json — it has no
+    # way to know `entries` here are synthetic. Hash what a fresh
+    # `catalog_mod.scan()` of this (empty) test environment actually
+    # returns, not `entries`, so the freshness check sees "unchanged"
+    # rather than "stale" for every test in this file.
+    source_hash = catalog_mod.compute_hash(catalog_mod.scan())
     index_mod.save(entries, embeddings, source_hash)
 
     sketch = centroids.empty(k=2)
@@ -465,7 +504,13 @@ def _prime_large_pool(isolated_paths, *, n: int = 30, observed: int = 1000) -> N
         fits.append(0.05 + i * 0.001)
 
     embeddings = _emb(fits)
-    source_hash = catalog_mod.compute_hash(entries)
+    # F5: `_cmd_rotate`'s freshness check re-scans the real filesystem and
+    # compares against the hash recorded alongside catalog.json — it has no
+    # way to know `entries` here are synthetic. Hash what a fresh
+    # `catalog_mod.scan()` of this (empty) test environment actually
+    # returns, not `entries`, so the freshness check sees "unchanged"
+    # rather than "stale" for every test in this file.
+    source_hash = catalog_mod.compute_hash(catalog_mod.scan())
     index_mod.save(entries, embeddings, source_hash)
 
     sketch = centroids.empty(k=2)
@@ -589,7 +634,13 @@ def _prime_pool_with_picks_and_noisy_excluded_entry(
         fits.append(0.5)  # irrelevant — excluded from the pool regardless of fit
 
     embeddings = _emb(fits)
-    source_hash = catalog_mod.compute_hash(entries)
+    # F5: `_cmd_rotate`'s freshness check re-scans the real filesystem and
+    # compares against the hash recorded alongside catalog.json — it has no
+    # way to know `entries` here are synthetic. Hash what a fresh
+    # `catalog_mod.scan()` of this (empty) test environment actually
+    # returns, not `entries`, so the freshness check sees "unchanged"
+    # rather than "stale" for every test in this file.
+    source_hash = catalog_mod.compute_hash(catalog_mod.scan())
     index_mod.save(entries, embeddings, source_hash)
 
     sketch = centroids.empty(k=2)

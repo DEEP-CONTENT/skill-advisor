@@ -746,6 +746,32 @@ def _cmd_rotate(args: argparse.Namespace) -> int:
         print(f"ERROR: {exc}")
         return 1
 
+    # F5: `doctor` re-scans the disk and compares against the hash recorded
+    # at the last `build` to report staleness, but `rotate` never did — it
+    # loaded catalog.json as-is and scored/wrote against it regardless of
+    # whether skills or skillOverrides had changed since. The sharp case is
+    # an upgrade: an old catalog.json deserializes with `enabled=True`
+    # defaulted for every entry (CatalogEntry.from_json tolerates missing
+    # fields), so `rotate --apply` run before `build` sees a fabricated
+    # "everything is active" starting point and can propose hundreds of
+    # demotions from data that was never real. Unlike `migrate-excludes`,
+    # `--apply` here takes no backup, and this is a CLI verb — it fails
+    # loudly rather than silently trusting stale state.
+    try:
+        fresh_hash = catalog_mod.compute_hash(catalog_mod.scan(cfg))
+    except Exception as exc:
+        print(f"ERROR: catalog scan failed: {exc}")
+        return 1
+    stored_hash = index_mod.current_hash()
+    if stored_hash and stored_hash != fresh_hash:
+        print(
+            "ERROR: catalog is stale — skills or skillOverrides changed "
+            "since the last `skill-advisor build`; refusing to rotate "
+            "against outdated data.\n"
+            "Run `skill-advisor build`, then re-run `skill-advisor rotate`."
+        )
+        return 1
+
     pool_catalog, pool_embeddings, excluded, excluded_labels = _rotatable_pool(
         idx.catalog, idx.embeddings
     )
