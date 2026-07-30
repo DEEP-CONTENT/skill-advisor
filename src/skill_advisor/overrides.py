@@ -35,8 +35,19 @@ def override_key(*, kind: str, namespace: str, path: str, name: str) -> str | No
     `skillOverrides` covers skills only — subagents and slash commands are not
     addressable through it. Plugin skills carry no key today (zero of the 889
     live keys contain a colon), so they resolve to enabled by default.
+
+    Verified live against Claude Code
+    (docs/superpowers/notes/2026-07-30-skilloverrides-verification.md, case D):
+    a bare directory name in `skillOverrides` (e.g. `{"brainstorming": "off"}`)
+    silences only the *user* skill in that directory. A plugin skill living in
+    a same-named directory (`superpowers:brainstorming`) is not addressable
+    through `skillOverrides` at all and stays enabled regardless of what the
+    table contains — the namespaced form is silently ignored too (case C).
+    So a plugin entry must resolve to no key, not to the shared dirname.
     """
     if kind != "skill":
+        return None
+    if namespace.startswith("plugin:"):
         return None
     return _dir_name(path) or name
 

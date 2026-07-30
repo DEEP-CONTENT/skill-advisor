@@ -15,6 +15,18 @@ def test_override_key_is_the_directory_name_not_the_frontmatter_name():
     assert key == "xlsx"
 
 
+def test_override_key_is_still_the_dir_name_for_user_skills():
+    """Guard against over-correction: only plugin-namespaced entries should
+    resolve to None. A user skill's key must still be its directory name."""
+    key = overrides.override_key(
+        kind="skill",
+        namespace="user",
+        path="/home/u/.claude/skills/brainstorming/SKILL.md",
+        name="brainstorming",
+    )
+    assert key == "brainstorming"
+
+
 def test_override_key_is_none_for_builtins():
     assert (
         overrides.override_key(
@@ -28,6 +40,22 @@ def test_override_key_is_none_for_builtins():
         )
         is None
     )
+
+
+def test_override_key_is_none_for_plugin_skills_even_when_dir_matches_a_table_key():
+    """Verification gate docs/superpowers/notes/2026-07-30-skilloverrides-verification.md,
+    case D: a bare directory name in skillOverrides (`{"brainstorming": "off"}`)
+    silenced only the user skill; the plugin skill sharing that directory name
+    (`superpowers:brainstorming`) survived untouched. `skillOverrides` does not
+    address plugin skills at all — `override_key` must return None for them so
+    `is_enabled` always resolves to True, regardless of what the table contains."""
+    key = overrides.override_key(
+        kind="skill",
+        namespace="plugin:superpowers",
+        path="/x/plugins/cache/official/superpowers/6.2.0/skills/brainstorming/SKILL.md",
+        name="brainstorming",
+    )
+    assert key is None
 
 
 def test_invoke_name_namespaces_plugin_skills():

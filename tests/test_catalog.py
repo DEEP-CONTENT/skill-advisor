@@ -370,6 +370,49 @@ def test_exclude_names_by_namespaced_key_drops_only_plugin_skill(isolated_paths)
     assert "brainstorming" in by_invoke
 
 
+def test_scan_off_by_bare_dir_name_disables_only_the_user_skill(isolated_paths):
+    """Pins the verification gate's case D
+    (docs/superpowers/notes/2026-07-30-skilloverrides-verification.md): live
+    Claude Code was fed `{"skillOverrides": {"brainstorming": "off"}}` and only
+    the user-level `brainstorming` skill disappeared from its skill list —
+    `superpowers:brainstorming` (a plugin skill in a same-named directory)
+    stayed enabled. `override_key` returning the bare dirname for plugin
+    entries too would silence the plugin skill as well; this is the case that
+    catches that regression."""
+    user_d = isolated_paths["claude_home"] / "skills" / "brainstorming"
+    user_d.mkdir(parents=True)
+    (user_d / "SKILL.md").write_text(
+        '---\nname: brainstorming\ndescription: "User brainstorming skill."\n---\n',
+        encoding="utf-8",
+    )
+    plugin_d = (
+        isolated_paths["claude_home"]
+        / "plugins"
+        / "cache"
+        / "official"
+        / "superpowers"
+        / "6.2.0"
+        / "skills"
+        / "brainstorming"
+    )
+    plugin_d.mkdir(parents=True)
+    (plugin_d / "SKILL.md").write_text(
+        '---\nname: brainstorming\ndescription: "Plugin brainstorming skill."\n---\n',
+        encoding="utf-8",
+    )
+
+    entries = catalog.scan(Config(), overrides_table={"brainstorming": "off"})
+    by_invoke = {e.invoke_name: e for e in entries}
+
+    user_entry = by_invoke["brainstorming"]
+    plugin_entry = by_invoke["superpowers:brainstorming"]
+
+    assert user_entry.namespace == "user"
+    assert user_entry.enabled is False
+    assert plugin_entry.namespace == "plugin:superpowers"
+    assert plugin_entry.enabled is True
+
+
 def test_pool_health_unparseable_count_is_per_file_not_deduped(isolated_paths, tmp_path):
     """When two roots contain unparseable files with the same directory name,
     the per-file count must be used for arithmetic, not the deduplicated count."""
