@@ -12,8 +12,8 @@ import sys
 import time
 from typing import Any
 
-from . import inject, lifecycle, matcher, paths, telemetry, triage
-from .config import load as load_config
+from . import baseline, effort, inject, judge, lifecycle, matcher, paths, telemetry, triage
+from .config import Config, load as load_config
 
 
 class _BudgetExceeded(Exception):
@@ -22,6 +22,18 @@ class _BudgetExceeded(Exception):
 
 def _alarm_handler(signum, frame):  # pragma: no cover - signal path
     raise _BudgetExceeded()
+
+
+def alarm_seconds(cfg: Config) -> int:
+    """Whole-hook SIGALRM budget, in whole seconds.
+
+    Must stay strictly greater than judge.rank()'s own subprocess timeout
+    (`max(cfg.matcher.budget_seconds - 0.5, 0.5)`, judge.py:106-110) — otherwise
+    the alarm kills the hook before matcher.py's embedding fallback ever runs.
+    A named function (rather than an inline expression) so tests can pin the
+    ordering against the real formula instead of a restated copy of it.
+    """
+    return max(int(cfg.matcher.budget_seconds + 0.5), 1)
 
 
 def _setup_logging() -> None:
@@ -44,14 +56,61 @@ def _read_input() -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _emit(text: str) -> None:
-    envelope = {
+def _emit(text: str, system_message: str | None = None) -> None:
+    envelope: dict[str, Any] = {
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": text,
         }
     }
+    if system_message:
+        envelope["systemMessage"] = system_message
     sys.stdout.write(json.dumps(envelope))
+
+
+def _nudge_message(observed: str | None, rec) -> str | None:
+    """One-line systemMessage, or None when we must stay quiet."""
+    if rec is None or not effort.should_nudge(observed, rec.level):
+        return None
+    if rec.level == effort.ULTRACODE:
+        # ultracode is a keyword, not a /effort argument — typing it trips the
+        # harness's own built-in badge.
+        return (
+            f"skill-advisor: this decomposes into parallel work ({rec.reason}) — "
+            f"consider the `ultracode` keyword. You're at {observed}."
+        )
+    return (
+        f"skill-advisor: this looks like {rec.level} work ({rec.reason}) — "
+        f"you're at {observed}.  /effort {rec.level}"
+    )
+
+
+def _emit_nudged(
+    text: str,
+    *,
+    nudge: str | None,
+    session_id: str | None,
+    observed: str | None,
+    level: str | None,
+) -> None:
+    """Emit the envelope, then consume the nudge rate-limit slot only once the
+    emit actually happened.
+
+    Consumption is tied to this single emission point rather than to any one
+    caller's branch, so a future emission site that also carries a pending
+    nudge (e.g. a no-picks-but-announcement path) stays correct by calling
+    this same helper instead of re-deriving "did this reach the user" logic.
+    If `_emit` raises, the caller's own exception handling takes over and the
+    slot is never touched — the message never reached the user.
+    """
+    _emit(text, system_message=nudge)
+    if nudge:
+        try:
+            baseline.mark_nudged(session_id, observed, level)
+        except Exception as exc:  # pragma: no cover - defensive
+            logging.getLogger("skill_advisor.hook").debug(
+                "nudge mark failed: %s", exc, exc_info=True
+            )
 
 
 def _extract_todo_titles(tool_input: dict) -> list[str]:
@@ -83,14 +142,41 @@ def run() -> int:
         return 0
 
     cfg = load_config()
-    budget = max(int(cfg.matcher.budget_seconds + 0.5), 1)
+    budget = alarm_seconds(cfg)
+    # Created before the alarm is armed: it costs nothing, and it must already
+    # exist before anything below can raise (matcher.pick(), or the alarm
+    # itself) so any handler that wants to read or annotate it — like the
+    # budget-exceeded branch below — finds a live object, not a NameError.
+    trace = matcher.JudgeTrace()
     signal.signal(signal.SIGALRM, _alarm_handler)
     signal.alarm(budget)
 
     try:
-        result = matcher.pick(prompt, cfg, session_id=session_id)
+        result = matcher.pick(prompt, cfg, session_id=session_id, trace=trace)
     except _BudgetExceeded:
-        log.info("budget exceeded after %.2fs; falling back silent", time.monotonic() - started)
+        duration = time.monotonic() - started
+        log.info("budget exceeded after %.2fs; falling back silent", duration)
+        # The alarm kill is otherwise invisible in events.jsonl — no row at
+        # all, indistinguishable from a hook that never fired. Record one,
+        # marked distinctly, so it's countable. Must not itself raise: this is
+        # a hook path and hook paths are silent on error.
+        if cfg.telemetry.events_enabled:
+            try:
+                trace.failure = judge.FAILURE_BUDGET_EXCEEDED
+                telemetry.record(
+                    prompt=prompt,
+                    session_id=session_id,
+                    picks=[],
+                    phase="none",
+                    phase_source="user",
+                    judge_used=trace.ran,
+                    judge_failure=trace.failure,
+                    triage_skipped=triage.should_skip(prompt, cfg),
+                    duration_ms=int(duration * 1000),
+                    config=cfg.telemetry,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                log.debug("budget-exceeded telemetry record failed: %s", exc, exc_info=True)
         return 0
     except Exception as exc:  # pragma: no cover - defensive
         log.warning("hook exception: %s", exc, exc_info=True)
@@ -102,11 +188,78 @@ def run() -> int:
     phase = result.state.phase if (result and result.state) else "none"
     picks = result.picks if result else []
 
+    rec = result.effort if result else None
+    nudge = None
+    observed = None
+    if cfg.effort.enabled and rec is not None:
+        try:
+            effort.write_recommendation(rec, session_id=session_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("effort write failed: %s", exc, exc_info=True)
+        try:
+            obs_session, observed = effort.read_observed()
+            if cfg.effort.nudge and obs_session == session_id:
+                candidate = _nudge_message(observed, rec)
+                # Check only — do NOT consume the slot here. It must not
+                # be spent until we know the message actually reached the
+                # user (see `_emit_nudged`); otherwise a turn that never
+                # emits (empty picks) or fails mid-emit silently burns the
+                # one shot this session gets for this (observed, level)
+                # pair, and the user is never told.
+                if candidate and not baseline.was_nudged(session_id, observed, rec.level):
+                    nudge = candidate
+            if observed and obs_session == session_id:
+                try:
+                    baseline.note_observation(session_id, observed, cfg)
+                except Exception as exc:  # pragma: no cover - defensive
+                    log.debug("baseline observation failed: %s", exc, exc_info=True)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("nudge computation failed: %s", exc, exc_info=True)
+            nudge = None
+            observed = None
+        try:
+            baseline.record(session_id or "", rec.level)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("baseline record failed: %s", exc, exc_info=True)
+
+    # A baseline write on a previous session's Stop leaves a one-shot
+    # announcement pending. Consume it here, on the first prompt after the
+    # write, and prepend it to any pending nudge so a single systemMessage
+    # carries both. `announcement` (not the merged `nudge`) is what gates the
+    # no-picks branch below — an ordinary effort nudge with no picks must
+    # stay silent (there's nothing to attach it to), but an announcement is
+    # its own message and must get through regardless of picks.
+    announcement = None
+    if cfg.effort.enabled:
+        try:
+            announcement = baseline.take_announcement()
+        except Exception:  # pragma: no cover - defensive
+            announcement = None
+        if announcement:
+            nudge = f"{announcement}\n{nudge}" if nudge else announcement
+
     if result is None or not result.picks:
+        if announcement:
+            try:
+                _emit_nudged(
+                    "",
+                    nudge=nudge,
+                    session_id=session_id,
+                    observed=observed,
+                    level=rec.level if rec else None,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                log.warning("emit failed: %s", exc, exc_info=True)
         log.debug("no picks for prompt (%.2fs)", duration)
     else:
         try:
-            _emit(inject.format(result))
+            _emit_nudged(
+                inject.format(result),
+                nudge=nudge,
+                session_id=session_id,
+                observed=observed,
+                level=rec.level if rec else None,
+            )
         except Exception as exc:  # pragma: no cover - defensive
             log.warning("emit failed: %s", exc, exc_info=True)
             return 0
@@ -126,7 +279,8 @@ def run() -> int:
                 picks=picks,
                 phase=phase,
                 phase_source="user",
-                judge_used=cfg.matcher.use_judge,
+                judge_used=trace.ran,
+                judge_failure=trace.failure,
                 triage_skipped=triage.should_skip(prompt, cfg),
                 duration_ms=int(duration * 1000),
                 config=cfg.telemetry,
@@ -219,13 +373,26 @@ def run_stop() -> int:
         log.debug("stop turn cleanup failed: %s", exc, exc_info=True)
         return 0
 
-    if turn is None:
-        return 0
-
     try:
         cfg = load_config()
     except Exception as exc:  # pragma: no cover - defensive
         log.debug("stop config load failed: %s", exc, exc_info=True)
+        return 0
+
+    # Effort baseline finalisation: tallies/window/write-back are session-level
+    # bookkeeping, independent of lifecycle turn-tracking. A turn that used no
+    # tools at all (turn is None — e.g. a plain conversational reply) still
+    # deserves this pass, so it runs before the turn-is-None short-circuit
+    # below. Wrapped defensively: run_stop must always return 0.
+    if cfg.effort.enabled:
+        try:
+            baseline.finalise_session(session_id)
+            baseline.decrement_cooldown(session_id)
+            baseline.maybe_write(cfg, launch_level=baseline.first_observation(session_id))
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("baseline finalise failed: %s", exc, exc_info=True)
+
+    if turn is None:
         return 0
 
     # Stop-event telemetry runs regardless of lifecycle config — it's how the

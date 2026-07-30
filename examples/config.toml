@@ -73,3 +73,28 @@ extra_disable_patterns = []
 # [lifecycle.phase_additions]
 # implementation = ["skill:team-implementation-checklist"]
 # review = ["subagent:feature-dev:code-reviewer", "skill:team-review-checklist"]
+
+[effort]
+# Master toggle. When false, nothing in this feature runs: no classification, no
+# status line registration, no nudge, no write-back. Off by default so existing
+# installs are untouched until you opt in. See "Effort signalling" below.
+enabled = false
+
+# Register a `statusLine` command in claudeskill-settings.json (needs `jq`).
+statusline = true
+
+# Emit a systemMessage when the recommendation disagrees with observed effort.
+nudge = true
+
+# Allow occasional writes of `effortLevel` into claudeskill-settings.json.
+write_back = true
+
+# Consecutive qualifying sessions of disagreement before a write happens.
+write_back_after_sessions = 5
+
+# Sessions to suppress write-back for after the user manually overrides.
+veto_cooldown_sessions = 10
+
+# Recommend `ultracode` when the parallelization detector says yes.
+# Never persisted — Claude Code treats ultracode as session-only by design.
+ultracode_nudge = true

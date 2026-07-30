@@ -4,6 +4,7 @@ Uses `--output-format json` to get a structured envelope. Validates the model's
 inner JSON against a tiny schema and rejects names that weren't in the candidate
 list (hallucination guard — known `claude -p` rough edge).
 """
+
 from __future__ import annotations
 
 import json
@@ -14,8 +15,25 @@ from dataclasses import dataclass
 
 from .catalog import CatalogEntry
 from .config import Config
+from . import effort as effort_mod
 
 log = logging.getLogger(__name__)
+
+# Why the judge produced no verdict. `None` means it ran and answered —
+# including answering "nothing fits", which is a verdict, not a failure.
+FAILURE_NO_CANDIDATES = "no_candidates"
+FAILURE_CLI_MISSING = "cli_missing"
+FAILURE_TIMEOUT = "timeout"
+FAILURE_SUBPROCESS = "subprocess_error"
+FAILURE_EXIT = "exit_nonzero"
+FAILURE_UNPARSEABLE = "unparseable"
+
+# Not produced by rank() itself — set by hook.py when the whole-hook SIGALRM
+# fires before the judge (or anything else downstream of it) returns a
+# verdict. Defined here, alongside the judge's own FAILURE_* values, so every
+# string that can land in the `judge_failure` telemetry field lives in one
+# place and is guaranteed not to collide.
+FAILURE_BUDGET_EXCEEDED = "budget_exceeded"
 
 
 @dataclass(frozen=True)
@@ -24,14 +42,29 @@ class Pick:
     reason: str
 
 
+@dataclass(frozen=True)
+class JudgeResult:
+    picks: list[Pick]
+    effort: str | None = None
+    # None ⟺ the judge ran and returned a usable verdict. Callers use this to
+    # tell a 24-second timeout apart from a deliberate "nothing fits" — the
+    # first should fall back to the embedding ranking, the second must not.
+    failure: str | None = None
+
+    @property
+    def ran(self) -> bool:
+        return self.failure is None
+
+
 _JUDGE_TEMPLATE = """You are a skill router for Claude Code. Given the user's message and a candidate list, pick 0-3 catalog entries that best apply. Return ONLY JSON matching this schema (no prose, no code fences):
 
-{{"picks": [{{"name": "<exact catalog name>", "reason": "<<=12 words>"}}], "skip": <bool>}}
+{{"picks": [{{"name": "<exact catalog name>", "reason": "<<=12 words>"}}], "skip": <bool>, "effort": "<low|medium|high|xhigh|ultracode>"}}
 
 Rules:
 - Use exact names from the candidate list. Do not invent or rename.
 - If nothing is a strong fit, return {{"picks": [], "skip": true}}.
 - Prefer skills over subagents when both match; prefer subagents for heavy exploration/planning work.
+- `effort` is how much reasoning depth this task warrants: `low` for trivial edits and lookups, `medium` for routine changes, `high` for multi-file work, `xhigh` for design or debugging that needs sustained reasoning, `ultracode` only when the task decomposes into several independent sub-tasks that could run in parallel.
 
 User message:
 <<<
@@ -54,22 +87,45 @@ def _render_candidates(candidates: list[CatalogEntry]) -> str:
     return "\n".join(lines)
 
 
-def rank(prompt: str, candidates: list[CatalogEntry], config: Config, timeout: float | None = None) -> list[Pick] | None:
+def rank(
+    prompt: str,
+    candidates: list[CatalogEntry],
+    config: Config,
+    timeout: float | None = None,
+) -> JudgeResult:
+    """Rank `candidates` with `claude -p`.
+
+    Never returns None. A result with `failure is None` means the judge ran and
+    answered; `picks == []` in that case is a deliberate decline and callers
+    must respect it. A non-None `failure` means no verdict was obtained and the
+    caller should fall back to whatever it already has.
+    """
     if not candidates:
-        return None
+        return JudgeResult(picks=[], failure=FAILURE_NO_CANDIDATES)
     if shutil.which("claude") is None:
         log.warning("claude CLI not on PATH; judge skipped")
-        return None
+        return JudgeResult(picks=[], failure=FAILURE_CLI_MISSING)
 
     judge_prompt = _JUDGE_TEMPLATE.format(
         prompt=prompt.strip(),
         candidates=_render_candidates(candidates),
     )
-    budget = timeout if timeout is not None else max(config.matcher.budget_seconds - 0.5, 0.5)
+    budget = (
+        timeout
+        if timeout is not None
+        else max(config.matcher.budget_seconds - 0.5, 0.5)
+    )
 
     try:
         completed = subprocess.run(
-            ["claude", "-p", "--model", config.matcher.model, "--output-format", "json"],
+            [
+                "claude",
+                "-p",
+                "--model",
+                config.matcher.model,
+                "--output-format",
+                "json",
+            ],
             input=judge_prompt,
             capture_output=True,
             text=True,
@@ -78,19 +134,24 @@ def rank(prompt: str, candidates: list[CatalogEntry], config: Config, timeout: f
         )
     except subprocess.TimeoutExpired:
         log.info("judge timed out after %.2fs", budget)
-        return None
+        return JudgeResult(picks=[], failure=FAILURE_TIMEOUT)
     except (OSError, ValueError) as exc:
         log.warning("judge subprocess failed: %s", exc)
-        return None
+        return JudgeResult(picks=[], failure=FAILURE_SUBPROCESS)
 
     if completed.returncode != 0:
         log.warning("judge exit %s: %s", completed.returncode, completed.stderr[:200])
-        return None
+        return JudgeResult(picks=[], failure=FAILURE_EXIT)
 
-    return _parse_judge_reply(completed.stdout, candidates)
+    parsed = _parse_judge_reply(completed.stdout, candidates)
+    if parsed is None:
+        return JudgeResult(picks=[], failure=FAILURE_UNPARSEABLE)
+    return parsed
 
 
-def _parse_judge_reply(stdout: str, candidates: list[CatalogEntry]) -> list[Pick] | None:
+def _parse_judge_reply(
+    stdout: str, candidates: list[CatalogEntry]
+) -> JudgeResult | None:
     stdout = stdout.strip()
     if not stdout:
         return None
@@ -113,9 +174,15 @@ def _parse_judge_reply(stdout: str, candidates: list[CatalogEntry]) -> list[Pick
     picks_raw = inner.get("picks")
     if not isinstance(picks_raw, list):
         return None
+
+    raw_effort = inner.get("effort")
+    parsed_effort = raw_effort if raw_effort in effort_mod.RECOMMENDABLE else None
+    if raw_effort is not None and parsed_effort is None:
+        log.info("rejected out-of-enum effort: %r", raw_effort)
+
     skip = bool(inner.get("skip", False))
     if skip and not picks_raw:
-        return []
+        return JudgeResult(picks=[], effort=parsed_effort)
 
     valid_names = {e.name for e in candidates}
     picks: list[Pick] = []
@@ -130,7 +197,7 @@ def _parse_judge_reply(stdout: str, candidates: list[CatalogEntry]) -> list[Pick
             log.info("rejected hallucinated pick: %r", name)
             continue
         picks.append(Pick(name=name.strip(), reason=reason.strip()))
-    return picks
+    return JudgeResult(picks=picks, effort=parsed_effort)
 
 
 def _extract_json_object(text: str) -> dict | None:

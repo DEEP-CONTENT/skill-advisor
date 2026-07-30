@@ -1,4 +1,5 @@
 """`skill-advisor install` / `uninstall` — wires the framework into the user's shell."""
+
 from __future__ import annotations
 
 import json
@@ -8,14 +9,26 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import paths
+from . import statusline
+from .config import load as load_config
 
 ALIAS_BEGIN = "# >>> skill-advisor alias >>>"
 ALIAS_END = "# <<< skill-advisor alias <<<"
 
 
+class RenderSettingsError(RuntimeError):
+    """`render_settings()` could not prepare or write its target settings file.
+
+    Raised instead of letting the underlying OSError propagate as a raw
+    traceback — the message names the resolved path and, when set, the
+    `SKILL_ADVISOR_SETTINGS_FILE` override responsible for it, so a typo'd or
+    permission-restricted override fails with something the user can act on.
+    """
+
+
 @dataclass(frozen=True)
 class ShellTarget:
-    name: str           # "bash" | "zsh" | "fish"
+    name: str  # "bash" | "zsh" | "fish"
     rc_file: Path
     alias_line: str
 
@@ -108,10 +121,12 @@ def _merge_hook_entry(
                 }
                 return
 
-    blocks.append({
-        "matcher": "",
-        "hooks": [{"type": "command", "command": command, "timeout": timeout_ms}],
-    })
+    blocks.append(
+        {
+            "matcher": "",
+            "hooks": [{"type": "command", "command": command, "timeout": timeout_ms}],
+        }
+    )
 
 
 def render_settings() -> Path:
@@ -121,9 +136,29 @@ def render_settings() -> Path:
     read the existing file if present, upsert our UserPromptSubmit / PostToolUse
     / Stop hook entries by their sentinel command strings, leave every other
     hook block alone. Idempotent — re-runs yield no diff once paths are stable.
+    When the effort feature is enabled, also upserts a `statusLine` key pointing
+    at our generated script by exact path match — any `statusLine` whose command
+    is not exactly our script's path is treated as user-owned and left untouched.
+
+    Raises `RenderSettingsError` (not the raw OSError) if the settings file's
+    directory can't be prepared — most likely a typo'd or permission-restricted
+    `SKILL_ADVISOR_SETTINGS_FILE`. Deliberately not swallowed: the caller must
+    know install did not complete.
     """
-    paths.ensure_dirs()
     target = paths.settings_file()
+    try:
+        paths.ensure_dirs()
+    except OSError as exc:
+        override = os.environ.get("SKILL_ADVISOR_SETTINGS_FILE")
+        source = (
+            f"SKILL_ADVISOR_SETTINGS_FILE={override!r}"
+            if override
+            else "the default config directory"
+        )
+        raise RenderSettingsError(
+            f"could not prepare the directory for the settings file at {target} "
+            f"(from {source}): {exc}"
+        ) from exc
 
     data: dict = {}
     if target.is_file():
@@ -143,6 +178,20 @@ def render_settings() -> Path:
     _merge_hook_entry(hooks, "UserPromptSubmit", f"{advisor} hook")
     _merge_hook_entry(hooks, "PostToolUse", f"{advisor} posttooluse")
     _merge_hook_entry(hooks, "Stop", f"{advisor} stop")
+
+    try:
+        cfg = load_config()
+    except Exception:  # pragma: no cover - defensive; installer must not crash
+        cfg = None
+
+    if cfg is not None and cfg.effort.enabled and cfg.effort.statusline:
+        existing = data.get("statusLine")
+        expected = str(paths.statusline_script())
+        existing_cmd = existing.get("command") if isinstance(existing, dict) else None
+        is_foreign = isinstance(existing_cmd, str) and existing_cmd != expected
+        if not is_foreign:
+            ours = str(statusline.write_script())
+            data["statusLine"] = {"type": "command", "command": ours}
 
     target.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     return target
@@ -174,7 +223,7 @@ max_picks = 3
 # Total hook budget in seconds. Hook exits silent if exceeded — your prompt
 # always goes through, even when the advisor can't answer in time.
 # Bump to ~15.0 if you enable use_judge = true.
-budget_seconds = 4.0
+budget_seconds = 8.0
 
 # Minimum cosine score to surface a pick in embedding-only mode.
 # Range 0-1; 0.35 filters out weak matches on unrelated prompts.
@@ -252,11 +301,36 @@ prompt_hash_salt = ""
 # Parallelization-check feature. When enabled, the advisor watches for multi-item
 # TodoWrite events during the planning phase and asks `claude -p` whether the
 # tasks can be executed as parallel subagents in isolated worktrees. Off by
-# default. Enabling requires matcher.budget_seconds >= 23.
+# default. Enabling requires matcher.budget_seconds >= judge_timeout_seconds + 3.
 # [parallelization]
 # enabled = false
 # min_tasks = 3
-# judge_timeout_seconds = 20.0
+# judge_timeout_seconds = 5.0
+
+[effort]
+# Master toggle. When false, nothing in this feature runs: no classification, no
+# status line registration, no nudge, no write-back. Off by default so existing
+# installs are untouched until you opt in. See "Effort signalling" below.
+enabled = false
+
+# Register a `statusLine` command in claudeskill-settings.json (needs `jq`).
+statusline = true
+
+# Emit a systemMessage when the recommendation disagrees with observed effort.
+nudge = true
+
+# Allow occasional writes of `effortLevel` into claudeskill-settings.json.
+write_back = true
+
+# Consecutive qualifying sessions of disagreement before a write happens.
+write_back_after_sessions = 5
+
+# Sessions to suppress write-back for after the user manually overrides.
+veto_cooldown_sessions = 10
+
+# Recommend `ultracode` when the parallelization detector says yes.
+# Never persisted — Claude Code treats ultracode as session-only by design.
+ultracode_nudge = true
 """
 
 
@@ -300,7 +374,11 @@ def install_alias(shell: ShellTarget) -> bool:
     original = _read_rc(shell.rc_file)
     stripped = _strip_block(original)
     block = f"\n{ALIAS_BEGIN}\n{shell.alias_line}\n{ALIAS_END}\n"
-    updated = (stripped.rstrip("\n") + "\n" + block) if stripped.strip() else block.lstrip("\n")
+    updated = (
+        (stripped.rstrip("\n") + "\n" + block)
+        if stripped.strip()
+        else block.lstrip("\n")
+    )
     if updated == original:
         return False
     shell.rc_file.write_text(updated, encoding="utf-8")

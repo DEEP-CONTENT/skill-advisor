@@ -67,6 +67,17 @@ def _enable_telemetry_in_config(isolated_paths):
     cfg.write_text("[telemetry]\nevents_enabled = true\nprompt_hash_salt = \"fixed\"\n")
 
 
+def _enable_telemetry_and_judge(isolated_paths):
+    """Telemetry on AND use_judge on — so `judge_used` echoing the config is
+    distinguishable from `judge_used` reporting what actually happened."""
+    cfg = isolated_paths["config_home"] / "config.toml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(
+        "[telemetry]\nevents_enabled = true\nprompt_hash_salt = \"fixed\"\n"
+        "\n[matcher]\nuse_judge = true\n"
+    )
+
+
 def test_hook_writes_telemetry_event_when_enabled(isolated_paths):
     _enable_telemetry_in_config(isolated_paths)
     entry = CatalogEntry(kind="skill", name="brainstorming", namespace="user", description="...")
@@ -120,6 +131,85 @@ def test_hook_records_event_even_when_no_picks(isolated_paths):
     lines = [json.loads(l) for l in events_path.read_text().splitlines() if l.strip()]
     assert len(lines) == 1
     assert lines[0]["picks"] == []
+
+
+def test_judge_used_is_false_when_the_judge_never_ran(isolated_paths):
+    """Today `judge_used` records cfg.matcher.use_judge, so 830 triage-skipped
+    events on the live log claim the judge ran. It must report what happened."""
+    _enable_telemetry_and_judge(isolated_paths)
+    with patch("skill_advisor.hook.matcher.pick", return_value=None):
+        _run_with_stdin({"prompt": "a substantive prompt that should match", "session_id": "s1"})
+
+    events_path = isolated_paths["cache_home"] / "advisor.events.jsonl"
+    lines = [json.loads(l) for l in events_path.read_text().splitlines() if l.strip()]
+    assert lines[-1]["judge_used"] is False
+
+
+def test_judge_failure_is_recorded(isolated_paths):
+    _enable_telemetry_and_judge(isolated_paths)
+
+    def _fake_pick(prompt, cfg, session_id=None, *, trace=None):
+        if trace is not None:
+            trace.ran = False
+            trace.failure = "timeout"
+        return None
+
+    with patch("skill_advisor.hook.matcher.pick", _fake_pick):
+        _run_with_stdin({"prompt": "a substantive prompt that should match", "session_id": "s1"})
+
+    events_path = isolated_paths["cache_home"] / "advisor.events.jsonl"
+    lines = [json.loads(l) for l in events_path.read_text().splitlines() if l.strip()]
+    assert lines[-1]["judge_failure"] == "timeout"
+    assert lines[-1]["judge_used"] is False
+
+
+def test_budget_exceeded_records_a_countable_telemetry_event(isolated_paths):
+    """An alarm kill must not be invisible in events.jsonl — no row at all is
+    indistinguishable from the hook never firing. It needs its own marker,
+    distinct from every judge.FAILURE_* value."""
+    _enable_telemetry_in_config(isolated_paths)
+    with patch("skill_advisor.hook.matcher.pick", side_effect=hook_mod._BudgetExceeded):
+        out = _run_with_stdin({"prompt": "a substantive prompt that should match", "session_id": "s1"})
+
+    assert out == ""
+    events_path = isolated_paths["cache_home"] / "advisor.events.jsonl"
+    assert events_path.is_file()
+    lines = [
+        json.loads(line) for line in events_path.read_text().splitlines() if line.strip()
+    ]
+    assert len(lines) == 1
+    assert lines[-1]["judge_failure"] == "budget_exceeded"
+    assert lines[-1]["judge_used"] is False
+    assert lines[-1]["picks"] == []
+
+
+def test_budget_exceeded_writes_no_event_when_telemetry_disabled(isolated_paths):
+    # No config.toml → events_enabled defaults to False.
+    with patch("skill_advisor.hook.matcher.pick", side_effect=hook_mod._BudgetExceeded):
+        out = _run_with_stdin({"prompt": "a substantive prompt that should match", "session_id": "s1"})
+
+    assert out == ""
+    events_path = isolated_paths["cache_home"] / "advisor.events.jsonl"
+    assert not events_path.exists()
+
+
+def test_judge_used_is_true_when_the_judge_actually_ran(isolated_paths):
+    _enable_telemetry_and_judge(isolated_paths)
+    entry = CatalogEntry(kind="skill", name="brainstorming", namespace="user", description="...")
+    result = PickResult(picks=[ResolvedPick(entry=entry, reason="judge said so")], state=None)
+
+    def _fake_pick(prompt, cfg, session_id=None, *, trace=None):
+        if trace is not None:
+            trace.ran = True
+        return result
+
+    with patch("skill_advisor.hook.matcher.pick", _fake_pick):
+        _run_with_stdin({"prompt": "a substantive prompt that should match", "session_id": "s1"})
+
+    events_path = isolated_paths["cache_home"] / "advisor.events.jsonl"
+    lines = [json.loads(l) for l in events_path.read_text().splitlines() if l.strip()]
+    assert lines[-1]["judge_used"] is True
+    assert lines[-1]["judge_failure"] is None
 
 
 def test_posttooluse_records_todowrite_when_enabled(monkeypatch, tmp_path):
@@ -294,3 +384,297 @@ def test_posttooluse_taskcreate_missing_subject_is_silent(monkeypatch):
     turn = lifecycle.load_turn("sess-tc3")
     assert turn is not None
     assert turn.todo_write is None
+
+
+# ---------------------------------------------------------------------------
+# Effort: nudge builder + rate-limited state
+# ---------------------------------------------------------------------------
+
+import json
+
+from skill_advisor import effort, hook, paths
+
+
+def _emit_capture(capsys):
+    out = capsys.readouterr().out.strip()
+    return json.loads(out) if out else {}
+
+
+def test_emit_includes_system_message(capsys):
+    hook._emit("ctx", system_message="hello")
+    payload = _emit_capture(capsys)
+    assert payload["hookSpecificOutput"]["additionalContext"] == "ctx"
+    assert payload["systemMessage"] == "hello"
+
+
+def test_emit_omits_system_message_when_none(capsys):
+    hook._emit("ctx")
+    payload = _emit_capture(capsys)
+    assert "systemMessage" not in payload
+
+
+def test_nudge_suppressed_without_observation():
+    """First prompt of a session — the sensor has not run yet."""
+    msg = hook._nudge_message(observed=None, rec=effort.EffortRecommendation("xhigh", "r", "judge"))
+    assert msg is None
+
+
+def test_nudge_message_names_both_levels():
+    msg = hook._nudge_message(
+        observed="medium", rec=effort.EffortRecommendation("xhigh", "5 tasks", "judge")
+    )
+    assert "xhigh" in msg and "medium" in msg
+    assert "/effort xhigh" in msg
+
+
+def test_ultracode_nudge_suggests_the_keyword_not_a_slash_command():
+    msg = hook._nudge_message(
+        observed="medium",
+        rec=effort.EffortRecommendation("ultracode", "parallel tasks", "parallelization"),
+    )
+    assert "ultracode" in msg
+    assert "/effort" not in msg
+
+
+def test_nudge_suppressed_at_max():
+    msg = hook._nudge_message(
+        observed="max", rec=effort.EffortRecommendation("low", "r", "heuristic")
+    )
+    assert msg is None
+
+
+def test_nudge_rate_limited_per_level_pair():
+    """A long session must not nag on every prompt for the same disagreement."""
+    from skill_advisor import baseline
+
+    assert baseline.mark_nudged("s1", "medium", "xhigh") is True
+    assert baseline.mark_nudged("s1", "medium", "xhigh") is False
+    # a different pair is a genuinely new piece of information
+    assert baseline.mark_nudged("s1", "medium", "low") is True
+
+
+# ---------------------------------------------------------------------------
+# Session finalisation (Stop) and the baseline-move announcement (first
+# prompt after a write)
+# ---------------------------------------------------------------------------
+
+
+def test_stop_finalises_session_and_may_write(monkeypatch, isolated_paths):
+    from skill_advisor import baseline
+
+    _enable_effort_in_config(isolated_paths)
+
+    calls = []
+    monkeypatch.setattr(baseline, "finalise_session", lambda s: calls.append(("final", s)))
+    monkeypatch.setattr(baseline, "decrement_cooldown", lambda s: calls.append(("dec", s)))
+    monkeypatch.setattr(baseline, "maybe_write", lambda cfg, launch_level: calls.append(("write",)))
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"session_id":"s1"}'))
+    hook.run_stop()
+    assert ("final", "s1") in calls
+    assert ("dec", "s1") in calls
+    assert ("write",) in calls
+
+
+def test_stop_finalisation_skipped_when_effort_disabled(monkeypatch):
+    """No config.toml → effort.enabled defaults False. Finalisation must not run."""
+    from skill_advisor import baseline
+
+    calls = []
+    monkeypatch.setattr(baseline, "finalise_session", lambda s: calls.append(("final", s)))
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"session_id":"s1"}'))
+    rc = hook.run_stop()
+    assert rc == 0
+    assert calls == []
+
+
+def test_stop_finalisation_swallows_exceptions(isolated_paths):
+    """run_stop must always return 0, even if baseline bookkeeping blows up."""
+    _enable_effort_in_config(isolated_paths)
+    with patch("skill_advisor.hook.baseline.finalise_session", side_effect=RuntimeError("boom")), \
+         patch("sys.stdin", io.StringIO(json.dumps({"session_id": "s1"}))):
+        rc = hook.run_stop()
+    assert rc == 0
+
+
+def test_run_no_picks_emits_pending_announcement(isolated_paths):
+    """The no-picks branch is a second emission site: an announcement pending
+    from a previous session's Stop must reach the user even when this turn
+    matched no skills.
+    """
+    from skill_advisor import baseline
+
+    _enable_effort_in_config(isolated_paths)
+    baseline._save({"announce": {"from": "xhigh", "to": "low", "sessions": 3}})
+
+    with patch("skill_advisor.hook.matcher.pick", return_value=None):
+        out = _run_with_stdin({"prompt": "anything", "session_id": "s1"})
+    envelope = json.loads(out)
+    assert envelope["hookSpecificOutput"]["additionalContext"] == ""
+    assert "xhigh" in envelope["systemMessage"]
+    assert "low" in envelope["systemMessage"]
+
+    # Consumed once: a second no-picks prompt in the same session is fully silent.
+    with patch("skill_advisor.hook.matcher.pick", return_value=None):
+        out2 = _run_with_stdin({"prompt": "anything else", "session_id": "s1"})
+    assert out2 == ""
+
+
+def test_run_no_picks_announcement_merges_with_pending_nudge_via_emit_nudged(isolated_paths):
+    """When both an ordinary effort nudge and an announcement are pending on
+    a no-picks turn, the announcement must route through `_emit_nudged` (not
+    a raw `_emit`) — proven here by checking that the nudge's rate-limit slot
+    is actually consumed, which only `_emit_nudged` does.
+    """
+    from skill_advisor import baseline
+
+    _enable_effort_in_config(isolated_paths)
+    _write_observed("s1", "medium")
+    baseline._save({"announce": {"from": "xhigh", "to": "low", "sessions": 3}})
+
+    empty_result = PickResult(
+        picks=[], state=None, effort=effort.EffortRecommendation("xhigh", "5 tasks", "judge")
+    )
+    with patch("skill_advisor.hook.matcher.pick", return_value=empty_result):
+        out = _run_with_stdin({"prompt": "anything", "session_id": "s1"})
+    envelope = json.loads(out)
+    # Both messages landed in the single systemMessage, announcement first.
+    assert "low" in envelope["systemMessage"]
+    assert "you're at medium" in envelope["systemMessage"]
+    assert envelope["systemMessage"].index("skill-advisor moved") < envelope["systemMessage"].index(
+        "this looks like"
+    )
+    # The ordinary nudge rode along and was actually shown, so its rate-limit
+    # slot must now be consumed — proof this went through `_emit_nudged`.
+    assert baseline.was_nudged("s1", "medium", "xhigh") is True
+
+
+def test_run_no_picks_without_announcement_stays_silent(isolated_paths):
+    """No baseline write happened — no picks and no announcement must produce
+    no output at all, matching the pre-existing no-picks-stays-silent contract.
+    """
+    with patch("skill_advisor.hook.matcher.pick", return_value=None):
+        out = _run_with_stdin({"prompt": "anything", "session_id": "s1"})
+    assert out == ""
+
+
+def test_take_announcement_not_called_when_effort_disabled(isolated_paths):
+    """With cfg.effort.enabled False, take_announcement must never even be
+    consulted — a stray announce payload must survive untouched for whenever
+    the feature is turned on.
+    """
+    from skill_advisor import baseline, paths as paths_mod
+
+    paths_mod.ensure_dirs()
+    baseline._save({"announce": {"from": "xhigh", "to": "low", "sessions": 3}})
+
+    with patch("skill_advisor.hook.matcher.pick", return_value=None):
+        out = _run_with_stdin({"prompt": "anything", "session_id": "s1"})
+    assert out == ""
+    data = json.loads(paths_mod.baseline_file().read_text(encoding="utf-8"))
+    assert data.get("announce") == {"from": "xhigh", "to": "low", "sessions": 3}
+
+
+def test_nudge_bookkeeping_does_not_touch_lifecycle_state():
+    """Regression guard: writing nudge state must not refresh `updated_at`.
+
+    `hook.run_stop()` skips auto-advance when the lifecycle state was updated
+    less than a second ago. If nudge bookkeeping went through `lifecycle.save()`
+    it would bump that timestamp on every prompt and silently disable
+    auto-advance.
+    """
+    from skill_advisor import baseline, lifecycle
+
+    state = lifecycle.start("s1", "build a thing")
+    before = lifecycle.load("s1").updated_at
+    baseline.mark_nudged("s1", "medium", "xhigh")
+    assert lifecycle.load("s1").updated_at == before
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1: the nudge rate-limit slot must be consumed only when the
+# nudge was actually shown to the user — not merely computed.
+# ---------------------------------------------------------------------------
+
+
+def _enable_effort_in_config(isolated_paths):
+    cfg = isolated_paths["config_home"] / "config.toml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text("[effort]\nenabled = true\nnudge = true\n")
+
+
+def _write_observed(session_id: str, level: str) -> None:
+    paths.ensure_dirs()
+    paths.observed_effort_file().write_text(
+        json.dumps({"session_id": session_id, "level": level}), encoding="utf-8"
+    )
+
+
+def test_hook_no_picks_does_not_consume_nudge_slot(isolated_paths):
+    """A PickResult with empty picks never reaches _emit — the slot must survive."""
+    from skill_advisor import baseline
+
+    _enable_effort_in_config(isolated_paths)
+    _write_observed("s1", "medium")
+
+    empty_result = PickResult(
+        picks=[], state=None, effort=effort.EffortRecommendation("xhigh", "5 tasks", "judge")
+    )
+    with patch("skill_advisor.hook.matcher.pick", return_value=empty_result):
+        out = _run_with_stdin({"prompt": "anything", "session_id": "s1"})
+    assert out == ""
+    # Nothing was shown, so the pair must still be un-nudged.
+    assert baseline.was_nudged("s1", "medium", "xhigh") is False
+
+    # A later prompt that DOES have picks must still get the nudge — proving
+    # the earlier no-picks turn never burned the slot.
+    entry = CatalogEntry(kind="skill", name="brainstorming", namespace="user", description="...")
+    result_with_picks = PickResult(
+        picks=[ResolvedPick(entry=entry, reason="embedding match (0.80)")],
+        state=None,
+        effort=effort.EffortRecommendation("xhigh", "5 tasks", "judge"),
+    )
+    with patch("skill_advisor.hook.matcher.pick", return_value=result_with_picks):
+        out2 = _run_with_stdin({"prompt": "anything else", "session_id": "s1"})
+    envelope = json.loads(out2)
+    assert envelope.get("systemMessage")
+    assert "xhigh" in envelope["systemMessage"]
+
+
+def test_hook_emit_failure_does_not_consume_nudge_slot(isolated_paths):
+    """If _emit raises, the message never reached the user — slot must survive."""
+    from skill_advisor import baseline
+
+    _enable_effort_in_config(isolated_paths)
+    _write_observed("s1", "medium")
+
+    entry = CatalogEntry(kind="skill", name="brainstorming", namespace="user", description="...")
+    result = PickResult(
+        picks=[ResolvedPick(entry=entry, reason="embedding match (0.80)")],
+        state=None,
+        effort=effort.EffortRecommendation("xhigh", "5 tasks", "judge"),
+    )
+    with patch("skill_advisor.hook.matcher.pick", return_value=result), \
+         patch("skill_advisor.hook._emit", side_effect=RuntimeError("boom")):
+        out = _run_with_stdin({"prompt": "anything", "session_id": "s1"})
+    assert out == ""
+    assert baseline.was_nudged("s1", "medium", "xhigh") is False
+
+
+def test_hook_nudge_shown_once_across_two_successful_emits(isolated_paths):
+    """Existing behaviour preserved: a genuinely shown nudge is not repeated."""
+    _enable_effort_in_config(isolated_paths)
+    _write_observed("s1", "medium")
+
+    entry = CatalogEntry(kind="skill", name="brainstorming", namespace="user", description="...")
+    result = PickResult(
+        picks=[ResolvedPick(entry=entry, reason="embedding match (0.80)")],
+        state=None,
+        effort=effort.EffortRecommendation("xhigh", "5 tasks", "judge"),
+    )
+    with patch("skill_advisor.hook.matcher.pick", return_value=result):
+        out1 = _run_with_stdin({"prompt": "first", "session_id": "s1"})
+        out2 = _run_with_stdin({"prompt": "second", "session_id": "s1"})
+    env1 = json.loads(out1)
+    env2 = json.loads(out2)
+    assert env1.get("systemMessage")
+    assert "systemMessage" not in env2

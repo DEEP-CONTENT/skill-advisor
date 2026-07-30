@@ -88,3 +88,46 @@ def test_ensure_dirs_creates_both(isolated_paths):
     paths.ensure_dirs()
     assert isolated_paths["config_home"].is_dir()
     assert isolated_paths["cache_home"].is_dir()
+
+
+def test_effort_paths_live_in_cache_dir():
+    assert paths.effort_file().parent == paths.cache_dir()
+    assert paths.observed_effort_file().parent == paths.cache_dir()
+    assert paths.baseline_file().parent == paths.cache_dir()
+
+
+def test_statusline_script_lives_in_config_dir():
+    assert paths.statusline_script().parent == paths.config_dir()
+    assert paths.statusline_script().name == "statusline.sh"
+
+
+def test_settings_file_default_is_claudeskill_settings_json(isolated_paths):
+    assert paths.settings_file() == isolated_paths["config_home"] / "claudeskill-settings.json"
+
+
+def test_settings_file_honors_full_path_override(monkeypatch, tmp_path):
+    override = tmp_path / "elsewhere" / "claudew-settings.json"
+    monkeypatch.setenv("SKILL_ADVISOR_SETTINGS_FILE", str(override))
+    assert paths.settings_file() == override
+
+
+def test_settings_file_override_can_point_outside_config_dir(monkeypatch, tmp_path, isolated_paths):
+    """The override is a FULL PATH — it need not live under config_dir() at all."""
+    override = tmp_path / "totally-unrelated-dir" / "settings.json"
+    monkeypatch.setenv("SKILL_ADVISOR_SETTINGS_FILE", str(override))
+    resolved = paths.settings_file()
+    assert resolved == override
+    assert resolved.parent != isolated_paths["config_home"]
+
+
+def test_settings_file_empty_override_treated_as_unset(monkeypatch, isolated_paths):
+    monkeypatch.setenv("SKILL_ADVISOR_SETTINGS_FILE", "")
+    assert paths.settings_file() == isolated_paths["config_home"] / "claudeskill-settings.json"
+
+
+def test_ensure_dirs_creates_override_settings_parent(monkeypatch, tmp_path):
+    override = tmp_path / "deep" / "nested" / "dir" / "claudew-settings.json"
+    monkeypatch.setenv("SKILL_ADVISOR_SETTINGS_FILE", str(override))
+    assert not override.parent.exists()
+    paths.ensure_dirs()
+    assert override.parent.is_dir()

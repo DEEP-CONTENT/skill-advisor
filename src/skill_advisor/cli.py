@@ -28,7 +28,11 @@ def _cmd_install(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    settings_path = install_mod.render_settings()
+    try:
+        settings_path = install_mod.render_settings()
+    except install_mod.RenderSettingsError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     config_path = install_mod.write_default_config(force=False)
 
     print(f"settings: {settings_path}")
@@ -75,6 +79,10 @@ def _cmd_uninstall(args: argparse.Namespace) -> int:
         paths.log_file(),
         paths.events_file(),
         paths.telemetry_salt_file(),
+        paths.effort_file(),
+        paths.observed_effort_file(),
+        paths.baseline_file(),
+        paths.statusline_script(),
     ):
         if path.is_file():
             path.unlink()
@@ -194,6 +202,16 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
     # Parallelization-specific: judge needs budget headroom.
     cfg = load_config()
+
+    cfg_effort = cfg.effort
+    if cfg_effort.enabled:
+        jq = shutil.which("jq")
+        print(f"jq             : {jq or 'MISSING (status line will render nothing)'}")
+        script = paths.statusline_script()
+        print(f"statusline     : {script if script.is_file() else 'not written (run install)'}")
+        rec = paths.effort_file()
+        print(f"effort state   : {'present' if rec.is_file() else 'none yet'}")
+
     if cfg.parallelization.enabled:
         min_budget = cfg.parallelization.judge_timeout_seconds + 3.0
         if cfg.matcher.budget_seconds < min_budget:
@@ -557,7 +575,7 @@ def _cmd_match(args: argparse.Namespace) -> int:
             top_k=args.top_k,
             candidates=args.candidates,
             index=idx,
-        )
+        ).picks
 
     triage_skip = triage.should_skip(prompt, cfg) if args.show_triage else None
 

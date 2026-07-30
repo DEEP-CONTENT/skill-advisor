@@ -1,4 +1,5 @@
 """User-facing config (`~/.config/skill-advisor/config.toml`) with defaults."""
+
 from __future__ import annotations
 
 import tomllib
@@ -13,7 +14,13 @@ class MatcherConfig:
     model: str = "claude-haiku-4-5-20251001"
     max_candidates: int = 15
     max_picks: int = 3
-    budget_seconds: float = 4.0
+    # Whole-hook budget. hook.py arms SIGALRM at int(budget_seconds + 0.5) around
+    # the entire matcher; judge.py gives its subprocess budget_seconds - 0.5, so
+    # the judge always loses the race and matcher.py's embedding fallback is
+    # reachable. Measured 2026-07-29: the judge answers usefully under 15 s or
+    # not at all (the >=24 s band produced 14 picks against 432 nothings), so a
+    # tight budget forfeits almost nothing.
+    budget_seconds: float = 8.0
     # When False (default) the embedding top-K is used directly as picks —
     # ~50-200 ms per prompt. When True, `claude -p` re-ranks the shortlist
     # for higher precision at the cost of 5-15 s of session-startup overhead.
@@ -56,9 +63,13 @@ class LifecycleConfig:
     extra_disable_patterns: tuple[str, ...] = ()
     # REPLACE the built-in preference list for a phase. Entries are ("kind", "name") tuples.
     # Empty dict keeps built-in defaults for every phase.
-    phase_candidates: dict[str, tuple[tuple[str, str], ...]] = field(default_factory=dict)
+    phase_candidates: dict[str, tuple[tuple[str, str], ...]] = field(
+        default_factory=dict
+    )
     # PREPEND to the built-in list for a phase (team-specific picks bubble to the top).
-    phase_additions: dict[str, tuple[tuple[str, str], ...]] = field(default_factory=dict)
+    phase_additions: dict[str, tuple[tuple[str, str], ...]] = field(
+        default_factory=dict
+    )
     # Auto-advance driven by Stop/PostToolUse hooks. Off by default.
     auto_advance: AutoAdvanceConfig = field(default_factory=AutoAdvanceConfig)
 
@@ -78,14 +89,40 @@ class TelemetryConfig:
 class ParallelizationConfig:
     # Master toggle. When false, PostToolUse never records TodoWrite payloads
     # for parallelization purposes and the Stop hook never transitions into
-    # parallelization_check. Off by default — enabling it requires bumping
-    # matcher.budget_seconds to >= 23 (judge_timeout_seconds + ~3 s margin).
+    # parallelization_check. Off by default. Enabling requires matcher.budget_seconds >=
+    # judge_timeout_seconds + 3.
     enabled: bool = False
     # Minimum TodoWrite task count to consider the check worthwhile.
     min_tasks: int = 3
-    # Hard cap on how long `parallelization.detect()` may spend in `claude -p`.
-    # Must be <= matcher.budget_seconds minus a small margin.
-    judge_timeout_seconds: float = 20.0
+    # Must stay <= matcher.budget_seconds - 3. The detector makes its own
+    # `claude -p` call from inside the hook's SIGALRM window, so a timeout
+    # longer than the budget means the alarm kills the whole hook — silent, no
+    # picks at all — instead of the detector merely giving up. At 5.0 under an
+    # 8 s budget the detector will often time out and return None; that
+    # degrades gracefully (no parallel picks, lifecycle still advances) and is
+    # the accepted trade for the budget cut.
+    judge_timeout_seconds: float = 5.0
+
+
+@dataclass(frozen=True)
+class EffortConfig:
+    # Master toggle. When false, nothing in this feature runs: no classification,
+    # no status line registration, no nudge, no write-back. Off by default so
+    # existing installs are untouched until the user opts in.
+    enabled: bool = False
+    # Register a `statusLine` command in claudeskill-settings.json.
+    statusline: bool = True
+    # Emit a systemMessage when the recommendation disagrees with observed effort.
+    nudge: bool = True
+    # Allow occasional writes of `effortLevel` into claudeskill-settings.json.
+    write_back: bool = True
+    # Consecutive qualifying sessions of disagreement before a write happens.
+    write_back_after_sessions: int = 5
+    # Sessions to suppress write-back for after the user manually overrides.
+    veto_cooldown_sessions: int = 10
+    # Recommend `ultracode` when the parallelization detector says yes.
+    # Never persisted — Claude Code treats ultracode as session-only by design.
+    ultracode_nudge: bool = True
 
 
 @dataclass(frozen=True)
@@ -95,7 +132,10 @@ class Config:
     triage: TriageConfig = field(default_factory=TriageConfig)
     lifecycle: LifecycleConfig = field(default_factory=LifecycleConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
-    parallelization: ParallelizationConfig = field(default_factory=ParallelizationConfig)
+    parallelization: ParallelizationConfig = field(
+        default_factory=ParallelizationConfig
+    )
+    effort: EffortConfig = field(default_factory=EffortConfig)
 
 
 def _as_tuple(value) -> tuple[str, ...]:
@@ -163,28 +203,39 @@ def load(path: Path | None = None) -> Config:
     lifecycle = raw.get("lifecycle", {}) or {}
     telemetry = raw.get("telemetry", {}) or {}
     parallelization = raw.get("parallelization", {}) or {}
+    effort = raw.get("effort", {}) or {}
 
     return Config(
         matcher=MatcherConfig(
             model=str(matcher.get("model", MatcherConfig.model)),
-            max_candidates=int(matcher.get("max_candidates", MatcherConfig.max_candidates)),
+            max_candidates=int(
+                matcher.get("max_candidates", MatcherConfig.max_candidates)
+            ),
             max_picks=int(matcher.get("max_picks", MatcherConfig.max_picks)),
-            budget_seconds=float(matcher.get("budget_seconds", MatcherConfig.budget_seconds)),
+            budget_seconds=float(
+                matcher.get("budget_seconds", MatcherConfig.budget_seconds)
+            ),
             use_judge=bool(matcher.get("use_judge", MatcherConfig.use_judge)),
-            min_embedding_score=float(matcher.get("min_embedding_score", MatcherConfig.min_embedding_score)),
+            min_embedding_score=float(
+                matcher.get("min_embedding_score", MatcherConfig.min_embedding_score)
+            ),
         ),
         catalog=CatalogConfig(
             extra_roots=_as_tuple(catalog.get("extra_roots")),
             exclude_names=_as_tuple(catalog.get("exclude_names")),
         ),
         triage=TriageConfig(
-            skip_if_shorter_than=int(triage.get("skip_if_shorter_than", TriageConfig.skip_if_shorter_than)),
+            skip_if_shorter_than=int(
+                triage.get("skip_if_shorter_than", TriageConfig.skip_if_shorter_than)
+            ),
             extra_skip_patterns=_as_tuple(triage.get("extra_skip_patterns")),
         ),
         lifecycle=LifecycleConfig(
             enabled=bool(lifecycle.get("enabled", LifecycleConfig.enabled)),
             max_correction_cycles=int(
-                lifecycle.get("max_correction_cycles", LifecycleConfig.max_correction_cycles)
+                lifecycle.get(
+                    "max_correction_cycles", LifecycleConfig.max_correction_cycles
+                )
             ),
             extra_trigger_patterns=_as_tuple(lifecycle.get("extra_trigger_patterns")),
             extra_disable_patterns=_as_tuple(lifecycle.get("extra_disable_patterns")),
@@ -193,18 +244,43 @@ def load(path: Path | None = None) -> Config:
             auto_advance=_parse_auto_advance(lifecycle.get("auto_advance")),
         ),
         telemetry=TelemetryConfig(
-            events_enabled=bool(telemetry.get("events_enabled", TelemetryConfig.events_enabled)),
+            events_enabled=bool(
+                telemetry.get("events_enabled", TelemetryConfig.events_enabled)
+            ),
             retain_days=int(telemetry.get("retain_days", TelemetryConfig.retain_days)),
-            prompt_hash_salt=str(telemetry.get("prompt_hash_salt", TelemetryConfig.prompt_hash_salt)),
+            prompt_hash_salt=str(
+                telemetry.get("prompt_hash_salt", TelemetryConfig.prompt_hash_salt)
+            ),
         ),
         parallelization=ParallelizationConfig(
             enabled=bool(parallelization.get("enabled", ParallelizationConfig.enabled)),
-            min_tasks=int(parallelization.get("min_tasks", ParallelizationConfig.min_tasks)),
+            min_tasks=int(
+                parallelization.get("min_tasks", ParallelizationConfig.min_tasks)
+            ),
             judge_timeout_seconds=float(
                 parallelization.get(
                     "judge_timeout_seconds",
                     ParallelizationConfig.judge_timeout_seconds,
                 )
+            ),
+        ),
+        effort=EffortConfig(
+            enabled=bool(effort.get("enabled", EffortConfig.enabled)),
+            statusline=bool(effort.get("statusline", EffortConfig.statusline)),
+            nudge=bool(effort.get("nudge", EffortConfig.nudge)),
+            write_back=bool(effort.get("write_back", EffortConfig.write_back)),
+            write_back_after_sessions=int(
+                effort.get(
+                    "write_back_after_sessions", EffortConfig.write_back_after_sessions
+                )
+            ),
+            veto_cooldown_sessions=int(
+                effort.get(
+                    "veto_cooldown_sessions", EffortConfig.veto_cooldown_sessions
+                )
+            ),
+            ultracode_nudge=bool(
+                effort.get("ultracode_nudge", EffortConfig.ultracode_nudge)
             ),
         ),
     )
