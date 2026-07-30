@@ -146,3 +146,39 @@ def test_ensure_dirs_creates_override_settings_parent(monkeypatch, tmp_path):
     assert not override.parent.exists()
     paths.ensure_dirs()
     assert override.parent.is_dir()
+
+
+def test_skill_roots_dedupes_symlinked_subdirectories(monkeypatch, tmp_path):
+    """When primary home's subdirs are symlinks to default home's subdirs,
+    skill_roots() should return resolved paths only once."""
+    home = tmp_path / "symlink-test-home"
+    home.mkdir(parents=True, exist_ok=True)
+    default_claude = home / ".claude"
+    default_claude.mkdir()
+    (default_claude / "skills").mkdir()
+    (default_claude / "plugins").mkdir()
+    (default_claude / "plugins" / "marketplaces").mkdir()
+    (default_claude / "plugins" / "cache").mkdir()
+
+    work_claude = home / ".claude-work"
+    work_claude.mkdir()
+    (work_claude / "skills").symlink_to(default_claude / "skills")
+    (work_claude / "plugins").symlink_to(default_claude / "plugins")
+
+    monkeypatch.delenv("CLAUDE_HOME", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(work_claude))
+    monkeypatch.setenv("HOME", str(home))
+
+    roots = paths.skill_roots()
+    resolved_roots = [r.resolve() for r in roots]
+
+    # Should have 3 entries (primary only), not 6 (primary + duplicate default).
+    assert len(roots) == 3
+    # All resolved paths should be unique.
+    assert len(set(resolved_roots)) == 3
+    # All should resolve to default_claude subdirs.
+    assert resolved_roots[0] == (default_claude / "skills").resolve()
+    assert resolved_roots[1] == (
+        default_claude / "plugins" / "marketplaces"
+    ).resolve()
+    assert resolved_roots[2] == (default_claude / "plugins" / "cache").resolve()

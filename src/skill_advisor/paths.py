@@ -42,10 +42,13 @@ def skill_roots() -> list[Path]:
     `skills/` is empty — the default `~/.claude` skills are also included so the
     catalog isn't empty. Catalog dedupes by (kind, name); the primary root wins on
     collision.
+
+    Dedupes by resolved path to handle cases where primary subdirectories are
+    symlinks to the default home's subdirectories.
     """
     primary = claude_home()
     default = _home() / ".claude"
-    roots = [
+    candidates = [
         primary / "skills",
         primary / "plugins" / "marketplaces",
         primary / "plugins" / "cache",
@@ -56,8 +59,16 @@ def skill_roots() -> list[Path]:
             default / "plugins" / "marketplaces",
             default / "plugins" / "cache",
         ):
-            if extra not in roots:
-                roots.append(extra)
+            candidates.append(extra)
+
+    # Dedupe by resolved path, keeping first occurrence of each unique target.
+    seen: set[Path] = set()
+    roots: list[Path] = []
+    for root in candidates:
+        resolved = root.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            roots.append(root)
     return roots
 
 
