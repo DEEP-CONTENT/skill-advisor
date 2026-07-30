@@ -293,12 +293,17 @@ def _render_match_text(
     if not picks:
         print("  (no picks)")
     else:
+        # invoke_name (falling back to name) — the string the Skill tool
+        # actually accepts, not the frontmatter `name:`. This is the command
+        # a user runs to check what will be recommended; printing the wrong
+        # name here would mask exactly the bug this renders to catch.
+        names = [p.entry.invoke_name or p.entry.name for p in picks]
         width_kind = max(len(p.entry.kind) for p in picks)
-        width_name = max(len(p.entry.name) for p in picks)
-        for rank, pick in enumerate(picks, start=1):
+        width_name = max(len(n) for n in names)
+        for rank, (pick, name) in enumerate(zip(picks, names), start=1):
             line = (
                 f"  {rank}. {pick.entry.kind:<{width_kind}}  "
-                f"{pick.entry.name:<{width_name}}  {pick.reason}"
+                f"{name:<{width_name}}  {pick.reason}"
             )
             print(line)
             if verbose:
@@ -325,7 +330,9 @@ def _render_match_json(
             {
                 "rank": rank,
                 "kind": p.entry.kind,
-                "name": p.entry.name,
+                # invoke_name (falling back to name) — the string the Skill
+                # tool actually accepts. Same fix as the text renderer above.
+                "name": p.entry.invoke_name or p.entry.name,
                 "namespace": p.entry.namespace,
                 "reason": p.reason,
                 "description": p.entry.description,

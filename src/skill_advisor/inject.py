@@ -18,7 +18,16 @@ def _format_picks(picks: list[ResolvedPick]) -> list[str]:
     lines = []
     for idx, p in enumerate(picks, start=1):
         reason = p.reason or "matches the prompt"
-        lines.append(f"  {idx}. {p.entry.name} ({p.entry.kind}) — {reason}")
+        # Must be the string the Skill tool actually accepts (the directory
+        # name, namespaced `<plugin>:<dir>` for plugin skills) — NOT
+        # `entry.name` (the frontmatter `name:`), which can differ for both
+        # plugin skills (always) and any skill whose frontmatter `name:`
+        # diverges from its directory (7 on the author's machine, e.g.
+        # `xlsx` declaring `name: xlsx-official`). Emitting `entry.name` here
+        # recommends a string the model cannot invoke. See
+        # `cli._print_proposal_lines`, which already uses this idiom.
+        invoke_name = p.entry.invoke_name or p.entry.name
+        lines.append(f"  {idx}. {invoke_name} ({p.entry.kind}) — {reason}")
     return lines
 
 
