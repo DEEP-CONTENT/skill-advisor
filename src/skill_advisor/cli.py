@@ -203,6 +203,30 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     # Parallelization-specific: judge needs budget headroom.
     cfg = load_config()
 
+    # Pool health: how much of the disk the scanner can see.
+    health = catalog_mod.pool_health(cfg)
+    print(
+        f"skill files    : {health['skill_md_files']} on disk, "
+        f"{health['parseable']} parseable"
+    )
+    print(
+        f"catalog        : {health['pool']} in pool, {health['pickable']} pickable"
+    )
+    if health["unparseable"]:
+        shown = ", ".join(health["unparseable"][:5])
+        more = len(health["unparseable"]) - 5
+        suffix = f", +{more} more" if more > 0 else ""
+        print(
+            f"WARN: {len(health['unparseable'])} SKILL.md files are unparseable "
+            f"(no YAML frontmatter) and invisible to the advisor: {shown}{suffix}"
+        )
+    if health["excluded_but_enabled"]:
+        print(
+            f"NOTE: {len(health['excluded_but_enabled'])} names in "
+            f"catalog.exclude_names are enabled in Claude Code — muted in the "
+            f"advisor but invocable. `skill-advisor migrate-excludes` reconciles this."
+        )
+
     cfg_effort = cfg.effort
     if cfg_effort.enabled:
         jq = shutil.which("jq")

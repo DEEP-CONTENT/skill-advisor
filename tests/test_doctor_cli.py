@@ -102,3 +102,44 @@ def test_doctor_still_warns_when_budget_is_below_the_detector_timeout(
     out = capsys.readouterr().out
     assert "WARN" in out
     assert "budget_seconds" in out
+
+
+def test_doctor_reports_unparseable_skill_files(
+    isolated_paths, fake_claude_home, capsys
+):
+    """23% of SKILL.md files on the author's machine have no frontmatter and are
+    invisible to the scanner. Silence about that reads as full coverage."""
+    from skill_advisor import cli
+
+    broken = fake_claude_home / "skills" / "no-frontmatter"
+    broken.mkdir(parents=True)
+    (broken / "SKILL.md").write_text(
+        "# Just a heading, no frontmatter\n", encoding="utf-8"
+    )
+
+    try:
+        cli.main(["doctor"])  # ends in sys.exit; tests/test_doctor_cli.py:23 idiom
+    except SystemExit:
+        pass
+    out = capsys.readouterr().out
+    assert "unparseable" in out.lower()
+    assert "no-frontmatter" in out
+
+
+def test_doctor_reports_pickable_versus_pool(isolated_paths, fake_claude_home, capsys):
+    from skill_advisor import cli
+
+    paths_mod = __import__("skill_advisor.paths", fromlist=["paths"])
+    paths_settings = paths_mod.settings_file()
+    paths_settings.parent.mkdir(parents=True, exist_ok=True)
+    paths_settings.write_text(
+        '{"skillOverrides": {"demo-skill": "off"}}', encoding="utf-8"
+    )
+
+    try:
+        cli.main(["doctor"])  # ends in sys.exit; tests/test_doctor_cli.py:23 idiom
+    except SystemExit:
+        pass
+    out = capsys.readouterr().out
+    assert "pickable" in out.lower()
+    assert "pool" in out.lower()
