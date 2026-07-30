@@ -222,6 +222,51 @@ def test_phase_candidates_return_empty_when_all_are_disabled():
     )
 
 
+def test_pick_candidates_for_phase_resolves_bare_and_namespaced_separately():
+    """F2: a bare directory name can exist in BOTH the user skills and the
+    plugin cache — e.g. a user skill `brainstorming` AND a plugin skill
+    whose frontmatter `name:` is ALSO "brainstorming" but whose invocable
+    identity is "superpowers:brainstorming". Keying the phase-preference
+    lookup on `entry.name` (the frontmatter name) collides the two: since
+    plugins/cache is scanned after skills/, last-wins in the dict
+    comprehension silently resolves the BARE "brainstorming" preference to
+    the PLUGIN entry, not the user's.
+
+    Here the plugin entry is disabled and the user's is enabled, so the old
+    bug loses the pick entirely: the bare preference mis-resolves to the
+    disabled plugin entry and is filtered out by `pickable_only`, and the
+    namespaced preference ("superpowers:brainstorming") never matches
+    anything at all under the old code, because no catalog entry's
+    frontmatter `name:` is ever namespaced. The user's perfectly enabled
+    skill is unreachable either way."""
+
+    def _entry(name, namespace, invoke_name, enabled):
+        return CatalogEntry(
+            kind="skill",
+            name=name,
+            namespace=namespace,
+            description="d",
+            path=f"/s/{name}/SKILL.md",
+            enabled=enabled,
+            invoke_name=invoke_name,
+        )
+
+    # Scan order matters: skills/ is scanned before plugins/cache, so the
+    # plugin entry appears LATER in the catalog list — reproducing the exact
+    # last-wins collision `catalog.scan()` produces in practice.
+    catalog = [
+        _entry("brainstorming", "user", "brainstorming", enabled=True),
+        _entry(
+            "brainstorming",
+            "plugin:superpowers",
+            "superpowers:brainstorming",
+            enabled=False,
+        ),
+    ]
+    picks = lifecycle.pick_candidates_for_phase(lifecycle.PLANNING, catalog, limit=3)
+    assert [p.invoke_name for p in picks] == ["brainstorming"]
+
+
 def test_phase_candidates_can_opt_out_of_filtering():
     """The rotation needs to see what a phase WOULD pick from the whole pool."""
     catalog = [

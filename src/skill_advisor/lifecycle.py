@@ -408,19 +408,48 @@ def pick_candidates_for_phase(
     what the list was always for. Measured 2026-07-29: without this filter the
     PLANNING list stopped at `plan-writing` (disabled) and never reached
     `brainstorming`, producing 490 un-invocable recommendations.
+
+    Looked up by invocable identity (`invoke_name or name`), matching how
+    `PHASE_CANDIDATES` itself spells plugin entries (namespaced,
+    `<plugin>:<dir>`, e.g. "superpowers:brainstorming") and matching
+    `catalog._accept()`'s own dedup key. Keying on `entry.name` — the
+    frontmatter `name:` — instead broke both directions: a namespaced
+    preference could never match, because no catalog entry's frontmatter
+    `name:` is ever namespaced; and a *bare* preference (e.g.
+    "brainstorming") collided across namespaces whenever a user skill and a
+    plugin skill share a frontmatter name, since plugin-cache roots are
+    scanned after skills/ — the dict comprehension's last-wins semantics
+    silently resolved the bare preference to the plugin entry, whose
+    `enabled` is always True regardless of what the user actually muted.
+    `seen` is tracked by the same invocable identity, not `entry.name`, for
+    the same reason: two DIFFERENT entries (a user skill and a plugin skill)
+    can share a frontmatter name while being distinct, independently
+    pickable catalog entries.
+
+    Deliberately NOT cross-matching a bare preference to a namespaced entry
+    or vice versa — `PHASE_CANDIDATES` already lists both spellings as
+    separate, explicitly-ordered preferences wherever that fallback matters
+    (see PLANNING's "brainstorming" / "superpowers:brainstorming" pair), so
+    implicit cross-matching would just reintroduce the same collision this
+    fixes.
     """
     prefs = _resolve_phase_prefs(phase, config)
-    by_name: dict[str, CatalogEntry] = {e.name: e for e in catalog}
+    by_invocable: dict[str, CatalogEntry] = {
+        (e.invoke_name or e.name): e for e in catalog
+    }
     picks: list[CatalogEntry] = []
     seen: set[str] = set()
     for kind, name in prefs:
-        entry = by_name.get(name)
-        if entry is None or entry.kind != kind or entry.name in seen:
+        entry = by_invocable.get(name)
+        if entry is None or entry.kind != kind:
+            continue
+        invocable = entry.invoke_name or entry.name
+        if invocable in seen:
             continue
         if pickable_only and not entry.enabled:
             continue
         picks.append(entry)
-        seen.add(entry.name)
+        seen.add(invocable)
         if len(picks) >= limit:
             break
     return picks
