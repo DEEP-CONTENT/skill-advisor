@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import shutil
 import sys
 import time
@@ -16,7 +17,7 @@ from . import hook as hook_mod
 from . import index as index_mod
 from . import install as install_mod
 from . import lifecycle as lifecycle_mod
-from . import matcher, paths, telemetry, triage
+from . import matcher, overrides, paths, telemetry, triage
 from . import sync as sync_mod
 from .config import load as load_config
 
@@ -695,6 +696,71 @@ def _cmd_sync_skills(args: argparse.Namespace) -> int:
     return 0
 
 
+_MIGRATE_BACKUP_SUFFIX = ".pre-migrate.bak"
+
+
+def _cmd_migrate_excludes(args: argparse.Namespace) -> int:
+    """Move catalog.exclude_names into skillOverrides, once.
+
+    Deliberate, accepted consequence: the migrated names become
+    rotation-eligible. Some were muted for irrelevance and may come back.
+    Hence the backups and the printed revert command — read the first
+    `rotate --dry-run` after migrating rather than applying it blind.
+    """
+    cfg_path = paths.config_file()
+    settings_path = paths.settings_file()
+    cfg_bak = cfg_path.with_name(cfg_path.name + _MIGRATE_BACKUP_SUFFIX)
+    settings_bak = settings_path.with_name(settings_path.name + _MIGRATE_BACKUP_SUFFIX)
+
+    if args.revert:
+        restored = []
+        for bak, live in ((cfg_bak, cfg_path), (settings_bak, settings_path)):
+            if bak.is_file():
+                live.write_bytes(bak.read_bytes())
+                bak.unlink()
+                restored.append(str(live))
+        if not restored:
+            print("nothing to revert: no .pre-migrate.bak files found")
+            return 1
+        print("restored:\n  " + "\n  ".join(restored))
+        return 0
+
+    cfg = load_config()
+    names = list(cfg.catalog.exclude_names)
+    if not names:
+        print("catalog.exclude_names is already empty; nothing to migrate")
+        return 0
+
+    paths.ensure_dirs()
+    if cfg_path.is_file():
+        cfg_bak.write_bytes(cfg_path.read_bytes())
+    if settings_path.is_file():
+        settings_bak.write_bytes(settings_path.read_bytes())
+
+    if not overrides.write({n: overrides.OFF for n in names}):
+        print("ERROR: could not write skillOverrides; config.toml left unchanged")
+        return 1
+
+    text = cfg_path.read_text(encoding="utf-8") if cfg_path.is_file() else ""
+    text = re.sub(
+        r"exclude_names\s*=\s*\[[^\]]*\]",
+        "exclude_names = []  # migrated to skillOverrides; see `skill-advisor rotate`",
+        text,
+        count=1,
+        flags=re.DOTALL,
+    )
+    if "exclude_names" not in text:
+        text += "\n[catalog]\nexclude_names = []  # migrated to skillOverrides\n"
+    cfg_path.write_text(text, encoding="utf-8")
+
+    print(f"migrated {len(names)} names from catalog.exclude_names into skillOverrides")
+    print(f"backups: {cfg_bak}\n         {settings_bak}")
+    print("revert with: skill-advisor migrate-excludes --revert")
+    print("NEXT: run `skill-advisor build`, then read `skill-advisor rotate` carefully "
+          "before applying — the migrated names are now rotation-eligible.")
+    return 0
+
+
 def _detect_existing_claudeskill() -> str | None:
     """Return a short description of any existing `claudeskill` wrapper, or None."""
     import os
@@ -893,6 +959,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_sync.add_argument("--force", action="store_true", help="overwrite existing skill directories in ~/.claude/skills")
     p_sync.add_argument("--dry-run", action="store_true", help="print what would happen without copying")
     p_sync.set_defaults(func=_cmd_sync_skills)
+
+    p_migrate = sub.add_parser(
+        "migrate-excludes",
+        help="move catalog.exclude_names into skillOverrides (one-time, reversible)",
+    )
+    p_migrate.add_argument("--revert", action="store_true", help="restore the pre-migration backups")
+    p_migrate.set_defaults(func=_cmd_migrate_excludes)
 
     return parser
 

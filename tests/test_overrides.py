@@ -104,3 +104,34 @@ def test_read_merges_advisor_settings_over_claude_settings(isolated_paths):
 def test_read_survives_malformed_settings(isolated_paths):
     paths.settings_file().write_text("{ not json", encoding="utf-8")
     assert overrides.read() == {}
+
+
+def test_write_merges_and_leaves_other_keys_alone(isolated_paths):
+    paths.settings_file().write_text(
+        json.dumps({"effortLevel": "high", "skillOverrides": {"a": "off"}}),
+        encoding="utf-8",
+    )
+    assert overrides.write({"b": "off"}) is True
+
+    data = json.loads(paths.settings_file().read_text(encoding="utf-8"))
+    assert data["effortLevel"] == "high"
+    assert data["skillOverrides"] == {"a": "off", "b": "off"}
+
+
+def test_write_aborts_on_unparseable_settings_leaving_bytes_identical(isolated_paths):
+    paths.settings_file().write_text("{ not json", encoding="utf-8")
+    before = paths.settings_file().read_bytes()
+    assert overrides.write({"b": "off"}) is False
+    assert paths.settings_file().read_bytes() == before
+
+
+def test_write_rejects_a_namespaced_key():
+    """A key containing `:` would be silently ignored by Claude Code
+    (docs/superpowers/notes/2026-07-30-skilloverrides-verification.md, case C) —
+    writing one produces a caller that reports success and changes nothing.
+    `override_key` never produces such a key, so this is defence against a
+    future caller that would; reject loudly rather than silently no-op."""
+    import pytest
+
+    with pytest.raises(ValueError):
+        overrides.write({"superpowers:brainstorming": "off"})

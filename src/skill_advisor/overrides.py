@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 from . import paths
@@ -89,6 +90,60 @@ def read(settings_path: Path | None = None) -> dict[str, str]:
     table = _read_one(paths.claude_home() / "settings.json")
     table.update(_read_one(settings_path or paths.settings_file()))
     return table
+
+
+def write(updates: dict[str, str], *, settings_path: Path | None = None) -> bool:
+    """Merge `updates` into skillOverrides in the ADVISOR's settings file.
+
+    Never touches ~/.claude/settings.json — that promise is why this tool is
+    safe to run. Same read-modify-write contract as baseline._write_settings_effort,
+    including the documented race with install.render_settings(): the later
+    writer wins and no lock is taken, judged acceptable for a single-user tool.
+    """
+    for key in updates:
+        if ":" in key:
+            raise ValueError(
+                f"refusing to write namespaced skillOverrides key {key!r}: "
+                "Claude Code silently ignores namespaced keys (plugin skills "
+                "are not addressable through skillOverrides at all — see "
+                "override_key), so writing one would report success while "
+                "changing nothing."
+            )
+
+    target = settings_path or paths.settings_file()
+    data: dict = {}
+    if target.is_file():
+        try:
+            parsed = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            log.warning("settings unparseable; skillOverrides write aborted")
+            return False
+        if not isinstance(parsed, dict):
+            log.warning("settings not a JSON object; skillOverrides write aborted")
+            return False
+        data = parsed
+
+    table = data.get("skillOverrides")
+    if not isinstance(table, dict):
+        table = {}
+    table.update({str(k): str(v) for k, v in updates.items()})
+    data["skillOverrides"] = table
+
+    tmp = target.with_suffix(f".json.tmp.{os.getpid()}")
+    try:
+        paths.ensure_dirs()
+        serialised = json.dumps(data, indent=2) + "\n"
+        json.loads(serialised)  # round-trip before it touches the real path
+        tmp.write_text(serialised, encoding="utf-8")
+        tmp.replace(target)
+        return True
+    except (OSError, ValueError) as exc:
+        log.warning("skillOverrides write failed: %s", exc)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return False
 
 
 def is_enabled(key: str | None, table: dict[str, str]) -> bool:
