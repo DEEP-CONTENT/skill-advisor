@@ -12,7 +12,8 @@ import sys
 import time
 from typing import Any
 
-from . import baseline, effort, inject, judge, lifecycle, matcher, paths, telemetry, triage
+from . import baseline, centroids, effort, inject, judge, lifecycle, matcher, paths, telemetry, triage
+from . import index as index_mod
 from .config import Config, load as load_config
 
 
@@ -296,6 +297,19 @@ def run() -> int:
             )
         except Exception as exc:
             log.debug("telemetry record failed: %s", exc, exc_info=True)
+
+        # Fold this prompt into the centroid sketch (Task 10) so rotation can
+        # score skills that have never been used. Lives inside this same
+        # telemetry gate — not a second parallel gate — so the privacy claim
+        # (no prompt text, no per-prompt vectors ever stored) holds by
+        # construction rather than by two gates agreeing. Never allowed to
+        # cost the user their picks: this runs after the emit above.
+        try:
+            sketch = centroids.load()
+            centroids.observe(sketch, index_mod.embed_one(prompt))
+            centroids.save(sketch)
+        except Exception as exc:  # pragma: no cover - defensive; hooks never raise
+            log.debug("centroid update failed: %s", exc, exc_info=True)
     return 0
 
 

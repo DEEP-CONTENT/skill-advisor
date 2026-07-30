@@ -118,6 +118,45 @@ def test_hook_silent_when_telemetry_record_fails(isolated_paths):
     assert "brainstorming" in envelope["hookSpecificOutput"]["additionalContext"]
 
 
+def test_hook_folds_the_prompt_into_the_sketch(isolated_paths):
+    import numpy as np
+
+    from skill_advisor import centroids
+
+    _enable_telemetry_in_config(isolated_paths)
+    unit = np.zeros(centroids.DIM, dtype=np.float32)
+    unit[0] = 1.0
+
+    with patch("skill_advisor.hook.matcher.pick", return_value=None), \
+         patch("skill_advisor.hook.index_mod.embed_one", return_value=unit):
+        _run_with_stdin({"prompt": "why is this pod crashlooping in sydcdev", "session_id": "s1"})
+
+    assert centroids.load().observed == 1
+
+
+def test_hook_does_not_write_the_sketch_when_telemetry_is_off(isolated_paths):
+    from skill_advisor import paths
+
+    # No config.toml → events_enabled defaults to False.
+    with patch("skill_advisor.hook.matcher.pick", return_value=None):
+        _run_with_stdin({"prompt": "why is this pod crashlooping in sydcdev", "session_id": "s1"})
+
+    assert not paths.centroids_file().exists()
+
+
+def test_a_failing_sketch_update_never_breaks_the_hook(isolated_paths):
+    """Hook paths are silent on error. A broken sketch must not cost a pick."""
+    _enable_telemetry_in_config(isolated_paths)
+    entry = CatalogEntry(kind="skill", name="brainstorming", namespace="user", description="...")
+    result = PickResult(picks=[ResolvedPick(entry=entry, reason="...")], state=None)
+
+    with patch("skill_advisor.hook.matcher.pick", return_value=result), \
+         patch("skill_advisor.hook.index_mod.embed_one", side_effect=RuntimeError("boom")):
+        out = _run_with_stdin({"prompt": "a substantive prompt that should match", "session_id": "s1"})
+
+    assert "brainstorming" in out
+
+
 def test_hook_records_event_even_when_no_picks(isolated_paths):
     _enable_telemetry_in_config(isolated_paths)
     with patch("skill_advisor.hook.matcher.pick", return_value=None):

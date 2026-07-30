@@ -126,6 +126,21 @@ class EffortConfig:
 
 
 @dataclass(frozen=True)
+class RotationConfig:
+    # Automatic rotation stays off until the scoring proves itself against real
+    # data. A wrong rotation silently removes a skill the user relies on, which
+    # is more disruptive than a wrong effort level.
+    enabled: bool = False
+    target_active: int = 75  # within the spec's 50-100 band
+    min_active: int = 25  # hard floor; a write that would go below aborts
+    hysteresis: float = 0.05  # score margin required to swap, prevents thrash
+    exploration_fraction: float = 0.10  # slots reserved for zero-usage high-fit skills
+    recency_days: int = 30  # never demote a skill invoked inside this window
+    min_observed_prompts: int = 200  # cold-start floor for the centroid sketch
+    centroid_count: int = 8
+
+
+@dataclass(frozen=True)
 class Config:
     matcher: MatcherConfig = field(default_factory=MatcherConfig)
     catalog: CatalogConfig = field(default_factory=CatalogConfig)
@@ -136,6 +151,7 @@ class Config:
         default_factory=ParallelizationConfig
     )
     effort: EffortConfig = field(default_factory=EffortConfig)
+    rotation: RotationConfig = field(default_factory=RotationConfig)
 
 
 def _as_tuple(value) -> tuple[str, ...]:
@@ -204,6 +220,7 @@ def load(path: Path | None = None) -> Config:
     telemetry = raw.get("telemetry", {}) or {}
     parallelization = raw.get("parallelization", {}) or {}
     effort = raw.get("effort", {}) or {}
+    rotation = raw.get("rotation", {}) or {}
 
     return Config(
         matcher=MatcherConfig(
@@ -281,6 +298,28 @@ def load(path: Path | None = None) -> Config:
             ),
             ultracode_nudge=bool(
                 effort.get("ultracode_nudge", EffortConfig.ultracode_nudge)
+            ),
+        ),
+        rotation=RotationConfig(
+            enabled=bool(rotation.get("enabled", RotationConfig.enabled)),
+            target_active=int(
+                rotation.get("target_active", RotationConfig.target_active)
+            ),
+            min_active=int(rotation.get("min_active", RotationConfig.min_active)),
+            hysteresis=float(rotation.get("hysteresis", RotationConfig.hysteresis)),
+            exploration_fraction=float(
+                rotation.get(
+                    "exploration_fraction", RotationConfig.exploration_fraction
+                )
+            ),
+            recency_days=int(rotation.get("recency_days", RotationConfig.recency_days)),
+            min_observed_prompts=int(
+                rotation.get(
+                    "min_observed_prompts", RotationConfig.min_observed_prompts
+                )
+            ),
+            centroid_count=int(
+                rotation.get("centroid_count", RotationConfig.centroid_count)
             ),
         ),
     )

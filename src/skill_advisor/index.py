@@ -79,14 +79,19 @@ def current_hash() -> str | None:
     return f.read_text(encoding="utf-8").strip()
 
 
+def embed_one(text: str) -> np.ndarray:
+    """A single L2-normalised query vector."""
+    model = _embed_model()
+    q = np.array(list(model.embed([text])), dtype=np.float32)
+    return _normalise(q)[0]
+
+
 def top_k(
     prompt: str, index: Index, k: int, *, pickable_only: bool = True
 ) -> list[tuple[CatalogEntry, float]]:
     if index.embeddings.shape[0] == 0 or k <= 0:
         return []
-    model = _embed_model()
-    q = np.array(list(model.embed([prompt])), dtype=np.float32)
-    q = _normalise(q)[0]
+    q = embed_one(prompt)
     scores = index.embeddings @ q  # cosine because both sides are unit vectors
 
     if pickable_only and index.pickable is not None:

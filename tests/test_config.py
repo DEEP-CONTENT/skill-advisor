@@ -99,6 +99,53 @@ def test_effort_section_absent_yields_defaults(tmp_path):
     assert cfg.effort.enabled is False
 
 
+def test_rotation_config_defaults():
+    cfg = config.Config()
+    assert cfg.rotation.enabled is False
+    assert cfg.rotation.target_active == 75
+    assert cfg.rotation.min_active == 25
+    assert cfg.rotation.hysteresis == 0.05
+    assert cfg.rotation.exploration_fraction == 0.10
+    assert cfg.rotation.recency_days == 30
+    assert cfg.rotation.min_observed_prompts == 200
+    assert cfg.rotation.centroid_count == 8
+
+
+def test_rotation_config_parses_toml(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text(
+        """
+[rotation]
+enabled = true
+target_active = 60
+min_active = 20
+hysteresis = 0.1
+exploration_fraction = 0.2
+recency_days = 14
+min_observed_prompts = 100
+centroid_count = 4
+""",
+        encoding="utf-8",
+    )
+    cfg = config.load(p)
+    assert cfg.rotation.enabled is True
+    assert cfg.rotation.target_active == 60
+    assert cfg.rotation.min_active == 20
+    assert cfg.rotation.hysteresis == 0.1
+    assert cfg.rotation.exploration_fraction == 0.2
+    assert cfg.rotation.recency_days == 14
+    assert cfg.rotation.min_observed_prompts == 100
+    assert cfg.rotation.centroid_count == 4
+
+
+def test_rotation_section_absent_yields_defaults(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text("[matcher]\nuse_judge = true\n", encoding="utf-8")
+    cfg = config.load(p)
+    assert cfg.rotation.enabled is False
+    assert cfg.rotation.target_active == 75
+
+
 def test_shipped_defaults_keep_doctor_quiet(isolated_paths, capsys):
     """Turning on parallelization at the shipped budget_seconds/judge_timeout_seconds
     (8.0 / 5.0) must not trip doctor's WARN. Invokes the real `doctor` command rather
