@@ -7,7 +7,7 @@
 [![CI](https://github.com/deep-content/skill-advisor/actions/workflows/ci.yml/badge.svg)](https://github.com/deep-content/skill-advisor/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
-[![Tests](https://img.shields.io/badge/tests-261%20passing-brightgreen.svg)](#development)
+[![Tests](https://img.shields.io/badge/tests-438%20passing-brightgreen.svg)](#development)
 [![Hook latency](https://img.shields.io/badge/latency-~0.3s%20warm-success.svg)](#latency-and-the-two-matcher-modes)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing)
 
@@ -70,7 +70,7 @@ No API keys are ever introduced. All LLM calls route through `claude -p` subproc
 ```
 skill-advisor/
 ├── src/skill_advisor/     Python package — the advisor runtime & CLI
-├── tests/                 pytest suite (261 tests, all pass, zero real-home leaks)
+├── tests/                 pytest suite (438 tests, all pass, zero real-home leaks)
 ├── examples/
 │   ├── config.toml        Commented default user config
 │   ├── claudeskill-settings.json  Reference UserPromptSubmit hook settings
@@ -588,11 +588,13 @@ max_picks = 3
 
 # Whole-hook budget in seconds — signal.alarm() arms around the entire matcher
 # call (not just the judge). If the alarm itself fires, the hook exits silent
-# (no picks) so your prompt always goes through unaffected — but in practice
-# that's a rare last resort: the judge's own subprocess timeout is set to
-# budget_seconds - 0.5, so it always loses that race. A judge that times out
-# now falls back to the embedding ranking already computed ("embedding
-# fallback (0.NN)") instead of going silent.
+# (no picks) so your prompt always goes through unaffected, though it still
+# records an event row marked judge_failure = "budget_exceeded" so the kill is
+# countable rather than invisible. In practice that's a rare last resort: the
+# judge's own subprocess timeout is set to budget_seconds - 0.5, so it always
+# loses that race. A judge that times out now falls back to the embedding
+# ranking already computed ("embedding fallback (0.NN)") instead of going
+# silent.
 # Must be at least parallelization.judge_timeout_seconds + 3 if you enable
 # [parallelization]; `doctor` warns when it isn't.
 # Bump to ~15.0 if you enable use_judge = true.
@@ -1552,11 +1554,20 @@ not embeddings) and the LLM judge mode (where scores aren't returned).
 turn (declining with zero picks still counts). Before the latency fast-fail change
 it echoed `matcher.use_judge` instead — whether the judge was *configured*, not
 whether it ran — so a triage-skipped or judge-disabled turn could still claim
-`judge_used: true`. `judge_failure` is `null` when the judge ran (or wasn't asked),
-and otherwise names why it produced nothing: one of `judge.py`'s `FAILURE_*`
-values (`no_candidates`, `cli_missing`, `timeout`, `subprocess_error`,
-`exit_nonzero`, `unparseable`), or `budget_exceeded` when the hook's own SIGALRM
-fired before the judge could answer. Rows written before this change have no
+`judge_used: true`. `judge_failure` names why the turn emitted no picks: one of
+`judge.py`'s `FAILURE_*` values (`no_candidates`, `cli_missing`, `timeout`,
+`subprocess_error`, `exit_nonzero`, `unparseable`), or `budget_exceeded` when the
+hook's own SIGALRM killed the turn. It is `null` whenever picks were produced
+normally, including when the judge deliberately declined.
+
+The two fields answer different questions — `judge_used` is *did the subprocess
+run and return a verdict*, `judge_failure` is *why did this turn emit nothing* —
+so they are not mutually exclusive. `judge_used: true` with
+`judge_failure: "budget_exceeded"` is a real and useful combination: the judge
+answered, then the alarm fired during the post-judge work and its verdict was
+discarded. Counting those rows is the way to tell that `budget_seconds` sits too
+close to the judge's own timeout (`budget_seconds - 0.5`); every other
+`judge_failure` value implies `judge_used: false`. Rows written before this change have no
 `judge_failure` key at all — `"judge_failure" in row` is an exact discriminator
 between the two eras, and a more reliable one than filtering by timestamp, which
 is fragile against clock skew and replayed logs.
@@ -1672,7 +1683,7 @@ Code itself uses.
 
 PRs and issues are welcome. Before opening a PR:
 
-- Run `make test` — all 261 tests should pass on Linux and macOS, Python 3.11 / 3.12.
+- Run `make test` — all 438 tests should pass on Linux and macOS, Python 3.11 / 3.12.
 - Keep changes focused. Match the existing [Conventional Commits](https://www.conventionalcommits.org/) style (`feat:`, `fix:`, `docs:`, `chore:`, …).
 - For larger features or behavioral changes, open an issue first so we can align on scope before you invest time.
 
@@ -1693,7 +1704,7 @@ uv sync --extra dev
 ### Running tests
 
 ```bash
-uv run pytest                        # 261 tests
+uv run pytest                        # 438 tests
 uv run pytest tests/test_hook.py -v  # single file
 uv run pytest --cov=skill_advisor    # with coverage
 ```
@@ -1762,7 +1773,7 @@ skill-advisor/
 ├── tests/
 │   ├── conftest.py            Auto-use isolated_paths fixture (per-test tempdirs)
 │   ├── fixtures/              fake_claude_home/, prompts.jsonl
-│   └── test_*.py              261 tests across all modules
+│   └── test_*.py              438 tests across all modules
 │
 ├── examples/
 │   ├── config.toml            Default user config (commented)

@@ -183,6 +183,35 @@ def test_budget_exceeded_records_a_countable_telemetry_event(isolated_paths):
     assert lines[-1]["picks"] == []
 
 
+def test_budget_exceeded_after_a_completed_judge_keeps_both_facts(isolated_paths):
+    """The alarm can fire AFTER the judge answered — during the post-judge work
+    in `matcher.pick()` (effort classification, lifecycle bookkeeping). The row
+    then carries `judge_used: true` alongside `judge_failure: "budget_exceeded"`.
+
+    That pair is deliberate, not a contradiction. The two fields answer different
+    questions: `judge_used` is "did the subprocess run and return a verdict",
+    `judge_failure` is "why did this turn emit no picks". Collapsing it — by
+    forcing `judge_used` false here — would erase the only signal that the alarm
+    is discarding *completed* verdicts, which is precisely the tell that
+    `budget_seconds` is too close to the judge's own timeout.
+    """
+    _enable_telemetry_and_judge(isolated_paths)
+
+    def _pick_then_alarm(prompt, cfg, session_id=None, *, trace=None):
+        if trace is not None:
+            trace.ran = True  # judge completed and returned a verdict...
+        raise hook_mod._BudgetExceeded()  # ...then the alarm fired
+
+    with patch("skill_advisor.hook.matcher.pick", _pick_then_alarm):
+        _run_with_stdin({"prompt": "a substantive prompt that should match", "session_id": "s1"})
+
+    events_path = isolated_paths["cache_home"] / "advisor.events.jsonl"
+    lines = [json.loads(line) for line in events_path.read_text().splitlines() if line.strip()]
+    assert lines[-1]["judge_used"] is True
+    assert lines[-1]["judge_failure"] == "budget_exceeded"
+    assert lines[-1]["picks"] == []
+
+
 def test_budget_exceeded_writes_no_event_when_telemetry_disabled(isolated_paths):
     # No config.toml → events_enabled defaults to False.
     with patch("skill_advisor.hook.matcher.pick", side_effect=hook_mod._BudgetExceeded):
