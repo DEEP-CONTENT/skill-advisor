@@ -131,11 +131,16 @@ def run() -> int:
 
     cfg = load_config()
     budget = max(int(cfg.matcher.budget_seconds + 0.5), 1)
+    # Created before the alarm is armed: signal.alarm(budget) can fire mid-
+    # matcher.pick() and raise _BudgetExceeded, and the telemetry block below
+    # still runs on that path — it must find a live trace object, not a
+    # NameError.
+    trace = matcher.JudgeTrace()
     signal.signal(signal.SIGALRM, _alarm_handler)
     signal.alarm(budget)
 
     try:
-        result = matcher.pick(prompt, cfg, session_id=session_id)
+        result = matcher.pick(prompt, cfg, session_id=session_id, trace=trace)
     except _BudgetExceeded:
         log.info("budget exceeded after %.2fs; falling back silent", time.monotonic() - started)
         return 0
@@ -240,7 +245,8 @@ def run() -> int:
                 picks=picks,
                 phase=phase,
                 phase_source="user",
-                judge_used=cfg.matcher.use_judge,
+                judge_used=trace.ran,
+                judge_failure=trace.failure,
                 triage_skipped=triage.should_skip(prompt, cfg),
                 duration_ms=int(duration * 1000),
                 config=cfg.telemetry,
