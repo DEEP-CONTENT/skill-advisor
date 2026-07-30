@@ -253,28 +253,30 @@ def pool_health(
 ) -> dict:
     """Counts for `doctor`: how much of the disk the scanner can actually see.
 
-    Measured 2026-07-30: 216 of 947 SKILL.md files (23%) carry no parseable YAML
-    frontmatter and are silently invisible. Reporting that is deliberate — the
-    files belong to third-party skill libraries and fixing them is out of scope,
-    but a rotation pool that silently excludes a quarter of the disk should say so.
+    About ~20% of SKILL.md files carry no parseable YAML frontmatter and are
+    silently invisible. Reporting that is deliberate — the files belong to
+    third-party skill libraries and fixing them is out of scope, but a rotation
+    pool that silently excludes a fifth of the disk should say so.
     """
     cfg = config or load_config()
     table = overrides_table if overrides_table is not None else overrides.read()
     files = 0
-    unparseable: list[str] = []
+    unparseable_dirs: list[str] = []
     for root in paths.skill_roots():
         for skill_md in root.rglob("SKILL.md"):
             files += 1
             fm = parse_frontmatter(skill_md)
             if not fm or not fm.get("name") or not fm.get("description"):
-                unparseable.append(skill_md.parent.name)
+                unparseable_dirs.append(skill_md.parent.name)
+    unparseable_count = len(unparseable_dirs)
     entries = scan(cfg, overrides_table=table)
     off_keys = {k for k, v in table.items() if v.strip().lower() == overrides.OFF}
     excluded = set(cfg.catalog.exclude_names)
     return {
         "skill_md_files": files,
-        "parseable": files - len(unparseable),
-        "unparseable": sorted(set(unparseable)),
+        "parseable": files - unparseable_count,
+        "unparseable_count": unparseable_count,
+        "unparseable_dirs": sorted(set(unparseable_dirs)),
         "pool": len(entries),
         "pickable": sum(1 for e in entries if e.enabled),
         "excluded_but_enabled": sorted(excluded - off_keys),

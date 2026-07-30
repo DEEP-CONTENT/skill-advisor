@@ -250,3 +250,51 @@ def test_scan_dedupes_multiple_versions_of_same_plugin_skill(isolated_paths):
     assert len(writing_plans) == 1
     assert writing_plans[0].namespace == "plugin:superpowers"
     assert writing_plans[0].name == "writing-plans"
+
+
+def test_pool_health_unparseable_count_is_per_file_not_deduped(isolated_paths, tmp_path):
+    """When two roots contain unparseable files with the same directory name,
+    the per-file count must be used for arithmetic, not the deduplicated count."""
+    import unittest.mock
+
+    from skill_advisor import paths as paths_mod
+
+    # Create two roots, each with an unparseable skill directory named "broken"
+    root1 = tmp_path / "root1"
+    root1.mkdir()
+    (root1 / "broken").mkdir()
+    (root1 / "broken" / "SKILL.md").write_text("# No frontmatter\n", encoding="utf-8")
+    (root1 / "good").mkdir()
+    (root1 / "good" / "SKILL.md").write_text(
+        "---\nname: good-skill\ndescription: A working skill\n---\n# Content\n",
+        encoding="utf-8",
+    )
+
+    # Create a second root with another "broken" directory
+    root2 = tmp_path / "root2"
+    root2.mkdir()
+    (root2 / "broken").mkdir()
+    (root2 / "broken" / "SKILL.md").write_text(
+        "# Another no frontmatter\n", encoding="utf-8"
+    )
+
+    # Mock skill_roots to return both roots
+    def mocked_roots():
+        return [root1, root2]
+
+    with unittest.mock.patch.object(
+        paths_mod, "skill_roots", side_effect=mocked_roots
+    ):
+        health = catalog.pool_health()
+
+    # Should find 3 files total: 2 unparseable (in two "broken" dirs), 1 parseable
+    assert health["skill_md_files"] == 3
+    assert health["parseable"] == 1
+    assert health["unparseable_count"] == 2  # per-file count
+    # unparseable_dirs will be deduplicated to just ["broken"]
+    assert health["unparseable_dirs"] == ["broken"]
+    # Reconciliation: parseable + unparseable_count == skill_md_files must hold
+    assert (
+        health["parseable"] + health["unparseable_count"]
+        == health["skill_md_files"]
+    )

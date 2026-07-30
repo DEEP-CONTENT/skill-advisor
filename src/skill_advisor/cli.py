@@ -173,11 +173,11 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     if cat.is_file() and emb.is_file():
         try:
             entries = catalog_mod.load()
-            report.append(("catalog", f"{len(entries)} entries"))
+            report.append(("catalog (cached)", f"{len(entries)} entries"))
         except Exception as exc:
-            report.append(("catalog", f"broken: {exc}"))
+            report.append(("catalog (cached)", f"broken: {exc}"))
     else:
-        report.append(("catalog", "not built (run `skill-advisor build`)"))
+        report.append(("catalog (cached)", "not built (run `skill-advisor build`)"))
 
     source_hash = None
     try:
@@ -210,21 +210,22 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         f"{health['parseable']} parseable"
     )
     print(
-        f"catalog        : {health['pool']} in pool, {health['pickable']} pickable"
+        f"catalog (live) : {health['pool']} in pool, {health['pickable']} pickable"
     )
-    if health["unparseable"]:
-        shown = ", ".join(health["unparseable"][:5])
-        more = len(health["unparseable"]) - 5
+    if health["unparseable_count"] > 0:
+        shown = ", ".join(health["unparseable_dirs"][:5])
+        more = len(health["unparseable_dirs"]) - 5
         suffix = f", +{more} more" if more > 0 else ""
         print(
-            f"WARN: {len(health['unparseable'])} SKILL.md files are unparseable "
-            f"(no YAML frontmatter) and invisible to the advisor: {shown}{suffix}"
+            f"WARN: {health['unparseable_count']} SKILL.md files are unparseable "
+            f"(no YAML frontmatter) and invisible to the advisor. "
+            f"Examples: {shown}{suffix}"
         )
     if health["excluded_but_enabled"]:
         print(
-            f"NOTE: {len(health['excluded_but_enabled'])} names in "
-            f"catalog.exclude_names are enabled in Claude Code — muted in the "
-            f"advisor but invocable. `skill-advisor migrate-excludes` reconciles this."
+            f"NOTE: {len(health['excluded_but_enabled'])} names are configured as "
+            f"excluded in catalog.exclude_names but remain enabled in Claude Code. "
+            f"To reconcile: edit config.toml and remove them from catalog.exclude_names."
         )
 
     cfg_effort = cfg.effort
