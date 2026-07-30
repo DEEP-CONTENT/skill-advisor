@@ -804,8 +804,10 @@ hook failure.
 
 ### Safety rails
 
-- **`signal.alarm(budget_seconds + 0.5)`** — hard wall-clock budget; any overrun exits 0
-  silent via a `_BudgetExceeded` exception caught in `hook.run()`.
+- **`signal.alarm(hook.alarm_seconds(cfg))`**, i.e. `max(int(budget_seconds + 0.5), 1)`
+  — hard wall-clock budget, rounded to a whole second since `signal.alarm()` only
+  takes an int; any overrun exits 0 silent via a `_BudgetExceeded` exception caught
+  in `hook.run()`.
 - **Broad try/except in `hook.run()`** — any unexpected error exits 0 silent and logs
   to `advisor.log`.
 - **Hallucination guard in `judge._parse_judge_reply()`** — LLM-returned names are
@@ -966,7 +968,7 @@ review = ["subagent:feature-dev:code-reviewer", "skill:security-audit"]
 # be bumped to >= judge_timeout_seconds + 3.
 enabled = false
 min_tasks = 3
-judge_timeout_seconds = 20.0
+judge_timeout_seconds = 5.0
 
 [lifecycle.auto_advance]
 # Opt-in Stop/PostToolUse hooks that push phases forward without a user prompt.
@@ -1534,6 +1536,7 @@ Each line is one JSON object with this schema:
   "phase": "planning",
   "phase_source": "user",
   "judge_used": false,
+  "judge_failure": null,
   "picks": [
     {"rank": 1, "name": "Plan", "kind": "subagent", "score": null},
     {"rank": 2, "name": "writing-plans", "kind": "skill", "score": null}
@@ -1544,6 +1547,19 @@ Each line is one JSON object with this schema:
 `score` is `null` for lifecycle-phase picks (which come from a preference list,
 not embeddings) and the LLM judge mode (where scores aren't returned).
 `phase_source` is `"auto"` when the previous Stop handler advanced the phase.
+
+`judge_used` means the judge subprocess actually ran and returned a verdict this
+turn (declining with zero picks still counts). Before the latency fast-fail change
+it echoed `matcher.use_judge` instead — whether the judge was *configured*, not
+whether it ran — so a triage-skipped or judge-disabled turn could still claim
+`judge_used: true`. `judge_failure` is `null` when the judge ran (or wasn't asked),
+and otherwise names why it produced nothing: one of `judge.py`'s `FAILURE_*`
+values (`no_candidates`, `cli_missing`, `timeout`, `subprocess_error`,
+`exit_nonzero`, `unparseable`), or `budget_exceeded` when the hook's own SIGALRM
+fired before the judge could answer. Rows written before this change have no
+`judge_failure` key at all — `"judge_failure" in row` is an exact discriminator
+between the two eras, and a more reliable one than filtering by timestamp, which
+is fragile against clock skew and replayed logs.
 
 ### Disabling and wiping
 
