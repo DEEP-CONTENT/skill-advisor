@@ -1,0 +1,236 @@
+"""Tests for the `skill-advisor rotate` CLI subcommand."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from datetime import datetime, timedelta, timezone
+
+import numpy as np
+
+from skill_advisor import catalog as catalog_mod
+from skill_advisor import centroids, index as index_mod, paths
+from skill_advisor.catalog import CatalogEntry
+
+
+def _ns(**kw):
+    """Namespace stub matching what the `rotate` parser produces."""
+    base = {"apply": False, "target": None, "verbose": False}
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def _emb(values: list[float]) -> np.ndarray:
+    """Unit vectors on the plane spanned by the first two embedding axes.
+
+    `x` is the cosine similarity each row will have against a centroid
+    pinned to axis 0 (see `_prime_rotatable_state`), so callers can dial in
+    an exact semantic_fit per entry.
+    """
+    out = np.zeros((len(values), centroids.DIM), dtype=np.float32)
+    for i, x in enumerate(values):
+        out[i, 0] = x
+        out[i, 1] = float(np.sqrt(max(0.0, 1.0 - x * x)))
+    return out
+
+
+def _write_rotation_config(min_observed_prompts: int = 200) -> None:
+    """A small target/floor so a handful of catalog entries can exercise a
+    real promote+demote swap without needing hundreds of fixture entries."""
+    paths.ensure_dirs()
+    paths.config_file().write_text(
+        "[rotation]\n"
+        "target_active = 6\n"
+        "min_active = 2\n"
+        "hysteresis = 0.0\n"
+        "exploration_fraction = 0.0\n"
+        "recency_days = 0\n"
+        f"min_observed_prompts = {min_observed_prompts}\n",
+        encoding="utf-8",
+    )
+
+
+def _prime_rotatable_state(isolated_paths, *, observed: int = 1000) -> None:
+    """Catalog + embeddings + sketch + events for a deterministic rotate() run.
+
+    5 active (enabled) entries with low semantic fit and no picks; 5
+    candidate (disabled) entries with high semantic fit. Combined with
+    `_write_rotation_config`'s target_active=6/hysteresis=0/exploration=0,
+    this deterministically promotes all 5 candidates and demotes the 4
+    lowest-scoring incumbents, leaving 1 incumbent + 5 promotions = 6 active.
+    """
+    entries: list[CatalogEntry] = []
+    fits: list[float] = []
+    for i in range(5):
+        entries.append(
+            CatalogEntry(
+                kind="skill",
+                name=f"active{i}",
+                namespace="user",
+                description=f"active skill {i}",
+                path=f"/skills/active{i}/SKILL.md",
+                enabled=True,
+            )
+        )
+        fits.append(0.10 + i * 0.01)
+    for i in range(5):
+        entries.append(
+            CatalogEntry(
+                kind="skill",
+                name=f"cand{i}",
+                namespace="user",
+                description=f"candidate skill {i}",
+                path=f"/skills/cand{i}/SKILL.md",
+                enabled=False,
+            )
+        )
+        fits.append(0.95 - i * 0.01)
+
+    embeddings = _emb(fits)
+    source_hash = catalog_mod.compute_hash(entries)
+    index_mod.save(entries, embeddings, source_hash)
+
+    sketch = centroids.empty(k=2)
+    v = np.zeros(centroids.DIM, dtype=np.float32)
+    v[0] = 1.0
+    sketch.vectors[0] = v
+    sketch.counts[0] = observed
+    sketch.observed = observed
+    centroids.save(sketch)
+
+    _write_rotation_config()
+
+    now = datetime.now(timezone.utc)
+    lines = [
+        # A couple of picks for active4 — its fit (0.14) is still far below
+        # the candidates', so this doesn't disturb which 6 entries win.
+        json.dumps(
+            {
+                "schema": 1,
+                "kind": "prompt",
+                "ts": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "picks": [
+                    {"rank": 1, "name": "active4", "kind": "skill", "score": 0.5}
+                ],
+            }
+        ),
+        json.dumps(
+            {
+                "schema": 1,
+                "kind": "prompt",
+                "ts": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "picks": [
+                    {"rank": 1, "name": "active4", "kind": "skill", "score": 0.5}
+                ],
+            }
+        ),
+        # A stop event so one demoted incumbent (active2) has a real
+        # last_invoked_days instead of "never invoked", exercising both
+        # branches of the demotion-reason text.
+        json.dumps(
+            {
+                "schema": 1,
+                "kind": "stop",
+                "ts": (now - timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "skills": ["active2"],
+            }
+        ),
+    ]
+    paths.events_file().write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_dry_run_writes_nothing(isolated_paths, capsys):
+    """The settings file must be byte-identical after a rotate without --apply."""
+    from skill_advisor import cli
+
+    paths.settings_file().write_text(
+        '{"skillOverrides": {"a": "off"}}\n', encoding="utf-8"
+    )
+    before = paths.settings_file().read_bytes()
+
+    _prime_rotatable_state(isolated_paths)
+    assert cli._cmd_rotate(_ns()) == 0
+
+    assert paths.settings_file().read_bytes() == before
+    assert "dry run" in capsys.readouterr().out.lower()
+
+
+def test_apply_writes_the_overrides(isolated_paths, capsys):
+    from skill_advisor import cli
+
+    _prime_rotatable_state(isolated_paths)
+    assert cli._cmd_rotate(_ns(apply=True)) == 0
+
+    table = json.loads(paths.settings_file().read_text(encoding="utf-8"))[
+        "skillOverrides"
+    ]
+    assert table  # something changed
+    assert table.get("cand0") == "on"
+    assert any(v == "off" for k, v in table.items() if k.startswith("active"))
+
+
+def test_rotate_refuses_and_explains_before_cold_start(isolated_paths, capsys):
+    from skill_advisor import cli
+
+    _prime_rotatable_state(isolated_paths, observed=3)
+    assert cli._cmd_rotate(_ns()) == 1
+    assert "prompts" in capsys.readouterr().out.lower()
+
+
+def test_rotate_refuses_before_settings_write(isolated_paths, capsys):
+    """A refusal must also leave the settings file untouched."""
+    from skill_advisor import cli
+
+    paths.settings_file().write_text('{"skillOverrides": {}}\n', encoding="utf-8")
+    before = paths.settings_file().read_bytes()
+
+    _prime_rotatable_state(isolated_paths, observed=3)
+    assert cli._cmd_rotate(_ns(apply=True)) == 1
+    assert paths.settings_file().read_bytes() == before
+
+
+def test_dry_run_shows_score_signal_and_last_invocation(isolated_paths, capsys):
+    from skill_advisor import cli
+
+    _prime_rotatable_state(isolated_paths)
+    assert cli._cmd_rotate(_ns()) == 0
+    out = capsys.readouterr().out
+    assert "semantic_fit" in out
+    assert "PROMOTE" in out or "DEMOTE" in out
+    assert "never invoked" in out or "last invoked" in out
+
+
+def test_dry_run_shows_pool_active_target_sketch(isolated_paths, capsys):
+    """The pool/active/target/sketch line must print before the proposal so a
+    refusal (elsewhere) is self-explanatory."""
+    from skill_advisor import cli
+
+    _prime_rotatable_state(isolated_paths)
+    assert cli._cmd_rotate(_ns()) == 0
+    out = capsys.readouterr().out
+    assert "pool 10" in out
+    assert "active 5" in out
+    assert "target 6" in out
+
+
+def test_telemetry_disabled_note(isolated_paths, capsys):
+    """When telemetry is off, rotate must say plainly that pick_rate and
+    invocation_rate are unavailable."""
+    from skill_advisor import cli
+
+    _prime_rotatable_state(isolated_paths)
+    # _write_rotation_config only sets [rotation]; telemetry.events_enabled
+    # defaults to False, matching the scenario this test targets.
+    assert cli._cmd_rotate(_ns()) == 0
+    out = capsys.readouterr().out
+    assert "pick_rate" in out
+    assert "semantic_fit" in out
+
+
+def test_rotate_target_override(isolated_paths, capsys):
+    from skill_advisor import cli
+
+    _prime_rotatable_state(isolated_paths)
+    assert cli._cmd_rotate(_ns(target=3)) == 0
+    out = capsys.readouterr().out
+    assert "target 3" in out

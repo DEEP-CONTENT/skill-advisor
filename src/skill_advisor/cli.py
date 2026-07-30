@@ -16,11 +16,12 @@ from pathlib import Path
 import shutil as _shutil  # for sessions dir cleanup
 
 from . import catalog as catalog_mod
+from . import centroids
 from . import hook as hook_mod
 from . import index as index_mod
 from . import install as install_mod
 from . import lifecycle as lifecycle_mod
-from . import matcher, overrides, paths, telemetry, triage
+from . import matcher, overrides, paths, rotate, telemetry, triage
 from . import sync as sync_mod
 from .config import load as load_config
 
@@ -564,6 +565,154 @@ def _cmd_report(args: argparse.Namespace) -> int:
         _render_report_csv(stats, args)
     else:
         _render_report_text(stats, args)
+    return 0
+
+
+def _rotation_stats(events: list[dict]) -> dict[str, dict]:
+    """Fold the event log into per-skill picks / invocations / recency.
+
+    `invocations` and `last_invoked_days` come from the `skills` key on
+    kind=stop events, which only started being written in this release —
+    expect zeros/None for a while on a fresh install. `picks` comes from
+    kind=prompt events, same as `_report_stats` above.
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    out: dict[str, dict] = {}
+    for ev in events:
+        if ev.get("kind") == "stop":
+            for name in ev.get("skills") or []:
+                slot = out.setdefault(
+                    name, {"picks": 0, "invocations": 0, "last_invoked_days": None}
+                )
+                slot["invocations"] += 1
+                try:
+                    ts = datetime.fromisoformat(str(ev["ts"]).replace("Z", "+00:00"))
+                except (KeyError, ValueError):
+                    continue
+                days = (now - ts).total_seconds() / 86400.0
+                prev = slot["last_invoked_days"]
+                slot["last_invoked_days"] = days if prev is None else min(prev, days)
+            continue
+        for pick in ev.get("picks") or []:
+            name = pick.get("name")
+            if not name:
+                continue
+            slot = out.setdefault(
+                name, {"picks": 0, "invocations": 0, "last_invoked_days": None}
+            )
+            slot["picks"] += 1
+    return out
+
+
+def _cmd_rotate(args: argparse.Namespace) -> int:
+    """Propose (or, with --apply, write) active-skill-set rotation.
+
+    A CLI verb, not a hook path: it fails loudly. `RotationRefused` (cold
+    start, or a proposal that would breach `rotation.min_active`) and a
+    failed settings write both print a clear message and return a non-zero
+    exit code instead of a bare traceback.
+
+    Without --apply this MUST NOT touch the settings file — that is the
+    single most important property of this command, since the printed
+    proposal is read by a human before they decide whether to change their
+    active skill set. Every early-return path above the --apply branch below
+    happens before any write is attempted.
+
+    The pool/active/target/sketch line prints unconditionally, before the
+    scoring attempt, specifically so that a refusal below is self-explanatory
+    without a second run: the reader already has the sketch's observed-prompt
+    count et al. in view when the refusal message appears.
+    """
+    cfg = load_config()
+    rot = cfg.rotation
+    if args.target is not None:
+        rot = dataclasses.replace(rot, target_active=int(args.target))
+
+    try:
+        idx = index_mod.load()
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    sketch = centroids.load()
+    events = list(telemetry.iter_events())  # cutoff=None: the whole log
+    stats = _rotation_stats(events)
+
+    active = sum(1 for e in idx.catalog if e.enabled)
+    print(
+        f"pool {len(idx.catalog)} · active {active} · target {rot.target_active} "
+        f"· sketch {sketch.observed} prompts"
+    )
+    if not cfg.telemetry.events_enabled:
+        print(
+            "NOTE: telemetry is off — pick_rate and invocation_rate are "
+            "unavailable; scoring on semantic_fit alone."
+        )
+
+    try:
+        scored = rotate.score_pool(idx.catalog, idx.embeddings, sketch, stats, rot)
+        proposal = rotate.propose(scored, rot)
+    except rotate.RotationRefused as exc:
+        print(f"rotation refused: {exc}")
+        return 1
+
+    if not proposal.promote and not proposal.demote:
+        print("no changes proposed")
+        return 0
+
+    for s in proposal.promote:
+        name = s.entry.invoke_name or s.entry.name
+        print(f"  PROMOTE {name:45} {proposal.reason_by_name[s.entry.name]}")
+    for s in proposal.demote:
+        name = s.entry.invoke_name or s.entry.name
+        print(f"  DEMOTE  {name:45} {proposal.reason_by_name[s.entry.name]}")
+
+    if not args.apply:
+        print("\n(dry run — nothing written; rerun with --apply)")
+        return 0
+
+    # `overrides.override_key()` returns None for entries skillOverrides
+    # cannot address (plugin-namespaced skills, verified live — see
+    # docs/superpowers/notes/2026-07-30-skilloverrides-verification.md).
+    # Skip those rather than inventing a key: writing a namespaced key would
+    # be silently ignored by Claude Code, so `rotate --apply` would report
+    # success while changing nothing for that entry.
+    updates: dict[str, str] = {}
+    for s in proposal.promote:
+        key = overrides.override_key(
+            kind=s.entry.kind,
+            namespace=s.entry.namespace,
+            path=s.entry.path,
+            name=s.entry.name,
+        )
+        if key:
+            updates[key] = "on"
+    for s in proposal.demote:
+        key = overrides.override_key(
+            kind=s.entry.kind,
+            namespace=s.entry.namespace,
+            path=s.entry.path,
+            name=s.entry.name,
+        )
+        if key:
+            updates[key] = overrides.OFF
+
+    try:
+        wrote = overrides.write(updates)
+    except ValueError as exc:
+        # Defense in depth, not the expected path: override_key() already
+        # filters out namespaced keys above, so overrides.write() should
+        # never see one to raise on. A CLI verb still fails loudly rather
+        # than leaking that ValueError as a bare traceback.
+        print(f"ERROR: refused to write skillOverrides: {exc}")
+        return 1
+    if not wrote:
+        print("ERROR: settings write failed; nothing changed")
+        return 1
+    print(f"\napplied {len(updates)} change(s) to {paths.settings_file()}")
+    print("run `skill-advisor build` to rebuild the catalog")
     return 0
 
 
@@ -1309,6 +1458,21 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_migrate.set_defaults(func=_cmd_migrate_excludes)
+
+    p_rotate = sub.add_parser(
+        "rotate",
+        help="propose (or apply) active-skill-set rotation based on semantic fit and usage",
+    )
+    p_rotate.add_argument(
+        "--apply", action="store_true", help="write the proposal to the settings file"
+    )
+    p_rotate.add_argument(
+        "--target",
+        type=int,
+        default=None,
+        help="override rotation.target_active for this run",
+    )
+    p_rotate.set_defaults(func=_cmd_rotate)
 
     return parser
 
