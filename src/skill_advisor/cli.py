@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import logging
+import os
 import re
 import shutil
 import sys
 import time
+import tomllib
 from pathlib import Path
 
 import shutil as _shutil  # for sessions dir cleanup
@@ -20,6 +23,8 @@ from . import lifecycle as lifecycle_mod
 from . import matcher, overrides, paths, telemetry, triage
 from . import sync as sync_mod
 from .config import load as load_config
+
+log = logging.getLogger(__name__)
 
 
 def _cmd_install(args: argparse.Namespace) -> int:
@@ -699,13 +704,147 @@ def _cmd_sync_skills(args: argparse.Namespace) -> int:
 _MIGRATE_BACKUP_SUFFIX = ".pre-migrate.bak"
 
 
-def _cmd_migrate_excludes(args: argparse.Namespace) -> int:
-    """Move catalog.exclude_names into skillOverrides, once.
+def _classify_exclude_names(
+    names: list[str], cfg
+) -> tuple[dict[str, str], list[str], dict[str, str]]:
+    """Split `exclude_names` into what `skillOverrides` can address and what it can't.
 
-    Deliberate, accepted consequence: the migrated names become
+    `skillOverrides` covers only entries whose `overrides.override_key()`
+    resolves to a real key — user (and extra-root) *skills*. It has no
+    concept of subagents or slash commands at all, and plugin skills resolve
+    to None (verified live: a namespaced key is silently ignored). By
+    contrast `catalog._accept()` filters `exclude_names` on the bare
+    invocable name regardless of kind, so one name can simultaneously mute a
+    skill and a same-named subagent. Migrating a name is only safe when
+    EVERY catalog entry that name resolves to is skillOverrides-addressable —
+    otherwise the migration would silently stop muting whichever isn't.
+
+    Scans with exclude_names cleared: scanning with the live list would
+    filter out the very entries this function needs to classify.
+    """
+    scan_cfg = dataclasses.replace(
+        cfg, catalog=dataclasses.replace(cfg.catalog, exclude_names=())
+    )
+    entries = catalog_mod.scan(scan_cfg)
+    by_invocable: dict[str, list] = {}
+    for entry in entries:
+        invocable = entry.invoke_name or entry.name
+        by_invocable.setdefault(invocable, []).append(entry)
+
+    migratable: dict[str, str] = {}
+    retained: list[str] = []
+    reasons: dict[str, str] = {}
+    for name in names:
+        matches = by_invocable.get(name, [])
+        if not matches:
+            retained.append(name)
+            reasons[name] = "no catalog entry on disk"
+            continue
+        blockers = [
+            e
+            for e in matches
+            if overrides.override_key(
+                kind=e.kind, namespace=e.namespace, path=e.path, name=e.name
+            )
+            is None
+        ]
+        if blockers:
+            shapes = sorted({f"{e.kind}/{e.namespace}" for e in blockers})
+            retained.append(name)
+            reasons[name] = (
+                f"not addressable via skillOverrides ({', '.join(shapes)})"
+            )
+            continue
+        migratable[name] = overrides.OFF
+    return migratable, retained, reasons
+
+
+def _rewrite_exclude_names_text(text: str, retained: list[str]) -> str:
+    """Rewrite `exclude_names` inside the live `[catalog]` table only.
+
+    Deliberately NOT a first-match-anywhere-in-the-file substitution — that
+    would also rewrite a comment, or a table other than `[catalog]`, that
+    happens to contain the same text, silently leaving the real list
+    unmigrated while the command reports success. `retained` (not `[]`) is
+    written back: entries skillOverrides cannot address stay in
+    exclude_names rather than being dropped.
+    """
+    array_text = "[" + ", ".join(json.dumps(n) for n in retained) + "]"
+    replacement_line = (
+        f"exclude_names = {array_text}"
+        "  # curated by `skill-advisor migrate-excludes`;"
+        " these are not addressable via skillOverrides"
+    )
+
+    table_re = re.compile(r"^\[catalog\]\s*(#.*)?$", re.MULTILINE)
+    match = table_re.search(text)
+    if match is None:
+        prefix = text if (not text or text.endswith("\n")) else text + "\n"
+        return prefix + f"\n[catalog]\nexclude_names = {array_text}\n"
+
+    table_start = match.end()
+    next_table = re.search(r"^\[", text[table_start:], re.MULTILINE)
+    table_end = table_start + next_table.start() if next_table else len(text)
+
+    table_body = text[table_start:table_end]
+    # `[^\]]` matches newlines with or without DOTALL — DOTALL only changes
+    # what `.` matches, and this pattern has no `.` in it.
+    key_re = re.compile(r"^exclude_names\s*=\s*\[[^\]]*\](\s*#.*)?$", re.MULTILINE)
+    if key_re.search(table_body):
+        new_body = key_re.sub(lambda _m: replacement_line, table_body, count=1)
+    else:
+        new_body = table_body.rstrip("\n") + f"\n{replacement_line}\n"
+
+    return text[:table_start] + new_body + text[table_end:]
+
+
+def _write_config_toml(cfg_path: Path, text: str) -> bool:
+    """Atomic, syntax-validated config.toml write.
+
+    Same contract as `overrides.write()` / `baseline._write_settings_effort`:
+    temp file, validated by re-parsing with `tomllib` before it touches the
+    real path, atomic `Path.replace()`, temp unlinked on any failure. Returns
+    `False` on any failure, leaving the file byte-identical — a bare
+    `write_text()` here would let an interrupted write truncate config.toml,
+    and every later `skill-advisor` invocation reads it via `tomllib.loads()`
+    with no exception handling, so a truncated file bricks the whole tool,
+    not just this command.
+    """
+    tmp = cfg_path.with_suffix(f".toml.tmp.{os.getpid()}")
+    try:
+        tomllib.loads(text)  # syntax-validate before it touches the real path
+        paths.ensure_dirs()
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(cfg_path)
+        return True
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        log.warning("config.toml write failed: %s", exc)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return False
+
+
+def _cmd_migrate_excludes(args: argparse.Namespace) -> int:
+    """Move catalog.exclude_names into skillOverrides, once — partially.
+
+    Only names that resolve to a skillOverrides-addressable catalog entry (a
+    user/extra-root skill) are migrated; see `_classify_exclude_names`.
+    Everything skillOverrides cannot reach — subagent names, slash-command
+    names, namespaced/plugin entries, and names matching nothing on disk —
+    is left in catalog.exclude_names rather than silently losing its mute.
+
+    Deliberate, accepted consequence for what IS migrated: those names become
     rotation-eligible. Some were muted for irrelevance and may come back.
     Hence the backups and the printed revert command — read the first
     `rotate --dry-run` after migrating rather than applying it blind.
+
+    A CLI verb, so it fails loudly: the whole verb is wrapped so any
+    unexpected failure (including a `ValueError` from `overrides.write()`,
+    which should be unreachable now that only addressable names are ever
+    forwarded to it, but is defended against regardless) is reported instead
+    of a bare traceback, and the message reminds the user `--revert` exists.
     """
     cfg_path = paths.config_file()
     settings_path = paths.settings_file()
@@ -725,10 +864,38 @@ def _cmd_migrate_excludes(args: argparse.Namespace) -> int:
         print("restored:\n  " + "\n  ".join(restored))
         return 0
 
+    try:
+        return _do_migrate_excludes(cfg_path, settings_path, cfg_bak, settings_bak)
+    except Exception as exc:
+        print(f"ERROR: migrate-excludes failed: {exc}")
+        if cfg_bak.is_file() or settings_bak.is_file():
+            print("Backups from this run may still be present:")
+            print(f"  {cfg_bak}")
+            print(f"  {settings_bak}")
+            print("Revert with: skill-advisor migrate-excludes --revert")
+        return 1
+
+
+def _do_migrate_excludes(
+    cfg_path: Path, settings_path: Path, cfg_bak: Path, settings_bak: Path
+) -> int:
     cfg = load_config()
     names = list(cfg.catalog.exclude_names)
     if not names:
         print("catalog.exclude_names is already empty; nothing to migrate")
+        return 0
+
+    migratable, retained, reasons = _classify_exclude_names(names, cfg)
+
+    if not migratable:
+        print(
+            f"nothing migratable: none of the {len(names)} exclude_names "
+            "entries are addressable via skillOverrides (subagents, slash "
+            "commands, namespaced/plugin entries, and names matching "
+            "nothing on disk can't be). config.toml is unchanged."
+        )
+        for name in names:
+            print(f"  retained: {name} — {reasons[name]}")
         return 0
 
     paths.ensure_dirs()
@@ -737,27 +904,45 @@ def _cmd_migrate_excludes(args: argparse.Namespace) -> int:
     if settings_path.is_file():
         settings_bak.write_bytes(settings_path.read_bytes())
 
-    if not overrides.write({n: overrides.OFF for n in names}):
+    try:
+        wrote = overrides.write(migratable)
+    except ValueError as exc:
+        print(f"ERROR: refused to write skillOverrides: {exc}")
+        print("config.toml left unchanged.")
+        return 1
+    if not wrote:
         print("ERROR: could not write skillOverrides; config.toml left unchanged")
         return 1
 
     text = cfg_path.read_text(encoding="utf-8") if cfg_path.is_file() else ""
-    text = re.sub(
-        r"exclude_names\s*=\s*\[[^\]]*\]",
-        "exclude_names = []  # migrated to skillOverrides; see `skill-advisor rotate`",
-        text,
-        count=1,
-        flags=re.DOTALL,
-    )
-    if "exclude_names" not in text:
-        text += "\n[catalog]\nexclude_names = []  # migrated to skillOverrides\n"
-    cfg_path.write_text(text, encoding="utf-8")
+    new_text = _rewrite_exclude_names_text(text, retained)
+    if not _write_config_toml(cfg_path, new_text):
+        print(
+            "ERROR: could not write config.toml; skillOverrides was already "
+            "updated with the entries below, but config.toml is unchanged."
+        )
+        print(f"config.toml backup: {cfg_bak}")
+        print("Revert with: skill-advisor migrate-excludes --revert")
+        return 1
 
-    print(f"migrated {len(names)} names from catalog.exclude_names into skillOverrides")
+    print(f"migrated {len(migratable)} of {len(names)} names into skillOverrides:")
+    for name in migratable:
+        print(f"  {name}")
+    if retained:
+        print(
+            f"retained {len(retained)} name(s) in catalog.exclude_names "
+            "(skillOverrides cannot address them):"
+        )
+        for name in retained:
+            print(f"  {name} — {reasons[name]}")
     print(f"backups: {cfg_bak}\n         {settings_bak}")
     print("revert with: skill-advisor migrate-excludes --revert")
-    print("NEXT: run `skill-advisor build`, then read `skill-advisor rotate` carefully "
-          "before applying — the migrated names are now rotation-eligible.")
+    print(
+        "NEXT: run `skill-advisor build`, then read `skill-advisor rotate` "
+        "carefully before applying — the migrated names are now "
+        "rotation-eligible. Retained names are unaffected and still muted "
+        "via exclude_names."
+    )
     return 0
 
 
