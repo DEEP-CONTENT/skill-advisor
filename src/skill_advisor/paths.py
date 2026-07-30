@@ -149,6 +149,16 @@ def baseline_file() -> Path:
     return cache_dir() / "baseline.json"
 
 
+def centroids_file() -> Path:
+    """Fixed-size online sketch of prompt embeddings (8 x 384 float32, ~12 KB).
+
+    Holds no prompt text and no per-prompt vectors — it is a lossy aggregate of
+    thousands of prompts, not a record of any one of them. Written only when
+    telemetry.events_enabled is already true; removed by `uninstall`.
+    """
+    return cache_dir() / "centroids.npz"
+
+
 def statusline_script() -> Path:
     """Generated POSIX-sh status line, registered in claudeskill-settings.json."""
     return config_dir() / "statusline.sh"

@@ -1,4 +1,5 @@
 """Tests for `skill-advisor uninstall` — removal of effort-signalling artifacts."""
+
 from __future__ import annotations
 
 import pytest
@@ -51,3 +52,16 @@ def test_uninstall_does_not_raise_when_effort_artifacts_missing():
     with pytest.raises(SystemExit) as exc_info:
         cli.main(["uninstall"])
     assert exc_info.value.code == 0
+
+
+def test_uninstall_removes_the_centroid_sketch(isolated_paths):
+    from skill_advisor import centroids, cli, paths
+
+    centroids.save(centroids.empty())
+    assert paths.centroids_file().is_file()
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["uninstall"])
+    assert exc_info.value.code == 0
+
+    assert not paths.centroids_file().is_file()
