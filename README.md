@@ -7,7 +7,7 @@
 [![CI](https://github.com/deep-content/skill-advisor/actions/workflows/ci.yml/badge.svg)](https://github.com/deep-content/skill-advisor/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
-[![Tests](https://img.shields.io/badge/tests-438%20passing-brightgreen.svg)](#development)
+[![Tests](https://img.shields.io/badge/tests-542%20passing-brightgreen.svg)](#development)
 [![Hook latency](https://img.shields.io/badge/latency-~0.3s%20warm-success.svg)](#latency-and-the-two-matcher-modes)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing)
 
@@ -37,6 +37,10 @@ No API keys are ever introduced. All LLM calls route through `claude -p` subproc
 - **Hallucination-guarded** — LLM-judge picks are intersected with the candidate shortlist; unknown names are dropped.
 - **Fail-safe by design** — any error or budget overrun exits silent so your prompt always reaches the model.
 - **Opt-in telemetry** — local JSONL with hashed prompts; `skill-advisor report` surfaces dead-skill detection, latency, and ingestion rate.
+- **Only recommends what Claude Code can invoke** — the catalog resolves each skill's
+  `skillOverrides` state before it's ever matched, and `skill-advisor rotate` can
+  maintain the active set itself against usage and semantic fit. See
+  `migrate-excludes` and `rotate` in the [CLI reference](#cli-reference).
 
 ---
 
@@ -70,7 +74,7 @@ No API keys are ever introduced. All LLM calls route through `claude -p` subproc
 ```
 skill-advisor/
 ├── src/skill_advisor/     Python package — the advisor runtime & CLI
-├── tests/                 pytest suite (438 tests, all pass, zero real-home leaks)
+├── tests/                 pytest suite (542 tests, all pass, zero real-home leaks)
 ├── examples/
 │   ├── config.toml        Commented default user config
 │   ├── claudeskill-settings.json  Reference UserPromptSubmit hook settings
@@ -371,6 +375,9 @@ skill-advisor replay examples/prompts.jsonl   # benchmark the pipeline on a prom
 skill-advisor hook < event.json      # manually invoke the hook with a synthetic event
 skill-advisor match "some prompt"    # evaluate the matcher against a single prompt
 skill-advisor report                 # pick frequency, dead-skill list, latency (telemetry must be on)
+skill-advisor migrate-excludes       # one-time: move catalog.exclude_names into skillOverrides
+skill-advisor rotate                 # dry run: propose active-skill-set swaps
+skill-advisor rotate --apply         # write the proposed swaps
 skill-advisor install                # re-run the shell/rc install (idempotent)
 skill-advisor uninstall              # remove alias, settings, cache; keep config.toml
 skill-advisor uninstall --purge-config
@@ -498,29 +505,167 @@ Flags:
 ### `skill-advisor doctor`
 
 End-to-end diagnosis. Checks: `claude` on PATH, settings file present, catalog
-present & parseable, catalog freshness vs source mtimes, log file. Exits non-zero
-if a required piece is missing. When `[effort] enabled = true`, also checks for
-`jq` (required by the status line), whether the status line script has been
-written, and whether an effort recommendation has been recorded yet — these
-three lines are silent (not printed at all) when the effort feature is off.
+present & parseable, catalog freshness vs source mtimes, log file. Then reports
+catalog *health*: how much of the disk the scanner can actually see (`pool_health()`
+in `catalog.py`) — how many `SKILL.md` files exist versus how many parse, how many
+catalog entries that yields, and how many of those are pickable (not `off` in
+`skillOverrides`). Exits non-zero if a required piece from the first block is
+missing. When `[effort] enabled = true`, also checks for `jq` (required by the
+status line), whether the status line script has been written, and whether an
+effort recommendation has been recorded yet — these three lines are silent (not
+printed at all) when the effort feature is off.
 
 Example output (effort feature enabled):
 
 ```
-claude on PATH : /home/you/.local/bin/claude
-settings file  : /home/you/.config/skill-advisor/claudeskill-settings.json
-catalog        : 938 entries
-freshness      : up-to-date
-log            : /home/you/.cache/skill-advisor/advisor.log (3412 bytes)
+claude on PATH   : /home/you/.local/bin/claude
+settings file    : /home/you/.config/skill-advisor/claudeskill-settings.json
+catalog (cached) : 938 entries
+freshness        : up-to-date
+log              : /home/you/.cache/skill-advisor/advisor.log (3412 bytes)
+skill files    : 1067 on disk, 851 parseable
+catalog (live) : 383 in pool, 112 pickable
+WARN: 216 SKILL.md files are unparseable (no YAML frontmatter) and invisible to the advisor. Examples: ai-engineer, analytics-tracking, angular, api-documenter, arm-cortex-expert, +211 more
+NOTE: 22 names are configured as excluded in catalog.exclude_names but remain enabled in Claude Code. To reconcile: edit config.toml and remove them from catalog.exclude_names.
 jq             : /usr/bin/jq
 statusline     : /home/you/.config/skill-advisor/statusline.sh
 effort state   : present
 ```
 
+(The first five lines' column width is computed dynamically from their longest
+label — `catalog (cached)` — so they don't line up with everything below, which
+uses its own fixed spacing; that's an artifact of the real output, not a typo
+here.)
+
 `jq` prints `MISSING (status line will render nothing)` when absent; `statusline`
 prints `not written (run install)` until you `skill-advisor install` after
 enabling the feature; `effort state` prints `none yet` until the hook has fired
 at least once with a recommendation to record.
+
+`catalog (cached)` is what `skill-advisor build` last wrote to disk; `catalog
+(live)` is a fresh scan run by `doctor` itself, so the two can disagree right
+after you add or remove a `SKILL.md` and before the next `build`. The `WARN`
+line is silent when there are zero unparseable files. The `NOTE` line fires
+when a name in `catalog.exclude_names` is still enabled in Claude Code — muted
+in the advisor but invocable; `skill-advisor migrate-excludes` reconciles the
+subset of these it can (see below), the doctor message itself only points at
+editing `config.toml` by hand.
+
+### `skill-advisor migrate-excludes [--revert] [--create-settings]`
+
+One-time, reversible move of `[catalog] exclude_names` (a `config.toml` list that
+only ever affected what the advisor *recommends*) into Claude Code's own
+`skillOverrides` (which controls what Claude Code actually *exposes*). Run this
+once before your first `rotate` — until you do, the two lists stay independent
+and the advisor keeps recommending skills Claude Code cannot invoke.
+
+**Partial by design, not a bug.** `skillOverrides` can only address a *user
+skill* (keyed by its directory name). It has no key for a built-in subagent, a
+slash command, or a plugin-namespaced skill — `catalog.exclude_names`, by
+contrast, mutes by bare name regardless of kind. `migrate-excludes` classifies
+every excluded name and moves only what `skillOverrides` can actually govern:
+
+- **Migrated** — the name resolves to exactly one user-skill catalog entry;
+  written as `"off"` into `skillOverrides`.
+- **Retained** — everything `skillOverrides` cannot address: a name matching no
+  catalog entry on disk, a built-in subagent, a slash command, or a
+  plugin-namespaced skill. Left behind in `catalog.exclude_names` (the array is
+  rewritten to contain only the retained names, with a comment explaining why)
+  so the mute isn't silently dropped.
+
+The command prints exactly which names moved and which stayed, and why each
+retained name couldn't move.
+
+**Deliberate, accepted consequence:** every name that migrates becomes
+rotation-eligible. Some were excluded for irrelevance, not quality, and the
+first `rotate` dry run afterward may propose bringing one back — read it before
+`--apply`ing rather than assuming it's safe.
+
+Safety:
+
+- **Backs up both files first.** `config.toml.pre-migrate.bak`, and either
+  `<settings>.pre-migrate.bak` (if the settings file already existed) or a
+  `<settings>.pre-migrate.absent` marker recording exactly which keys this run
+  added (if it didn't). `--revert` restores the backup byte-for-byte, or — for
+  a freshly-created settings file — removes exactly the keys this migration
+  added, deleting the file itself only if nothing else has written to it since.
+- **`--create-settings`** is required the first time the resolved settings file
+  (`paths.settings_file()`, honouring `SKILL_ADVISOR_SETTINGS_FILE`) doesn't
+  exist yet. This guard exists because writing `skillOverrides` into a file
+  your `claude --settings ...` invocation never actually reads is silently
+  inert — no error, nothing changes, and you'd have no way to tell. See the
+  `SKILL_ADVISOR_SETTINGS_FILE` row in the [environment variable
+  table](#configuration-reference) and `paths.settings_file()`'s own docstring,
+  which documents this exact trap.
+- Every write is atomic (temp file, JSON/TOML round-trip validated before the
+  real path is touched, `Path.replace()`) and never touches
+  `~/.claude/settings.json`.
+
+```bash
+skill-advisor migrate-excludes                    # one-time move
+skill-advisor migrate-excludes --create-settings   # first run, settings file absent yet
+skill-advisor migrate-excludes --revert            # undo, exactly
+```
+
+### `skill-advisor rotate [--apply] [--target N] [--limit N]`
+
+Scores the **rotation pool** — every catalog entry `skillOverrides` can actually
+govern, which today means user skills only — against usage and semantic fit,
+and proposes swapping low-scoring active skills for higher-scoring inactive
+ones. Subagents, slash commands, and plugin-namespaced skills are permanently
+enabled in Claude Code and outside `skillOverrides`'s reach, so they're excluded
+from the pool entirely; the summary line reports how many and why.
+
+**A dry run writes nothing.** Without `--apply`, `rotate` only prints the
+proposal — every settings write happens strictly after the printed output, and
+every early-return path (cold start, an empty pool, a proposal that would breach
+`rotation.min_active`) sits above that write.
+
+```bash
+skill-advisor rotate                 # dry run
+skill-advisor rotate --apply         # write the proposal
+skill-advisor rotate --target 60     # override rotation.target_active for this run
+skill-advisor rotate --limit 0       # print every PROMOTE/DEMOTE line, not just the default 20
+```
+
+The summary line always prints first, before scoring is even attempted, so a
+refusal below it is self-explanatory without a second run — illustrative
+example:
+
+```
+catalog 383 entries · excluded 271 unrotatable (plugin skills, slash commands, subagents — not addressable via skillOverrides) · pool 112 · active 47 · target 75 · sketch 214 prompts
+```
+
+Then, if scoring succeeds and something changed:
+
+```
+proposal: 4 promotion(s), 2 demotion(s) → 49 active
+  PROMOTE some-skill                                  semantic_fit=0.812 total=0.812 (free slot)
+  PROMOTE another-skill                                exploration slot: semantic_fit=0.734, no usage history
+  DEMOTE  stale-skill                                  total=0.104, outside the top 75; last invoked 62d ago
+
+(dry run — nothing written; rerun with --apply)
+```
+
+- **Reasons** name the signals behind each line: a promotion into a free slot
+  cites its `semantic_fit` and `total`; one that displaced an incumbent also
+  cites `pick_rate` and the displaced score it had to clear (plus the
+  `hysteresis` margin); one that filled an exploration slot instead says so —
+  a fixed fraction of slots reserved for high-`semantic_fit`, zero-usage
+  skills that bypass the merit contest entirely. A demotion cites its own
+  score and whether it was displaced on merit or by an exploration slot, plus
+  how long ago it was last invoked (or "never invoked").
+- **A skill invoked within `rotation.recency_days` is never demoted**, whatever
+  it scores — the recency shield.
+- **Truncation.** Each direction (`PROMOTE`/`DEMOTE`) prints up to `--limit`
+  lines (default 20) and then an explicit `… +N more promotions/demotions` —
+  never a silent cut. `--limit 0` shows every line.
+- When telemetry is off, the tool says so and scores on `semantic_fit` alone —
+  `pick_rate` and `invocation_rate` both need the event log.
+
+`--apply` writes only the entries that changed, merged into `skillOverrides` in
+the advisor's own settings file — never `~/.claude/settings.json` — using the
+same atomic write as `migrate-excludes`.
 
 ### `skill-advisor hook`
 
@@ -674,6 +819,45 @@ veto_cooldown_sessions = 10
 # Recommend `ultracode` when the parallelization detector says yes.
 # Never persisted — Claude Code treats ultracode as session-only by design.
 ultracode_nudge = true
+
+[rotation]
+# Reserved for a future automatic-rotation mode ("rotate every N sessions,
+# announced via systemMessage", mirroring the effort write-back). NOT
+# consulted by anything today — `skill-advisor rotate` runs unconditionally
+# regardless of this flag. The only way to rotate today is running the
+# command yourself. Off by default because the scoring is unvalidated: a
+# wrong rotation silently removes a skill you rely on.
+enabled = false
+
+# How many user skills `rotate` tries to keep active. Within the 50-100 band
+# the design settled on. Override per-run with `rotate --target N`.
+target_active = 75
+
+# Hard floor. A proposal that would leave fewer than this many skills active
+# is refused before anything is written.
+min_active = 25
+
+# Score margin a candidate must clear over the incumbent it would displace,
+# so near-tied skills don't swap back and forth on every run.
+hysteresis = 0.05
+
+# Fraction of target_active reserved for high-semantic_fit, zero-usage
+# skills — skills the usage data alone could never recommend. These bypass
+# the hysteresis check entirely; that's the point of the reservation.
+exploration_fraction = 0.10
+
+# A skill invoked within this many days is never demoted, whatever it scores.
+recency_days = 30
+
+# Cold-start floor for the centroid sketch (see "The centroid sketch" under
+# Telemetry and usage reports). Below this many observed prompts, `rotate`
+# refuses to run rather than score against an unformed sketch.
+min_observed_prompts = 200
+
+# Declared but not wired up today: the sketch is always 8 centroids
+# (`centroids.DEFAULT_K`) regardless of this value. Left here as the
+# intended knob for when that's made configurable.
+centroid_count = 8
 ```
 
 Environment variables override path-derived defaults (useful for tests / multi-user
@@ -1585,6 +1769,41 @@ rm ~/.cache/skill-advisor/advisor.events.jsonl ~/.cache/skill-advisor/telemetry.
 
 `skill-advisor uninstall` also removes both files.
 
+### The centroid sketch (`centroids.npz`)
+
+`skill-advisor rotate` needs to score a skill that has never been used — usage
+data alone can never recommend it — by measuring how well it fits the kind of
+work you actually do. Since prompts are hashed and unrecoverable everywhere
+else in this project, the advisor keeps a small **online sketch** of the
+prompt embeddings themselves at `~/.cache/skill-advisor/centroids.npz`
+instead: 8 running centroids in the same 384-dim embedding space the matcher
+already uses. Each prompt nudges its nearest centroid (or claims a free one,
+up to 8) rather than being stored.
+
+Privacy properties, each verifiable directly against the code:
+
+- **Fixed size.** 8 × 384 float32 vectors plus small bookkeeping —
+  independent of how many prompts have been observed. Measured on disk:
+  roughly 12-13 KB, and it never grows past that.
+- **No prompt text, ever.** Only the already-computed embedding vector is
+  folded in (`centroids.observe()`); the prompt string itself never reaches
+  this code path.
+- **No per-prompt vectors either.** A prompt is *merged* into its nearest
+  centroid's running average, not appended anywhere — the file holds 8
+  aggregates, never a growing list. It is a lossy summary of thousands of
+  prompts, not a record of any individual one.
+- **Gated on the same flag as the rest of telemetry.** Written only when
+  `[telemetry] events_enabled` is already `true` — a single check in the
+  `UserPromptSubmit` hook, deliberately the *only* thing that decides whether
+  this runs, so there's no second, independently-maintained flag that could
+  drift out of sync with the rest of the opt-in telemetry story.
+- **Removed by `skill-advisor uninstall`**, alongside the rest of the cache.
+
+Below `rotation.min_observed_prompts` (default 200) observed prompts, `rotate`
+refuses to run rather than score against a sketch that hasn't seen enough of
+your work to mean anything yet — see the `[rotation]` block in [Configuration
+reference](#configuration-reference).
+
 ---
 
 ## Troubleshooting
@@ -1683,7 +1902,7 @@ Code itself uses.
 
 PRs and issues are welcome. Before opening a PR:
 
-- Run `make test` — all 438 tests should pass on Linux and macOS, Python 3.11 / 3.12.
+- Run `make test` — all 542 tests should pass on Linux and macOS, Python 3.11 / 3.12.
 - Keep changes focused. Match the existing [Conventional Commits](https://www.conventionalcommits.org/) style (`feat:`, `fix:`, `docs:`, `chore:`, …).
 - For larger features or behavioral changes, open an issue first so we can align on scope before you invest time.
 
@@ -1704,7 +1923,7 @@ uv sync --extra dev
 ### Running tests
 
 ```bash
-uv run pytest                        # 438 tests
+uv run pytest                        # 542 tests
 uv run pytest tests/test_hook.py -v  # single file
 uv run pytest --cov=skill_advisor    # with coverage
 ```
@@ -1744,7 +1963,14 @@ skill-advisor/
 │   ├── paths.py               XDG-aware path resolution (single source of truth)
 │   ├── config.py              TOML config + dataclass schema + defaults
 │   ├── builtins.py            Hardcoded subagents + slash commands
-│   ├── catalog.py             Scan SKILL.md + builtins, save/load catalog.json
+│   ├── catalog.py             Scan SKILL.md + builtins, save/load catalog.json,
+│   │                            resolve enabled/invoke_name, pool_health()
+│   ├── overrides.py           Sole owner of skillOverrides: directory-name join key,
+│   │                            merged read, atomic write, migrate/revert support
+│   ├── centroids.py           Fixed-size online sketch of prompt embeddings (rotation's
+│   │                            semantic_fit signal); knows nothing about skills
+│   ├── rotate.py              Score the rotation pool and propose promote/demote swaps;
+│   │                            pure functions, no I/O
 │   ├── index.py               fastembed embeddings + cosine top-K + hash check
 │   ├── triage.py              Cheap-prompt detector
 │   ├── judge.py               `claude -p` subprocess wrapper, JSON schema, hallucination guard
@@ -1768,12 +1994,13 @@ skill-advisor/
 │   ├── sync.py                Bundled-skills → ~/.claude/skills copy logic
 │   └── cli.py                 argparse dispatcher: install / uninstall / build / replay /
 │                                doctor / sync-skills / lifecycle / hook /
-│                                match / report / posttooluse / stop
+│                                match / report / posttooluse / stop /
+│                                migrate-excludes / rotate
 │
 ├── tests/
 │   ├── conftest.py            Auto-use isolated_paths fixture (per-test tempdirs)
 │   ├── fixtures/              fake_claude_home/, prompts.jsonl
-│   └── test_*.py              438 tests across all modules
+│   └── test_*.py              542 tests across all modules
 │
 ├── examples/
 │   ├── config.toml            Default user config (commented)
@@ -1806,6 +2033,9 @@ Per-user state (created by the installer, not tracked in git):
 ├── effort.json                 Latest recommendation (only when [effort] enabled)
 ├── observed-effort.json        Live effort last seen by the status line (the sensor)
 ├── baseline.json                Write-back window, history, veto/cooldown state
+├── centroids.npz                Fixed-size prompt-embedding sketch for `rotate`
+│                                  (only when [telemetry] events_enabled; see
+│                                  "The centroid sketch" under Telemetry and usage reports)
 └── sessions/
     ├── <session_id>.json       Per-session lifecycle state
     └── <session_id>.turn.json  Per-turn ephemeral tool/subagent record (auto-advance)
@@ -1827,10 +2057,14 @@ Skills copied into `~/.claude/skills/` via `sync-skills` are **not** removed by
 `uninstall` (they are indistinguishable from skills you installed by hand).
 Remove them by name if you want to.
 
-`uninstall` deletes `claudeskill-settings.json` (dropping any `effortLevel` baseline the
-advisor had written), plus the catalog, embeddings, log, and telemetry files. It also
-removes the effort feature's own state — `~/.cache/skill-advisor/effort.json`,
-`observed-effort.json`, `baseline.json`, and `~/.config/skill-advisor/statusline.sh`.
+`uninstall` deletes `claudeskill-settings.json` (dropping any `effortLevel` baseline
+*and* any `skillOverrides` that `migrate-excludes` or `rotate --apply` had written
+there), plus the catalog, embeddings, log, and telemetry files. It also removes the
+effort feature's own state — `~/.cache/skill-advisor/effort.json`,
+`observed-effort.json`, `baseline.json` — and `centroids.npz`, the rotation sketch,
+and `~/.config/skill-advisor/statusline.sh`. `config.toml` — including any names
+`migrate-excludes` left behind in `exclude_names` — is kept unless `--purge-config`
+is given.
 
 ---
 
