@@ -106,6 +106,41 @@ def test_every_proposal_carries_a_reason():
         assert prop.reason_by_name[s.entry.name]
 
 
+def test_negative_exploration_fraction_is_clamped_not_runaway():
+    """F8: `exploration_fraction` had no bounds validation.
+    `round(target * exploration_fraction)` goes negative for an
+    out-of-range value (e.g. a hand-edited config.toml with
+    exploration_fraction=-0.1), and `unused[:explore_slots]` then reads as
+    a NEGATIVE-index slice — "all but the last N" — which for a large pool
+    of zero-usage skills promotes nearly all of them. `min_active` is a
+    floor on the RESULT, not on this arithmetic, so it cannot catch it.
+    Measured (unclamped): target_active=75, exploration_fraction=-0.1 ->
+    explore_slots=-8 -> 222 promotions, ending at 292 active against a
+    target of 75."""
+    cfg = RotationConfig(
+        target_active=10,
+        min_active=0,
+        hysteresis=0.0,
+        exploration_fraction=-0.1,
+        recency_days=0,
+    )
+    incumbents = [_entry(f"inc{i}", enabled=True) for i in range(3)]
+    candidates = [_entry(f"cand{i:02d}", enabled=False) for i in range(20)]
+    entries = incumbents + candidates
+    fits = [0.50, 0.49, 0.48] + [0.40 - i * 0.01 for i in range(20)]
+
+    scored = rotate.score_pool(entries, _emb(fits), _sketch(), {}, cfg)
+    prop = rotate.propose(scored, cfg)
+
+    # Clamped to exploration_fraction=0.0 -> explore_slots=0, merit_slots=10
+    # -> exactly the top-10-by-fit chosen: 3 incumbents + the 7 highest-fit
+    # candidates. Without the clamp this promotes 19 of the 20 candidates.
+    assert len(prop.promote) == 7
+    assert len(prop.demote) == 0
+    resulting = len(incumbents) + len(prop.promote) - len(prop.demote)
+    assert resulting == 10
+
+
 def test_exploration_driven_demotion_reason_distinguishes_cause():
     """When exploration picks cause a demotion of an incumbent ranking in the
     top N by merit, the reason must not falsely claim it is 'outside the top N'."""

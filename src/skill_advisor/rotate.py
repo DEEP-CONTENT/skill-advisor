@@ -112,7 +112,17 @@ def propose(scored: list[Scored], cfg: RotationConfig) -> Proposal:
     ranked = sorted(scored, key=lambda s: s.total, reverse=True)
     target = max(int(cfg.target_active), 0)
 
-    explore_slots = int(round(target * cfg.exploration_fraction))
+    # F8: clamp defensively. An out-of-range exploration_fraction (e.g. a
+    # negative value from a hand-edited config.toml) turns explore_slots
+    # negative, and `unused[:explore_slots]` below then becomes a
+    # negative-index slice — Python silently reads that as "all but the
+    # last N", which for a large `unused` list promotes nearly everything
+    # with zero usage. Measured with exploration_fraction=-0.1 and
+    # target_active=75: explore_slots=-8, 222 promotions, ending at 292
+    # active against a target of 75. `min_active` is a floor on the
+    # RESULT, not on this arithmetic, so it cannot catch it.
+    exploration_fraction = min(max(cfg.exploration_fraction, 0.0), 1.0)
+    explore_slots = int(round(target * exploration_fraction))
     merit_slots = max(target - explore_slots, 0)
 
     chosen: list[Scored] = list(ranked[:merit_slots])
