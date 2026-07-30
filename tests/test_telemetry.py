@@ -77,7 +77,8 @@ def test_event_schema_has_expected_fields(isolated_paths):
     [event] = _read_events(isolated_paths)
     for key in (
         "schema", "ts", "session_sha256", "prompt_sha256", "prompt_words",
-        "triage_skipped", "duration_ms", "phase", "phase_source", "judge_used", "picks",
+        "triage_skipped", "duration_ms", "phase", "phase_source", "judge_used",
+        "judge_failure", "picks",
     ):
         assert key in event, f"missing field: {key}"
     assert event["phase"] == "review"
@@ -85,6 +86,30 @@ def test_event_schema_has_expected_fields(isolated_paths):
     assert event["judge_used"] is True
     assert event["triage_skipped"] is True
     assert event["picks"][0]["score"] == 0.5
+
+
+def test_judge_failure_recorded_when_given(isolated_paths):
+    telemetry.record(
+        prompt="p",
+        session_id="s",
+        picks=[_pick("a")],
+        judge_used=False,
+        judge_failure="timeout",
+        config=_on_config(prompt_hash_salt="fixed"),
+    )
+    [event] = _read_events(isolated_paths)
+    assert event["judge_failure"] == "timeout"
+
+
+def test_judge_failure_defaults_to_none_when_omitted(isolated_paths):
+    telemetry.record(
+        prompt="p",
+        session_id="s",
+        picks=[_pick("a")],
+        config=_on_config(prompt_hash_salt="fixed"),
+    )
+    [event] = _read_events(isolated_paths)
+    assert event["judge_failure"] is None
 
 
 def test_prompt_hash_stable_same_salt(isolated_paths):
