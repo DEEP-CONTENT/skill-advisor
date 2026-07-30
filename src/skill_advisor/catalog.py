@@ -180,9 +180,10 @@ def scan(
     out: list[CatalogEntry] = []
 
     def _accept(entry: CatalogEntry) -> None:
-        if entry.name in exclude:
+        invocable = entry.invoke_name or entry.name
+        if invocable in exclude:
             return
-        key = (entry.kind, entry.invoke_name or entry.name)
+        key = (entry.kind, invocable)
         if key in seen:
             return
         seen.add(key)

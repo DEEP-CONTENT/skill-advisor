@@ -301,6 +301,75 @@ def test_from_json_raises_on_missing_required_field():
         raise AssertionError("expected TypeError for missing required field")
 
 
+def test_exclude_names_by_bare_name_drops_only_user_skill(isolated_paths):
+    """A user skill and a same-frontmatter-named plugin skill both exist.
+    Excluding the bare frontmatter name (as a user would write for the
+    user-level skill) must drop only the user one — the plugin skill's
+    invocable identity is namespaced and distinct."""
+    user_d = isolated_paths["claude_home"] / "skills" / "brainstorming"
+    user_d.mkdir(parents=True)
+    (user_d / "SKILL.md").write_text(
+        '---\nname: brainstorming\ndescription: "User brainstorming skill."\n---\n',
+        encoding="utf-8",
+    )
+    plugin_d = (
+        isolated_paths["claude_home"]
+        / "plugins"
+        / "cache"
+        / "official"
+        / "superpowers"
+        / "6.2.0"
+        / "skills"
+        / "brainstorming"
+    )
+    plugin_d.mkdir(parents=True)
+    (plugin_d / "SKILL.md").write_text(
+        '---\nname: brainstorming\ndescription: "Plugin brainstorming skill."\n---\n',
+        encoding="utf-8",
+    )
+
+    cfg = Config(catalog=CatalogConfig(exclude_names=("brainstorming",)))
+    entries = catalog.scan(cfg, overrides_table={})
+    by_invoke = {e.invoke_name: e for e in entries}
+
+    assert "brainstorming" not in by_invoke
+    assert "superpowers:brainstorming" in by_invoke
+
+
+def test_exclude_names_by_namespaced_key_drops_only_plugin_skill(isolated_paths):
+    """Excluding the namespaced invoke_name (as a user would write for the
+    plugin skill) must drop only the plugin skill, leaving the same-named
+    user skill untouched."""
+    user_d = isolated_paths["claude_home"] / "skills" / "brainstorming"
+    user_d.mkdir(parents=True)
+    (user_d / "SKILL.md").write_text(
+        '---\nname: brainstorming\ndescription: "User brainstorming skill."\n---\n',
+        encoding="utf-8",
+    )
+    plugin_d = (
+        isolated_paths["claude_home"]
+        / "plugins"
+        / "cache"
+        / "official"
+        / "superpowers"
+        / "6.2.0"
+        / "skills"
+        / "brainstorming"
+    )
+    plugin_d.mkdir(parents=True)
+    (plugin_d / "SKILL.md").write_text(
+        '---\nname: brainstorming\ndescription: "Plugin brainstorming skill."\n---\n',
+        encoding="utf-8",
+    )
+
+    cfg = Config(catalog=CatalogConfig(exclude_names=("superpowers:brainstorming",)))
+    entries = catalog.scan(cfg, overrides_table={})
+    by_invoke = {e.invoke_name: e for e in entries}
+
+    assert "superpowers:brainstorming" not in by_invoke
+    assert "brainstorming" in by_invoke
+
+
 def test_pool_health_unparseable_count_is_per_file_not_deduped(isolated_paths, tmp_path):
     """When two roots contain unparseable files with the same directory name,
     the per-file count must be used for arithmetic, not the deduplicated count."""
