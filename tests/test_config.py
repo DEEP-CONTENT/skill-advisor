@@ -6,7 +6,7 @@ def test_defaults_when_no_config_file(isolated_paths):
     assert cfg.matcher.model.startswith("claude-haiku")
     assert cfg.matcher.max_candidates == 15
     assert cfg.matcher.max_picks == 3
-    assert cfg.matcher.budget_seconds == 4.0
+    assert cfg.matcher.budget_seconds == 8.0
     assert cfg.matcher.use_judge is False
     assert cfg.matcher.min_embedding_score == 0.35
     assert cfg.catalog.extra_roots == ()
@@ -45,11 +45,12 @@ def test_parallelization_config_defaults(isolated_paths):
     cfg = config.load()
     assert cfg.parallelization.enabled is False
     assert cfg.parallelization.min_tasks == 3
-    assert cfg.parallelization.judge_timeout_seconds == 20.0
+    assert cfg.parallelization.judge_timeout_seconds == 5.0
 
 
 def test_parallelization_config_parses_toml(tmp_path):
     from skill_advisor.config import load
+
     path = tmp_path / "config.toml"
     path.write_text(
         """
@@ -80,10 +81,7 @@ def test_effort_defaults_are_conservative():
 def test_effort_parsed_from_toml(tmp_path):
     p = tmp_path / "config.toml"
     p.write_text(
-        "[effort]\n"
-        "enabled = true\n"
-        "statusline = false\n"
-        "write_back_after_sessions = 3\n",
+        "[effort]\nenabled = true\nstatusline = false\nwrite_back_after_sessions = 3\n",
         encoding="utf-8",
     )
     cfg = config.load(p)
@@ -99,3 +97,37 @@ def test_effort_section_absent_yields_defaults(tmp_path):
     p.write_text("[matcher]\nuse_judge = true\n", encoding="utf-8")
     cfg = config.load(p)
     assert cfg.effort.enabled is False
+
+
+def test_judge_subprocess_timeout_is_strictly_under_the_hook_alarm():
+    """Two independent timeout layers guard the hot path:
+
+      * judge.py:78    subprocess timeout = max(budget_seconds - 0.5, 0.5)
+      * hook.py:133    SIGALRM            = int(budget_seconds + 0.5)
+
+    The alarm aborts the whole hook and returns silent, bypassing the
+    embedding fallback entirely. If it ever fires first, the fallback added in
+    this plan is dead code. Pin the ordering.
+    """
+    from skill_advisor.config import Config
+
+    budget = Config().matcher.budget_seconds
+    judge_timeout = max(budget - 0.5, 0.5)
+    hook_alarm = max(int(budget + 0.5), 1)
+    assert judge_timeout < hook_alarm
+
+
+def test_shipped_defaults_keep_doctor_quiet():
+    """budget_seconds must cover judge_timeout_seconds + 3 at the shipped values,
+    or a fresh install warns on its first `doctor` run."""
+    from skill_advisor.config import Config
+
+    cfg = Config()
+    assert cfg.matcher.budget_seconds >= cfg.parallelization.judge_timeout_seconds + 3.0
+
+
+def test_budget_default_is_eight_seconds():
+    from skill_advisor.config import Config
+
+    assert Config().matcher.budget_seconds == 8.0
+    assert Config().parallelization.judge_timeout_seconds == 5.0
