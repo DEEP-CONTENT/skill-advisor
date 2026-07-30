@@ -1171,10 +1171,19 @@ doctor` will warn if `budget_seconds < judge_timeout_seconds + 3`.
 
 #### Why it's opt-in
 
-The detector uses `claude -p`, which carries Claude Code's ~15 s session-startup
-cost. That's why `budget_seconds` must be bumped well above the default 4.0 —
-the `doctor` check enforces `>= judge_timeout_seconds + 3` so the subprocess
-has room to actually return a verdict.
+The detector makes its own `claude -p` call (`parallelization.detect()`, the same
+subprocess mechanism as the main judge), carrying the same session-startup cost —
+elsewhere in this doc measured at roughly 7-12 s for the main judge. `doctor` enforces
+`matcher.budget_seconds >= parallelization.judge_timeout_seconds + 3` whenever
+`[parallelization]` is enabled, and the shipped defaults (`budget_seconds = 8.0`,
+`judge_timeout_seconds = 5.0`) already satisfy that relationship exactly, so a fresh
+install won't trigger the warning. But 5 s is tight against a ~7-12 s subprocess: at the
+shipped defaults the detector will often time out and return `None` before it gets an
+answer. That's an accepted trade, not a bug — a timeout here degrades gracefully (no
+parallelization picks; the lifecycle still advances to `implementation` normally) rather
+than blocking anything. It's why the example above bumps both `budget_seconds` and
+`judge_timeout_seconds` well past the shipped defaults — giving the detector real room to
+answer is something you opt into deliberately, not what you get out of the box.
 
 #### Turning it off
 
