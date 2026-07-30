@@ -191,8 +191,22 @@ def propose(scored: list[Scored], cfg: RotationConfig) -> Proposal:
     # vs demotions due to low merit score.
     top_target_names = {ranked[i].entry.name for i in range(min(target, len(ranked)))}
 
-    # Identify exploration promotions for use in demotion reasons.
-    explore_demotions = [e for e in prop.promote if e.entry.name in explore_names]
+    # Every entry occupying an exploration slot — whether filling it
+    # required an actual promotion (the entry wasn't already active) or not
+    # (it was already an incumbent, so the explore step added it to
+    # `chosen` without ever touching `prop.promote`). F9: the previous
+    # version derived this from `prop.promote` alone
+    # (`explore_demotions = [e for e in prop.promote if ...]`), which is
+    # EMPTY whenever the explore slot happens to land on an already-enabled
+    # skill. When that happens, a true top-target incumbent bumped out of
+    # `chosen` by that same explore slot still gets demoted (chosen has
+    # merit_slots + explore_slots entries, not `target`, so a low-fit
+    # explore pick displaces a real top-target member) — but with
+    # `explore_demotions` empty, the branch below never fired and the
+    # incumbent was mislabeled "outside the top N" while, by construction,
+    # ranking IN the top N. Measured: an incumbent at merit rank 10 of 10
+    # printed "total=0.810, outside the top 10".
+    explore_entries = [by_name[n] for n in explore_names]
 
     for s in prop.demote:
         last = (
@@ -205,8 +219,8 @@ def propose(scored: list[Scored], cfg: RotationConfig) -> Proposal:
         # displaced by an exploration slot (a reserved discovery slot that
         # takes priority over merit ranking). Distinguish this from the
         # normal "low merit score" case.
-        if s.entry.name in top_target_names and explore_demotions:
-            lowest_explore = min(explore_demotions, key=lambda e: e.total)
+        if s.entry.name in top_target_names and explore_entries:
+            lowest_explore = min(explore_entries, key=lambda e: e.total)
             prop.reason_by_name[s.entry.name] = (
                 f"displaced by exploration slot ({lowest_explore.entry.name}: "
                 f"semantic_fit={lowest_explore.semantic_fit:.3f}); "

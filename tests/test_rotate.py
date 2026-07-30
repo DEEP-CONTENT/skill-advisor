@@ -188,3 +188,59 @@ def test_exploration_driven_demotion_reason_distinguishes_cause():
                 f"{demoted.entry.name} ranks #{rank + 1} (top 10) but doesn't mention "
                 f"exploration in reason: {reason}"
             )
+
+
+def test_demotion_reason_true_when_explore_slot_claimed_by_an_incumbent():
+    """F9: the same defect class as above, one layer deeper. The old code
+    derived its explore-attribution from `prop.promote` alone
+    (`explore_demotions = [e for e in prop.promote if e.entry.name in
+    explore_names]`), which is EMPTY whenever the exploration slot happens
+    to land on a skill that is ALREADY enabled — filling the slot adds it
+    to `chosen` without any promotion ever occurring. Here "X" wins the
+    single exploration slot (highest fit among zero-usage entries) but is
+    already an incumbent, so `prop.promote` stays empty even though "Y" — a
+    true top-10-by-total incumbent — gets bumped out of `chosen` by that
+    same slot and demoted. The old code's `... and explore_demotions` guard
+    was falsy, so it fell through to the merit branch and printed a false
+    "outside the top 10" for an incumbent that, by construction, ranks IN
+    the top 10."""
+    cfg = RotationConfig(
+        target_active=10,
+        min_active=0,
+        hysteresis=0.0,
+        exploration_fraction=0.1,  # 1 exploration slot, 9 merit slots
+        recency_days=0,
+    )
+    merit = [_entry(f"merit{i}", enabled=True) for i in range(9)]
+    # Y: incumbent with a little real usage — ranks #10 by total, just
+    # below the 9 merit entries, so it belongs in target_active=10 by
+    # merit alone.
+    y = _entry("Y", enabled=True)
+    # X: incumbent, ZERO usage — the only "unused" entry left once the
+    # merit slots are excluded, so it wins the exploration slot even
+    # though it is already active and no promotion results.
+    x = _entry("X", enabled=True)
+    # bigpicker: disabled, real usage — exists only to set max_picks so
+    # Y's pick_rate is a small fraction rather than automatically 1.0.
+    bigpicker = _entry("bigpicker", enabled=False)
+
+    entries = merit + [y, x, bigpicker]
+    fits = [0.90 - i * 0.01 for i in range(9)] + [0.65, 0.60, 0.01]
+    stats = {
+        "Y": {"picks": 1, "invocations": 0, "last_invoked_days": None},
+        "bigpicker": {"picks": 10, "invocations": 0, "last_invoked_days": None},
+    }
+
+    scored = rotate.score_pool(entries, _emb(fits), _sketch(), stats, cfg)
+    prop = rotate.propose(scored, cfg)
+
+    # Preconditions matching the scenario's whole point: the explore slot
+    # is claimed by an already-active skill, so no promotion happens at
+    # all, yet Y — ranking #10 of 12 by total — still gets demoted.
+    assert prop.promote == []
+    assert [s.entry.name for s in prop.demote] == ["Y"]
+
+    reason = prop.reason_by_name["Y"]
+    assert "outside the top 10" not in reason, reason
+    assert "displaced by exploration slot" in reason
+    assert "X" in reason
