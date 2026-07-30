@@ -163,6 +163,36 @@ def test_judge_failure_is_recorded(isolated_paths):
     assert lines[-1]["judge_used"] is False
 
 
+def test_budget_exceeded_records_a_countable_telemetry_event(isolated_paths):
+    """An alarm kill must not be invisible in events.jsonl — no row at all is
+    indistinguishable from the hook never firing. It needs its own marker,
+    distinct from every judge.FAILURE_* value."""
+    _enable_telemetry_in_config(isolated_paths)
+    with patch("skill_advisor.hook.matcher.pick", side_effect=hook_mod._BudgetExceeded):
+        out = _run_with_stdin({"prompt": "a substantive prompt that should match", "session_id": "s1"})
+
+    assert out == ""
+    events_path = isolated_paths["cache_home"] / "advisor.events.jsonl"
+    assert events_path.is_file()
+    lines = [
+        json.loads(line) for line in events_path.read_text().splitlines() if line.strip()
+    ]
+    assert len(lines) == 1
+    assert lines[-1]["judge_failure"] == "budget_exceeded"
+    assert lines[-1]["judge_used"] is False
+    assert lines[-1]["picks"] == []
+
+
+def test_budget_exceeded_writes_no_event_when_telemetry_disabled(isolated_paths):
+    # No config.toml → events_enabled defaults to False.
+    with patch("skill_advisor.hook.matcher.pick", side_effect=hook_mod._BudgetExceeded):
+        out = _run_with_stdin({"prompt": "a substantive prompt that should match", "session_id": "s1"})
+
+    assert out == ""
+    events_path = isolated_paths["cache_home"] / "advisor.events.jsonl"
+    assert not events_path.exists()
+
+
 def test_judge_used_is_true_when_the_judge_actually_ran(isolated_paths):
     _enable_telemetry_and_judge(isolated_paths)
     entry = CatalogEntry(kind="skill", name="brainstorming", namespace="user", description="...")

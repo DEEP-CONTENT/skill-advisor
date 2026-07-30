@@ -28,6 +28,13 @@ FAILURE_SUBPROCESS = "subprocess_error"
 FAILURE_EXIT = "exit_nonzero"
 FAILURE_UNPARSEABLE = "unparseable"
 
+# Not produced by rank() itself — set by hook.py when the whole-hook SIGALRM
+# fires before the judge (or anything else downstream of it) returns a
+# verdict. Defined here, alongside the judge's own FAILURE_* values, so every
+# string that can land in the `judge_failure` telemetry field lives in one
+# place and is guaranteed not to collide.
+FAILURE_BUDGET_EXCEEDED = "budget_exceeded"
+
 
 @dataclass(frozen=True)
 class Pick:

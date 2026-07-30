@@ -239,14 +239,24 @@ def test_rank_on_timeout_yields_no_picks():
 def test_judge_timeout_is_strictly_under_the_hook_alarm():
     """Two independent timeout layers guard the hot path:
 
-      * judge.py:106-109  subprocess timeout = max(budget_seconds - 0.5, 0.5)
-      * hook.py:133       SIGALRM            = max(int(budget_seconds + 0.5), 1)
+      * judge.rank()'s subprocess timeout = max(budget_seconds - 0.5, 0.5)   (judge.py:106-110)
+      * hook.alarm_seconds(cfg)           = max(int(budget_seconds + 0.5), 1) (hook.py)
 
     The alarm aborts the whole hook and returns silent, bypassing the embedding
     fallback entirely. If it ever fires first, the fallback is dead code. Pin the
-    ordering by capturing the real timeout passed to subprocess.run.
+    ordering by capturing the real timeout passed to subprocess.run *and* calling
+    hook's real `alarm_seconds()` function — not a restated copy of its formula —
+    so an edit to either side of the invariant is caught.
+
+    The margin between the two layers is `round(b) - (b - 0.5)`, which ranges
+    over (0, 1] depending on budget_seconds's fractional part; 1.0/4.0/8.0/25.0
+    all happen to land on the maximal 0.5s margin, so 2.49 and 8.4 are included
+    to exercise the thin end of that range too. Only strict ordering is
+    asserted — there's no guaranteed margin floor, and there shouldn't be one.
     """
     import subprocess
+
+    from skill_advisor import hook
 
     captured = {}
 
@@ -254,7 +264,7 @@ def test_judge_timeout_is_strictly_under_the_hook_alarm():
         captured["t"] = timeout
         raise subprocess.TimeoutExpired(cmd=["claude"], timeout=timeout)
 
-    for budget in (1.0, 4.0, 8.0, 25.0):
+    for budget in (1.0, 2.49, 4.0, 8.0, 8.4, 25.0):
         captured.clear()
         cfg = Config(matcher=MatcherConfig(budget_seconds=budget))
         with (
@@ -263,8 +273,7 @@ def test_judge_timeout_is_strictly_under_the_hook_alarm():
         ):
             judge.rank("prompt", _candidates(), cfg)
 
-        # hook.py's real formula at line 133
-        hook_alarm = max(int(budget + 0.5), 1)
+        hook_alarm = hook.alarm_seconds(cfg)
         assert captured["t"] < hook_alarm, (
             f"judge timeout {captured['t']} must be strictly less than "
             f"hook alarm {hook_alarm} for budget {budget}"
