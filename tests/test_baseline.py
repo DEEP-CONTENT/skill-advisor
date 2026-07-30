@@ -669,6 +669,92 @@ def test_veto_cooldown_is_consumed_by_session_boundaries_and_expires():
     assert baseline.maybe_write(cfg, launch_level="xhigh") == "low"
 
 
+def test_alternating_sessions_each_charge_the_cooldown_only_once():
+    """The cooldown counts DISTINCT sessions, not session *changes*.
+
+    Tracking only the last-seen session id made `s1,s2,s1,s2,...` decrement on
+    every single Stop, because the previous id always differed from the current
+    one. Measured before this fix: 10 alternating turns across only 2 distinct
+    sessions drained a 10-session cooldown to 1. Concurrent Claude Code sessions
+    across repos produce exactly that interleaving, so the documented
+    "suppressed for N sessions" guarantee silently did not hold.
+
+    Two distinct sessions may consume at most two units, however they interleave.
+    """
+    n = 10
+    cfg = _cfg(veto_cooldown_sessions=n)
+    baseline.note_observation("s1", "xhigh", cfg)
+    baseline.note_observation("s1", "medium", cfg)  # veto → cooldown armed at 10, by s1
+
+    for _ in range(10):
+        baseline.decrement_cooldown("s2")
+        baseline.decrement_cooldown("s3")
+
+    # s1 armed it (never charges), s2 and s3 charge once each → 10 - 2 = 8.
+    assert baseline._load()["veto_cooldown_remaining"] == n - 2
+    _fill("low", 3)
+    assert baseline.maybe_write(cfg, launch_level="xhigh") is None
+
+
+def test_rearming_the_cooldown_clears_previously_charged_sessions():
+    """A fresh veto starts a fresh cooldown. Sessions that charged the previous
+    one must be able to charge the new one, or a long-lived session id would be
+    permanently exempt from every future cooldown."""
+    cfg = _cfg(veto_cooldown_sessions=2)
+    baseline.note_observation("s1", "xhigh", cfg)
+    baseline.note_observation("s1", "medium", cfg)  # veto #1, armed by s1
+    baseline.decrement_cooldown("s2")               # s2 charges → 1
+
+    baseline.note_observation("s9", "low", cfg)
+    baseline.note_observation("s9", "high", cfg)    # veto #2, armed by s9 → re-armed at 2
+    baseline.decrement_cooldown("s2")               # s2 must charge again → 1
+
+    assert baseline._load()["veto_cooldown_remaining"] == 1
+
+    # ...and the NEW arming session is exempt from the cooldown it just armed.
+    # Without this, seeding the list as [] instead of [session_id] on re-arm
+    # would pass every other test in the suite.
+    baseline.decrement_cooldown("s9")
+    assert baseline._load()["veto_cooldown_remaining"] == 1
+
+
+def test_charged_session_list_stays_bounded():
+    """The list is per-cooldown and cannot outgrow the cooldown it belongs to:
+    once `remaining` hits 0 no further ids are recorded."""
+    n = 3
+    cfg = _cfg(veto_cooldown_sessions=n)
+    baseline.note_observation("s1", "xhigh", cfg)
+    baseline.note_observation("s1", "medium", cfg)  # armed by s1
+
+    for i in range(50):
+        baseline.decrement_cooldown(f"session-{i}")
+
+    charged = baseline._load().get("veto_cooldown_charged", [])
+    assert len(charged) <= n + 1  # n charging sessions + the arming session
+
+
+def test_decrement_cooldown_migrates_the_legacy_last_session_key():
+    """Upgrading mid-cooldown: an existing baseline.json written by the previous
+    version carries `veto_cooldown_last_session` and no charged list. The arming
+    session recorded there must still be exempt, or it charges its own cooldown."""
+    baseline._save(
+        {"veto_cooldown_remaining": 3, "veto_cooldown_last_session": "s1"}
+    )
+    baseline.decrement_cooldown("s1")  # the legacy arming session — must be a no-op
+    assert baseline._load()["veto_cooldown_remaining"] == 3
+
+    baseline.decrement_cooldown("s2")
+    assert baseline._load()["veto_cooldown_remaining"] == 2
+
+
+def test_decrement_cooldown_tolerates_malformed_charged_list():
+    """A corrupt value must degrade to 'nobody has charged yet', never raise —
+    baseline bookkeeping runs on the Stop hook path."""
+    baseline._save({"veto_cooldown_remaining": 2, "veto_cooldown_charged": "not-a-list"})
+    baseline.decrement_cooldown("s1")
+    assert baseline._load()["veto_cooldown_remaining"] == 1
+
+
 def test_veto_resets_the_window():
     _fill("low", 2)
     cfg = _cfg()
