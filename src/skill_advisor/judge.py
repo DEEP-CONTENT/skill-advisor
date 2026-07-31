@@ -27,6 +27,17 @@ FAILURE_TIMEOUT = "timeout"
 FAILURE_SUBPROCESS = "subprocess_error"
 FAILURE_EXIT = "exit_nonzero"
 FAILURE_UNPARSEABLE = "unparseable"
+# A nested `claude -p` inherits the CALLING session's hooks. When one fires
+# (observed: a Stop hook demanding a code review), it forces extra turns and
+# `result` becomes the nested session's reply to the hook instead of the
+# judge's verdict. That reply is not a parse failure — the session was
+# hijacked — so without this it gets misdiagnosed as FAILURE_UNPARSEABLE,
+# which implies a malformed reply or a parser gap when neither is true.
+# `num_turns` in the envelope is the discriminator: every clean verdict
+# observed is num_turns == 1, every contaminated reply is > 1, with zero
+# overlap across the 250-row calibration corpus (see
+# tools/build_calibration_corpus.py and task-2-report.md).
+FAILURE_HOOK_CONTAMINATED = "hook_contaminated"
 
 # Not produced by rank() itself — set by hook.py when the whole-hook SIGALRM
 # fires before the judge (or anything else downstream of it) returns a
@@ -160,6 +171,19 @@ def _parse_judge_reply(
     except json.JSONDecodeError:
         log.warning("judge returned non-JSON envelope: %r", stdout[:200])
         return None
+
+    # Check for hook contamination before ever looking at `result` — a
+    # hijacked session isn't a parse failure, so it must not be classified by
+    # what the (irrelevant) reply text happens to contain. See
+    # FAILURE_HOOK_CONTAMINATED above.
+    num_turns = envelope.get("num_turns") if isinstance(envelope, dict) else None
+    if isinstance(num_turns, (int, float)) and num_turns > 1:
+        log.warning(
+            "judge session hijacked by an inherited hook (num_turns=%s); "
+            "not a parse failure",
+            num_turns,
+        )
+        return JudgeResult(picks=[], failure=FAILURE_HOOK_CONTAMINATED)
 
     # `claude -p --output-format json` puts the assistant message in `result`.
     inner_text = envelope.get("result") if isinstance(envelope, dict) else None

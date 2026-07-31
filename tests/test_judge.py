@@ -236,6 +236,96 @@ def test_rank_on_timeout_yields_no_picks():
         assert judge.rank("anything", _candidates(), Config()).picks == []
 
 
+def test_parse_judge_reply_num_turns_one_with_valid_reply_parses_normally():
+    """num_turns == 1 is the clean case (238/238 in the 250-row corpus);
+    it must not be mistaken for contamination."""
+    envelope = {
+        "num_turns": 1,
+        "result": json.dumps(
+            {"picks": [{"name": "alpha", "reason": "fits"}], "skip": False}
+        ),
+    }
+    result = judge._parse_judge_reply(json.dumps(envelope), _candidates())
+    assert result is not None
+    assert result.failure is None
+    assert [p.name for p in result.picks] == ["alpha"]
+
+
+def test_num_turns_field_absent_is_not_treated_as_contaminated():
+    """Backward compatibility: an envelope with no `num_turns` key at all
+    (older `claude` CLI, or a hand-built test fixture) must still parse."""
+    envelope = {
+        "result": json.dumps(
+            {"picks": [{"name": "alpha", "reason": "fits"}], "skip": False}
+        )
+    }
+    result = judge._parse_judge_reply(json.dumps(envelope), _candidates())
+    assert result is not None
+    assert result.failure is None
+
+
+def test_parse_judge_reply_num_turns_greater_than_one_is_hook_contaminated():
+    """The production bug: a nested `claude -p` inherits the calling
+    session's hooks. When one fires (e.g. a Stop hook demanding a code
+    review), it forces extra turns and `result` becomes the nested
+    session's reply to the hook instead of the judge's verdict."""
+    envelope = {
+        "num_turns": 5,
+        "result": "Sure — here's a code review of your last change: ...",
+    }
+    result = judge._parse_judge_reply(json.dumps(envelope), _candidates())
+    assert result is not None
+    assert result.failure == judge.FAILURE_HOOK_CONTAMINATED
+    assert result.picks == []
+
+
+def test_hook_contamination_takes_priority_even_if_reply_would_otherwise_parse():
+    """num_turns is checked before the inner reply is ever interpreted — a
+    hijacked session is not a parse failure, so it must not be classified
+    by what the (irrelevant) reply text happens to contain."""
+    envelope = {
+        "num_turns": 2,
+        "result": json.dumps(
+            {"picks": [{"name": "alpha", "reason": "fits"}], "skip": False}
+        ),
+    }
+    result = judge._parse_judge_reply(json.dumps(envelope), _candidates())
+    assert result is not None
+    assert result.failure == judge.FAILURE_HOOK_CONTAMINATED
+    assert result.picks == []
+
+
+def test_rank_reports_hook_contamination_when_num_turns_exceeds_one():
+    stdout = json.dumps(
+        {
+            "num_turns": 5,
+            "result": "I reviewed your code and found three issues...",
+        }
+    )
+    completed = type("R", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
+    with (
+        patch("skill_advisor.judge.shutil.which", return_value="/usr/bin/claude"),
+        patch("skill_advisor.judge.subprocess.run", return_value=completed),
+    ):
+        result = judge.rank("anything", _candidates(), Config())
+    assert result.failure == judge.FAILURE_HOOK_CONTAMINATED
+    assert result.picks == []
+
+
+def test_rank_reports_unparseable_when_num_turns_is_one_and_reply_is_malformed():
+    """The counterpart to the contamination test above: a genuinely
+    malformed single-turn reply must still be FAILURE_UNPARSEABLE, not
+    swept into the new failure mode."""
+    stdout = json.dumps({"num_turns": 1, "result": "not json at all"})
+    completed = type("R", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
+    with (
+        patch("skill_advisor.judge.shutil.which", return_value="/usr/bin/claude"),
+        patch("skill_advisor.judge.subprocess.run", return_value=completed),
+    ):
+        result = judge.rank("anything", _candidates(), Config())
+    assert result.failure == judge.FAILURE_UNPARSEABLE
+
+
 def test_judge_timeout_is_strictly_under_the_hook_alarm():
     """Two independent timeout layers guard the hot path:
 

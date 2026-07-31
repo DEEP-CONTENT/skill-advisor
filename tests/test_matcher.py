@@ -242,6 +242,63 @@ def test_pick_stateless_force_judge_false_overrides_config(isolated_paths):
     assert [p.entry.name for p in picks] == ["alpha", "beta", "gamma"]
 
 
+def test_pick_stateless_falls_back_to_embedding_on_hook_contamination(isolated_paths):
+    """End-to-end: a nested `claude -p` hijacked by an inherited hook must
+    still surface embedding picks, not go silent. Exercises the real
+    judge.rank() -> matcher.pick_stateless() path (subprocess.run mocked at
+    the judge module boundary), not a mocked judge.rank."""
+    import json
+
+    from skill_advisor.config import Config
+    from skill_advisor import judge
+
+    stub = _prime_stateless_index([0.9, 0.7, 0.5])
+    stdout = json.dumps(
+        {"num_turns": 5, "result": "Sure — here's a code review of your last change: ..."}
+    )
+    completed = type("R", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
+    with (
+        patch.object(index_mod, "_embed_model", return_value=stub),
+        patch("skill_advisor.judge.shutil.which", return_value="/usr/bin/claude"),
+        patch("skill_advisor.judge.subprocess.run", return_value=completed),
+    ):
+        result = matcher.pick_stateless(
+            "q", Config(), force_judge=True, top_k=3, candidates=3, threshold=0.0
+        )
+
+    assert result.judge_ran is False
+    assert result.judge_failure == judge.FAILURE_HOOK_CONTAMINATED
+    assert [p.entry.name for p in result.picks] == ["alpha", "beta", "gamma"]
+    assert all(p.reason.startswith("embedding fallback") for p in result.picks)
+
+
+def test_pick_stateless_falls_back_to_embedding_on_genuine_unparseable_reply(
+    isolated_paths,
+):
+    """Counterpart: a clean single-turn session with a malformed reply must
+    still fall back the same way, under the pre-existing failure mode."""
+    import json
+
+    from skill_advisor.config import Config
+    from skill_advisor import judge
+
+    stub = _prime_stateless_index([0.9, 0.7, 0.5])
+    stdout = json.dumps({"num_turns": 1, "result": "not json at all"})
+    completed = type("R", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
+    with (
+        patch.object(index_mod, "_embed_model", return_value=stub),
+        patch("skill_advisor.judge.shutil.which", return_value="/usr/bin/claude"),
+        patch("skill_advisor.judge.subprocess.run", return_value=completed),
+    ):
+        result = matcher.pick_stateless(
+            "q", Config(), force_judge=True, top_k=3, candidates=3, threshold=0.0
+        )
+
+    assert result.judge_ran is False
+    assert result.judge_failure == judge.FAILURE_UNPARSEABLE
+    assert [p.entry.name for p in result.picks] == ["alpha", "beta", "gamma"]
+
+
 def test_pick_stateless_no_index_returns_empty(isolated_paths):
     from skill_advisor.config import Config
 
