@@ -668,7 +668,12 @@ def _rotatable_pool(catalog: list, embeddings):
     Subagents, slash commands, and plugin-namespaced skills are permanently
     enabled — `override_key()` returns `None` for all three (verified live:
     docs/superpowers/notes/2026-07-30-skilloverrides-verification.md, cases C
-    and D) — so neither promoting nor demoting one can ever change anything.
+    and D). `config.catalog.extra_roots` skills are excluded for a different
+    reason but the same effect: they're scanned in place from a directory
+    Claude Code's own skill discovery never looks at, so `skillOverrides`
+    (keyed off that discovery) can't address them either — proposing one
+    would be a silent no-op, same class of bug as the plugin-skill exclusion.
+    Either way, neither promoting nor demoting one can ever change anything.
     Excluding them HERE, before scoring, rather than only suppressing them at
     print time, matters: a scored-but-unprintable entry would still distort
     `pick_rate`'s max-picks normalisation and the target/active arithmetic in
@@ -680,8 +685,9 @@ def _rotatable_pool(catalog: list, embeddings):
     Returns `(pool_catalog, pool_embeddings, excluded_count, excluded_labels)`.
     `excluded_labels` is the set of human-readable categories actually seen
     among the excluded entries (a subset of {"subagents", "slash commands",
-    "plugin skills"}) — callers use it to describe the exclusion accurately
-    instead of always naming all three regardless of what was really excluded.
+    "plugin skills", "extra-root skills"}) — callers use it to describe the
+    exclusion accurately instead of always naming all four regardless of
+    what was really excluded.
     """
     keep: list[int] = []
     excluded_labels: set[str] = set()
@@ -698,6 +704,8 @@ def _rotatable_pool(catalog: list, embeddings):
             excluded_labels.add("slash commands")
         elif e.kind == "skill" and e.namespace.startswith("plugin:"):
             excluded_labels.add("plugin skills")
+        elif e.kind == "skill" and e.namespace == "extra":
+            excluded_labels.add("extra-root skills")
         else:  # pragma: no cover - defensive; no known catalog shape hits this
             excluded_labels.add("other unrotatable entries")
     pool_catalog = [catalog[i] for i in keep]
@@ -790,7 +798,7 @@ def _cmd_rotate(args: argparse.Namespace) -> int:
     )
     pool_names = {e.name for e in pool_catalog}
 
-    sketch = centroids.load()
+    sketch = centroids.load(k=rot.centroid_count)
     events = list(telemetry.iter_events())  # cutoff=None: the whole log
     # _rotation_stats() normalises stop-event names to entry.name space (see
     # its docstring), but its output still spans the WHOLE catalog — a
@@ -1288,15 +1296,35 @@ def _revert_absent_settings(settings_path: Path, settings_absent: Path) -> str |
     anything else is present (added by the Stop hook's effortLevel
     write-back, `install.render_settings()`, a hand-added key, ...) the file
     is kept and the message says so plainly.
+
+    A corrupt or wrong-shaped marker is a hard failure, not a silent
+    "nothing to remove": this function used to fall back to an empty key
+    list in that case and let the caller print "restored:" with exit 0 — a
+    revert that touched nothing while reporting success. A caller checking
+    only the exit code would believe the migrated `off` entries were gone
+    when they were not. Better to fail loudly and leave the marker in place
+    for a retry than to silently under-deliver.
     """
     try:
-        marker = json.loads(settings_absent.read_text(encoding="utf-8"))
-        migrated_keys = list(marker.get("keys", [])) if isinstance(marker, dict) else []
-    except (OSError, json.JSONDecodeError):
-        # Corrupt/legacy marker: don't guess which keys to remove — remove
-        # none, so the "only_ours" check below almost certainly keeps the
-        # file instead of risking deleting something we didn't add.
-        migrated_keys = []
+        raw = settings_absent.read_text(encoding="utf-8")
+        marker = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(
+            f"ERROR: {settings_absent} is corrupt ({exc}); cannot tell which "
+            "skillOverrides keys this migration added, so nothing was "
+            f"changed. Inspect {settings_absent} by hand (or remove it, "
+            "accepting the loss) and retry --revert."
+        )
+        return None
+    if not isinstance(marker, dict) or not isinstance(marker.get("keys"), list):
+        print(
+            f"ERROR: {settings_absent} does not have the expected "
+            '{"keys": [...]} shape; cannot tell which skillOverrides keys '
+            f"this migration added, so nothing was changed. Inspect "
+            f"{settings_absent} by hand and retry --revert."
+        )
+        return None
+    migrated_keys = list(marker["keys"])
 
     if not settings_path.is_file():
         # Already gone (deleted independently of this tool) — nothing to

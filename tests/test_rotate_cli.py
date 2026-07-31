@@ -196,6 +196,37 @@ def test_rotate_refuses_before_settings_write(isolated_paths, capsys):
     assert paths.settings_file().read_bytes() == before
 
 
+def test_rotate_creates_the_sketch_with_the_configured_centroid_count(isolated_paths):
+    """rotation.centroid_count was parsed but never read — a cold-start
+    sketch was always centroids.DEFAULT_K=8 regardless of config. `rotate`
+    must thread the configured value into centroids.load()."""
+    from unittest.mock import patch
+
+    from skill_advisor import cli
+
+    entries = [
+        CatalogEntry(
+            kind="skill",
+            name="a",
+            namespace="user",
+            description="a",
+            path="/skills/a/SKILL.md",
+            enabled=True,
+        ),
+    ]
+    embeddings = _emb([0.5])
+    source_hash = catalog_mod.compute_hash(catalog_mod.scan())
+    index_mod.save(entries, embeddings, source_hash)
+
+    paths.ensure_dirs()
+    paths.config_file().write_text("[rotation]\ncentroid_count = 4\n", encoding="utf-8")
+
+    with patch("skill_advisor.cli.centroids.load", wraps=centroids.load) as mock_load:
+        cli._cmd_rotate(_ns())
+
+    assert mock_load.call_args.kwargs.get("k") == 4
+
+
 def test_dry_run_shows_score_signal_and_last_invocation(isolated_paths, capsys):
     from skill_advisor import cli
 
@@ -443,6 +474,17 @@ def _prime_state_with_unrotatable_entries(
         )
     )
     fits.append(0.99)
+    entries.append(
+        CatalogEntry(
+            kind="skill",
+            name="extra-root-skill",
+            namespace="extra",
+            description="a config.catalog.extra_roots skill",
+            path="/team/skill-library/extra-root-skill/SKILL.md",
+            enabled=False,
+        )
+    )
+    fits.append(0.98)
 
     embeddings = _emb(fits)
     # F5: `_cmd_rotate`'s freshness check re-scans the real filesystem and
@@ -466,11 +508,17 @@ def _prime_state_with_unrotatable_entries(
 
 
 def test_unrotatable_entries_are_excluded_from_the_pool(isolated_paths, capsys):
-    """A subagent, a slash command, and a plugin skill sit in the catalog
-    alongside user skills. `overrides.override_key()` is None for all three,
-    so none is addressable via skillOverrides — none may appear in either
-    direction of the proposal, and the exclusion must be visible in the
-    printed summary so the pool count reconciles with the catalog size."""
+    """A subagent, a slash command, a plugin skill, and an extra_roots skill
+    sit in the catalog alongside user skills. `overrides.override_key()` is
+    None for all four, so none is addressable via skillOverrides — none may
+    appear in either direction of the proposal, and the exclusion must be
+    visible in the printed summary so the pool count reconciles with the
+    catalog size.
+
+    The extra-root skill in particular gets a very HIGH fit (0.98) while
+    disabled — if the pool filter didn't exclude it, it would be an
+    unmistakable PROMOTE candidate, exactly like the plugin skill case this
+    test already covers."""
     from skill_advisor import cli
 
     _prime_state_with_unrotatable_entries(isolated_paths)
@@ -480,7 +528,9 @@ def test_unrotatable_entries_are_excluded_from_the_pool(isolated_paths, capsys):
     assert "my-subagent" not in out
     assert "/my-command" not in out
     assert "plugin-skill" not in out
-    assert "excluded 3" in out
+    assert "extra-root-skill" not in out
+    assert "excluded 4" in out
+    assert "extra-root skills" in out
 
 
 def _prime_large_pool(isolated_paths, *, n: int = 30, observed: int = 1000) -> None:
