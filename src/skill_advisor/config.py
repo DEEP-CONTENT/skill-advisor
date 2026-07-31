@@ -127,10 +127,6 @@ class EffortConfig:
 
 @dataclass(frozen=True)
 class RotationConfig:
-    # Automatic rotation stays off until the scoring proves itself against real
-    # data. A wrong rotation silently removes a skill the user relies on, which
-    # is more disruptive than a wrong effort level.
-    enabled: bool = False
     target_active: int = 75  # within the spec's 50-100 band
     min_active: int = 25  # hard floor; a write that would go below aborts
     hysteresis: float = 0.05  # score margin required to swap, prevents thrash
@@ -301,7 +297,6 @@ def load(path: Path | None = None) -> Config:
             ),
         ),
         rotation=RotationConfig(
-            enabled=bool(rotation.get("enabled", RotationConfig.enabled)),
             target_active=int(
                 rotation.get("target_active", RotationConfig.target_active)
             ),

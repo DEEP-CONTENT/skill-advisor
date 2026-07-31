@@ -101,7 +101,6 @@ def test_effort_section_absent_yields_defaults(tmp_path):
 
 def test_rotation_config_defaults():
     cfg = config.Config()
-    assert cfg.rotation.enabled is False
     assert cfg.rotation.target_active == 75
     assert cfg.rotation.min_active == 25
     assert cfg.rotation.hysteresis == 0.05
@@ -116,7 +115,6 @@ def test_rotation_config_parses_toml(tmp_path):
     p.write_text(
         """
 [rotation]
-enabled = true
 target_active = 60
 min_active = 20
 hysteresis = 0.1
@@ -128,7 +126,6 @@ centroid_count = 4
         encoding="utf-8",
     )
     cfg = config.load(p)
-    assert cfg.rotation.enabled is True
     assert cfg.rotation.target_active == 60
     assert cfg.rotation.min_active == 20
     assert cfg.rotation.hysteresis == 0.1
@@ -142,7 +139,6 @@ def test_rotation_section_absent_yields_defaults(tmp_path):
     p = tmp_path / "config.toml"
     p.write_text("[matcher]\nuse_judge = true\n", encoding="utf-8")
     cfg = config.load(p)
-    assert cfg.rotation.enabled is False
     assert cfg.rotation.target_active == 75
 
 
