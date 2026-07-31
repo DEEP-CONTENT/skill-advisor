@@ -22,6 +22,14 @@ def isolated_paths(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_HOME", str(claude_home))
     monkeypatch.setenv("SKILL_ADVISOR_CONFIG_HOME", str(config_home))
     monkeypatch.setenv("SKILL_ADVISOR_CACHE_HOME", str(cache_home))
+    # `paths.settings_file()` gives SKILL_ADVISOR_SETTINGS_FILE precedence over
+    # config_dir(), so an ambient value escapes every other isolation above and
+    # points the suite at the developer's REAL settings file. The `claudew`
+    # alias exports exactly that, so running the suite from a claudew shell
+    # made tests read — and delete — the live file. Pin it inside tmp_path.
+    monkeypatch.setenv(
+        "SKILL_ADVISOR_SETTINGS_FILE", str(config_home / "claudeskill-settings.json")
+    )
     # Keep HOME stable so alias installers don't touch the real user's rc.
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir(parents=True, exist_ok=True)
