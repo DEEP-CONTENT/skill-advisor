@@ -12,7 +12,8 @@ import sys
 import time
 from typing import Any
 
-from . import baseline, effort, inject, judge, lifecycle, matcher, paths, telemetry, triage
+from . import baseline, centroids, effort, inject, judge, lifecycle, matcher, paths, telemetry, triage
+from . import index as index_mod
 from .config import Config, load as load_config
 
 
@@ -153,6 +154,42 @@ def run() -> int:
 
     try:
         result = matcher.pick(prompt, cfg, session_id=session_id, trace=trace)
+
+        # Fold this prompt into the centroid sketch (Task 10) so rotation can
+        # score skills that have never been used. Must run here, before the
+        # `finally` below disarms the alarm — NOT after the alarm is already
+        # off, where it previously lived. embed_one() builds a fastembed
+        # model with no bound on construction/inference time, so an unguarded
+        # call downstream of the alarm can hang the hook well past
+        # budget_seconds (proven by test_sketch_update_is_bounded_by_the_
+        # hook_alarm, which pins this with a real sleep + real SIGALRM rather
+        # than a raising mock — a mock can't prove an alarm exists).
+        # A _BudgetExceeded raised by the alarm firing mid-embed is caught by
+        # the inner except below, not the outer one: matcher.pick() already
+        # succeeded, so this is an interrupted sketch update, not a failed
+        # pick, and must not be reported as "budget exceeded" telemetry.
+        # Two gates: cfg.telemetry.events_enabled (the privacy claim — no
+        # prompt text, no per-prompt vectors ever stored — holds by
+        # construction, since this is the only check that decides whether
+        # anything is embedded), AND triage.should_skip(). matcher.pick()
+        # already returns early for a triage-skipped prompt outside an
+        # active lifecycle ("ok"/"yes"/"go", slash commands, ...) without
+        # ever touching the index — but until this second gate was added,
+        # the sketch update below ran anyway, unconditionally, for that same
+        # class of prompt. Two harms: a latency regression on the path that
+        # exists specifically to be near-free (README promises ~0 ms for
+        # triage-skipped prompts), and sketch pollution — with only 8
+        # centroid slots (SEED_SIMILARITY=0.9), a trivial acknowledgement is
+        # dissimilar enough from real work to claim one of them outright and
+        # then accumulate count, making it sticky. The one signal able to
+        # score a never-used skill was losing capacity to chit-chat.
+        if cfg.telemetry.events_enabled and not triage.should_skip(prompt, cfg):
+            try:
+                sketch = centroids.load()
+                centroids.observe(sketch, index_mod.embed_one(prompt))
+                centroids.save(sketch)
+            except Exception as exc:  # pragma: no cover - defensive; hooks never raise
+                log.debug("centroid update failed: %s", exc, exc_info=True)
     except _BudgetExceeded:
         duration = time.monotonic() - started
         log.info("budget exceeded after %.2fs; falling back silent", duration)
@@ -326,14 +363,18 @@ def run_posttooluse() -> int:
         return 0
 
     subagent_type = None
+    skill_name = None
     tool_input = event.get("tool_input") or {}
     if isinstance(tool_input, dict):
         raw_subagent = tool_input.get("subagent_type")
         if raw_subagent is not None:
             subagent_type = str(raw_subagent).strip() or None
+        raw_skill = tool_input.get("skill")
+        if raw_skill is not None:
+            skill_name = str(raw_skill).strip() or None
 
     try:
-        lifecycle.record_tool(session_id, tool_name, subagent_type=subagent_type)
+        lifecycle.record_tool(session_id, tool_name, subagent_type=subagent_type, skill_name=skill_name)
     except Exception as exc:  # pragma: no cover - defensive
         log.debug("posttooluse record failed: %s", exc, exc_info=True)
 
@@ -413,6 +454,7 @@ def run_stop() -> int:
                 session_id=session_id,
                 tools=turn.tool_names,
                 subagents=turn.subagents_invoked,
+                skills=turn.skills_invoked,
                 config=cfg.telemetry,
             )
         except Exception as exc:

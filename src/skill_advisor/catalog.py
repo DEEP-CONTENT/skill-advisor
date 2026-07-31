@@ -1,16 +1,18 @@
 """Catalog of skills, subagents, and slash commands available to the advisor."""
+
 from __future__ import annotations
 
 import hashlib
 import json
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Iterable
 
 import yaml
 
 from . import builtins as builtin_entries
+from . import overrides
 from . import paths
 from .config import Config, load as load_config
 
@@ -19,18 +21,30 @@ _FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
 @dataclass(frozen=True)
 class CatalogEntry:
-    kind: str         # "skill" | "subagent" | "command"
+    kind: str  # "skill" | "subagent" | "command"
     name: str
-    namespace: str    # "user" | "plugin:<name>" | "builtin"
+    namespace: str  # "user" | "plugin:<name>" | "builtin"
     description: str
-    path: str = ""    # SKILL.md path for skills; "" for builtins
+    path: str = ""  # SKILL.md path for skills; "" for builtins
+    enabled: bool = True  # resolved from skillOverrides at scan time
+    invoke_name: str = ""  # what the Skill tool accepts; "" ⟹ same as `name`
 
     def to_json(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_json(cls, data: dict) -> "CatalogEntry":
-        return cls(**data)
+        """Construct from a saved catalog.json entry, tolerating schema drift.
+
+        A newer binary can write fields an older installed CatalogEntry
+        doesn't know about (e.g. `enabled`, `invoke_name` were added after
+        the first release). Filter to this dataclass's own field names so a
+        forward-compatible cache never bricks an older binary with a
+        TypeError — but still raise if a field with no default (genuine
+        corruption) is missing.
+        """
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
 
     def embed_text(self) -> str:
         return f"{self.name}: {self.description}"
@@ -53,7 +67,9 @@ def parse_frontmatter(path: Path) -> dict | None:
     return data
 
 
-def _entries_from_skill_file(skill_md: Path, namespace: str) -> CatalogEntry | None:
+def _entries_from_skill_file(
+    skill_md: Path, namespace: str, table: dict[str, str]
+) -> CatalogEntry | None:
     fm = parse_frontmatter(skill_md)
     if not fm:
         return None
@@ -61,25 +77,34 @@ def _entries_from_skill_file(skill_md: Path, namespace: str) -> CatalogEntry | N
     description = fm.get("description")
     if not name or not description:
         return None
+    name = str(name).strip()
+    path = str(skill_md)
+    key = overrides.override_key(
+        kind="skill", namespace=namespace, path=path, name=name
+    )
     return CatalogEntry(
         kind="skill",
-        name=str(name).strip(),
+        name=name,
         namespace=namespace,
         description=str(description).strip(),
-        path=str(skill_md),
+        path=path,
+        enabled=overrides.is_enabled(key, table),
+        invoke_name=overrides.invoke_name(
+            kind="skill", namespace=namespace, path=path, name=name
+        ),
     )
 
 
-def _scan_user_skills(root: Path) -> Iterable[CatalogEntry]:
+def _scan_user_skills(root: Path, table: dict[str, str]) -> Iterable[CatalogEntry]:
     if not root.is_dir():
         return
     for skill_md in sorted(root.glob("*/SKILL.md")):
-        entry = _entries_from_skill_file(skill_md, namespace="user")
+        entry = _entries_from_skill_file(skill_md, namespace="user", table=table)
         if entry:
             yield entry
 
 
-def _scan_plugin_skills(root: Path) -> Iterable[CatalogEntry]:
+def _scan_plugin_skills(root: Path, table: dict[str, str]) -> Iterable[CatalogEntry]:
     if not root.is_dir():
         return
     # Pattern: <marketplace>/plugins/<plugin>/skills/<skill>/SKILL.md
@@ -88,17 +113,40 @@ def _scan_plugin_skills(root: Path) -> Iterable[CatalogEntry]:
             plugin_name = skill_md.parents[2].name
         except IndexError:
             plugin_name = "unknown"
-        entry = _entries_from_skill_file(skill_md, namespace=f"plugin:{plugin_name}")
+        entry = _entries_from_skill_file(
+            skill_md, namespace=f"plugin:{plugin_name}", table=table
+        )
         if entry:
             yield entry
 
 
-def _scan_extra_root(root: Path) -> Iterable[CatalogEntry]:
+def _scan_plugin_cache_skills(
+    root: Path, table: dict[str, str]
+) -> Iterable[CatalogEntry]:
+    """Installed-plugin layout: <marketplace>/<plugin>/<version>/skills/<skill>/SKILL.md.
+
+    Distinct from `plugins/marketplaces/`, which is the *catalogue* of available
+    plugins. The cache is what is actually installed and invocable, and it
+    interposes a version segment — so the marketplaces glob misses it entirely.
+    """
+    if not root.is_dir():
+        return
+    for skill_md in sorted(root.glob("*/*/*/skills/*/SKILL.md")):
+        try:
+            plugin_name = skill_md.parents[3].name
+        except IndexError:
+            plugin_name = "unknown"
+        entry = _entries_from_skill_file(skill_md, f"plugin:{plugin_name}", table)
+        if entry:
+            yield entry
+
+
+def _scan_extra_root(root: Path, table: dict[str, str]) -> Iterable[CatalogEntry]:
     if not root.is_dir():
         return
     # Accept either a flat skills/<name>/SKILL.md layout or a single SKILL.md file.
     for skill_md in sorted(root.rglob("SKILL.md")):
-        entry = _entries_from_skill_file(skill_md, namespace="extra")
+        entry = _entries_from_skill_file(skill_md, namespace="extra", table=table)
         if entry:
             yield entry
 
@@ -120,16 +168,22 @@ def _builtin_entries() -> Iterable[CatalogEntry]:
         )
 
 
-def scan(config: Config | None = None) -> list[CatalogEntry]:
+def scan(
+    config: Config | None = None,
+    *,
+    overrides_table: dict[str, str] | None = None,
+) -> list[CatalogEntry]:
     cfg = config or load_config()
+    table = overrides_table if overrides_table is not None else overrides.read()
     exclude = set(cfg.catalog.exclude_names)
     seen: set[tuple[str, str]] = set()
     out: list[CatalogEntry] = []
 
     def _accept(entry: CatalogEntry) -> None:
-        if entry.name in exclude:
+        invocable = entry.invoke_name or entry.name
+        if invocable in exclude:
             return
-        key = (entry.kind, entry.name)
+        key = (entry.kind, invocable)
         if key in seen:
             return
         seen.add(key)
@@ -137,17 +191,21 @@ def scan(config: Config | None = None) -> list[CatalogEntry]:
 
     # skill_roots() returns an ordered list of candidate roots — primary
     # Claude home first, then ~/.claude fallback if primary differs. Each root
-    # is either a skills/ dir or a plugins/marketplaces dir; detect by name.
+    # is either a skills/ dir, a plugins/marketplaces dir, or a plugins/cache dir;
+    # detect by name.
     for root in paths.skill_roots():
         if root.name == "skills":
-            for entry in _scan_user_skills(root):
+            for entry in _scan_user_skills(root, table):
                 _accept(entry)
         elif root.name == "marketplaces":
-            for entry in _scan_plugin_skills(root):
+            for entry in _scan_plugin_skills(root, table):
+                _accept(entry)
+        elif root.name == "cache":
+            for entry in _scan_plugin_cache_skills(root, table):
                 _accept(entry)
 
     for extra in cfg.catalog.extra_roots:
-        for entry in _scan_extra_root(Path(extra).expanduser()):
+        for entry in _scan_extra_root(Path(extra).expanduser(), table):
             _accept(entry)
 
     for entry in _builtin_entries():
@@ -166,6 +224,8 @@ def compute_hash(entries: list[CatalogEntry]) -> str:
         h.update(e.kind.encode())
         h.update(b"\x00")
         h.update(e.name.encode())
+        h.update(b"\x00")
+        h.update(b"1" if e.enabled else b"0")
         h.update(b"\x00")
         if e.path:
             try:
@@ -195,3 +255,40 @@ def load(source: Path | None = None) -> list[CatalogEntry]:
         raise FileNotFoundError(f"catalog not built yet; expected {src}")
     data = json.loads(src.read_text(encoding="utf-8"))
     return [CatalogEntry.from_json(item) for item in data]
+
+
+def pool_health(
+    config: Config | None = None,
+    *,
+    overrides_table: dict[str, str] | None = None,
+) -> dict:
+    """Counts for `doctor`: how much of the disk the scanner can actually see.
+
+    About ~20% of SKILL.md files carry no parseable YAML frontmatter and are
+    silently invisible. Reporting that is deliberate — the files belong to
+    third-party skill libraries and fixing them is out of scope, but a rotation
+    pool that silently excludes a fifth of the disk should say so.
+    """
+    cfg = config or load_config()
+    table = overrides_table if overrides_table is not None else overrides.read()
+    files = 0
+    unparseable_dirs: list[str] = []
+    for root in paths.skill_roots():
+        for skill_md in root.rglob("SKILL.md"):
+            files += 1
+            fm = parse_frontmatter(skill_md)
+            if not fm or not fm.get("name") or not fm.get("description"):
+                unparseable_dirs.append(skill_md.parent.name)
+    unparseable_count = len(unparseable_dirs)
+    entries = scan(cfg, overrides_table=table)
+    off_keys = {k for k, v in table.items() if v.strip().lower() == overrides.OFF}
+    excluded = set(cfg.catalog.exclude_names)
+    return {
+        "skill_md_files": files,
+        "parseable": files - unparseable_count,
+        "unparseable_count": unparseable_count,
+        "unparseable_dirs": sorted(set(unparseable_dirs)),
+        "pool": len(entries),
+        "pickable": sum(1 for e in entries if e.enabled),
+        "excluded_but_enabled": sorted(excluded - off_keys),
+    }

@@ -446,3 +446,34 @@ def test_judge_success_marks_judge_ran(isolated_paths):
     assert result.judge_ran is True
     assert result.judge_failure is None
     assert [p.entry.name for p in result.picks] == ["beta"]
+
+
+def test_matcher_never_picks_a_disabled_skill(isolated_paths):
+    """58.6% of live picks named a skill Claude Code cannot invoke. Zero now."""
+    import numpy as np
+
+    from skill_advisor import catalog as catalog_mod
+    from skill_advisor.catalog import CatalogEntry
+    from skill_advisor.config import Config
+
+    entries = [
+        CatalogEntry(kind="skill", name="disabled-but-relevant", namespace="user",
+                     description="d", path="/s/disabled-but-relevant/SKILL.md", enabled=False),
+        CatalogEntry(kind="skill", name="enabled-alternative", namespace="user",
+                     description="d", path="/s/enabled-alternative/SKILL.md", enabled=True),
+    ]
+    emb = np.array([[1.0, 0.0], [0.7, 0.714]], dtype=np.float32)
+    catalog_mod.save(entries)
+    index_mod.save(entries, emb, "h")
+
+    class _Fixed:
+        def embed(self, texts):
+            for _ in texts:
+                yield np.array([1.0, 0.0], dtype=np.float32)
+
+    with patch.object(index_mod, "_embed_model", return_value=_Fixed()):
+        result = matcher.pick_stateless("q", Config(), top_k=2, candidates=2, threshold=0.0)
+
+    names = [p.entry.name for p in result.picks]
+    assert "disabled-but-relevant" not in names
+    assert names == ["enabled-alternative"]

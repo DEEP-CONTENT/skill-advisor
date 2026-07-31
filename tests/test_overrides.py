@@ -1,0 +1,137 @@
+import json
+
+from skill_advisor import overrides, paths
+
+
+def test_override_key_is_the_directory_name_not_the_frontmatter_name():
+    """settings.json keys by directory; the catalog keys by frontmatter `name`.
+    They differ for 7 skills on the author's machine — `xlsx` vs `xlsx-official`."""
+    key = overrides.override_key(
+        kind="skill",
+        namespace="user",
+        path="/home/u/.claude/skills/xlsx/SKILL.md",
+        name="xlsx-official",
+    )
+    assert key == "xlsx"
+
+
+def test_override_key_is_still_the_dir_name_for_user_skills():
+    """Guard against over-correction: only plugin-namespaced entries should
+    resolve to None. A user skill's key must still be its directory name."""
+    key = overrides.override_key(
+        kind="skill",
+        namespace="user",
+        path="/home/u/.claude/skills/brainstorming/SKILL.md",
+        name="brainstorming",
+    )
+    assert key == "brainstorming"
+
+
+def test_override_key_is_none_for_builtins():
+    assert (
+        overrides.override_key(
+            kind="subagent", namespace="builtin", path="", name="Plan"
+        )
+        is None
+    )
+    assert (
+        overrides.override_key(
+            kind="command", namespace="builtin", path="", name="review"
+        )
+        is None
+    )
+
+
+def test_override_key_is_none_for_plugin_skills_even_when_dir_matches_a_table_key():
+    """Verification gate docs/superpowers/notes/2026-07-30-skilloverrides-verification.md,
+    case D: a bare directory name in skillOverrides (`{"brainstorming": "off"}`)
+    silenced only the user skill; the plugin skill sharing that directory name
+    (`superpowers:brainstorming`) survived untouched. `skillOverrides` does not
+    address plugin skills at all — `override_key` must return None for them so
+    `is_enabled` always resolves to True, regardless of what the table contains."""
+    key = overrides.override_key(
+        kind="skill",
+        namespace="plugin:superpowers",
+        path="/x/plugins/cache/official/superpowers/6.2.0/skills/brainstorming/SKILL.md",
+        name="brainstorming",
+    )
+    assert key is None
+
+
+def test_invoke_name_namespaces_plugin_skills():
+    """Claude Code invokes plugin skills as `<plugin>:<skill>`; the catalog
+    currently emits the bare frontmatter name, which the Skill tool rejects."""
+    got = overrides.invoke_name(
+        kind="skill",
+        namespace="plugin:dc-sprints",
+        path="/x/marketplaces/m/plugins/dc-sprints/skills/dc-board-overview/SKILL.md",
+        name="dc-board-overview",
+    )
+    assert got == "dc-sprints:dc-board-overview"
+
+
+def test_invoke_name_is_the_directory_name_for_user_skills():
+    got = overrides.invoke_name(
+        kind="skill",
+        namespace="user",
+        path="/home/u/.claude/skills/xlsx/SKILL.md",
+        name="xlsx-official",
+    )
+    assert got == "xlsx"
+
+
+def test_missing_key_means_enabled():
+    assert overrides.is_enabled("never-seen", {}) is True
+    assert overrides.is_enabled(None, {"anything": "off"}) is True
+
+
+def test_off_means_disabled():
+    assert overrides.is_enabled("muted", {"muted": "off"}) is False
+
+
+def test_read_merges_advisor_settings_over_claude_settings(isolated_paths):
+    (isolated_paths["claude_home"] / "settings.json").write_text(
+        json.dumps({"skillOverrides": {"a": "off", "b": "off"}}), encoding="utf-8"
+    )
+    paths.settings_file().write_text(
+        json.dumps({"skillOverrides": {"b": "on"}}), encoding="utf-8"
+    )
+    table = overrides.read()
+    assert table["a"] == "off"
+    assert table["b"] == "on"
+
+
+def test_read_survives_malformed_settings(isolated_paths):
+    paths.settings_file().write_text("{ not json", encoding="utf-8")
+    assert overrides.read() == {}
+
+
+def test_write_merges_and_leaves_other_keys_alone(isolated_paths):
+    paths.settings_file().write_text(
+        json.dumps({"effortLevel": "high", "skillOverrides": {"a": "off"}}),
+        encoding="utf-8",
+    )
+    assert overrides.write({"b": "off"}) is True
+
+    data = json.loads(paths.settings_file().read_text(encoding="utf-8"))
+    assert data["effortLevel"] == "high"
+    assert data["skillOverrides"] == {"a": "off", "b": "off"}
+
+
+def test_write_aborts_on_unparseable_settings_leaving_bytes_identical(isolated_paths):
+    paths.settings_file().write_text("{ not json", encoding="utf-8")
+    before = paths.settings_file().read_bytes()
+    assert overrides.write({"b": "off"}) is False
+    assert paths.settings_file().read_bytes() == before
+
+
+def test_write_rejects_a_namespaced_key():
+    """A key containing `:` would be silently ignored by Claude Code
+    (docs/superpowers/notes/2026-07-30-skilloverrides-verification.md, case C) —
+    writing one produces a caller that reports success and changes nothing.
+    `override_key` never produces such a key, so this is defence against a
+    future caller that would; reject loudly rather than silently no-op."""
+    import pytest
+
+    with pytest.raises(ValueError):
+        overrides.write({"superpowers:brainstorming": "off"})

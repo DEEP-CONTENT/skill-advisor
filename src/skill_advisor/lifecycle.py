@@ -398,19 +398,60 @@ def pick_candidates_for_phase(
     catalog: Iterable[CatalogEntry],
     limit: int = 3,
     config: LifecycleConfig | None = None,
+    *,
+    pickable_only: bool = True,
 ) -> list[CatalogEntry]:
-    """Pick preferred catalog entries for a phase, honoring config overrides."""
+    """Pick preferred catalog entries for a phase, honoring config overrides.
+
+    Disabled skills are skipped rather than consuming a slot, so the ordered
+    preference list falls through to the next enabled alternative — which is
+    what the list was always for. Measured 2026-07-29: without this filter the
+    PLANNING list stopped at `plan-writing` (disabled) and never reached
+    `brainstorming`, producing 490 un-invocable recommendations.
+
+    Looked up by invocable identity (`invoke_name or name`), matching how
+    `PHASE_CANDIDATES` itself spells plugin entries (namespaced,
+    `<plugin>:<dir>`, e.g. "superpowers:brainstorming") and matching
+    `catalog._accept()`'s own dedup key. Keying on `entry.name` — the
+    frontmatter `name:` — instead broke both directions: a namespaced
+    preference could never match, because no catalog entry's frontmatter
+    `name:` is ever namespaced; and a *bare* preference (e.g.
+    "brainstorming") collided across namespaces whenever a user skill and a
+    plugin skill share a frontmatter name, since plugin-cache roots are
+    scanned after skills/ — the dict comprehension's last-wins semantics
+    silently resolved the bare preference to the plugin entry, whose
+    `enabled` is always True regardless of what the user actually muted.
+    `seen` is tracked by the same invocable identity, not `entry.name`, for
+    the same reason: two DIFFERENT entries (a user skill and a plugin skill)
+    can share a frontmatter name while being distinct, independently
+    pickable catalog entries.
+
+    Deliberately NOT cross-matching a bare preference to a namespaced entry
+    or vice versa — `PHASE_CANDIDATES` already lists both spellings as
+    separate, explicitly-ordered preferences wherever that fallback matters
+    (see PLANNING's "brainstorming" / "superpowers:brainstorming" pair), so
+    implicit cross-matching would just reintroduce the same collision this
+    fixes.
+    """
     prefs = _resolve_phase_prefs(phase, config)
-    by_name: dict[str, CatalogEntry] = {e.name: e for e in catalog}
+    by_invocable: dict[str, CatalogEntry] = {
+        (e.invoke_name or e.name): e for e in catalog
+    }
     picks: list[CatalogEntry] = []
     seen: set[str] = set()
     for kind, name in prefs:
-        entry = by_name.get(name)
-        if entry and entry.kind == kind and entry.name not in seen:
-            picks.append(entry)
-            seen.add(entry.name)
-            if len(picks) >= limit:
-                break
+        entry = by_invocable.get(name)
+        if entry is None or entry.kind != kind:
+            continue
+        invocable = entry.invoke_name or entry.name
+        if invocable in seen:
+            continue
+        if pickable_only and not entry.enabled:
+            continue
+        picks.append(entry)
+        seen.add(invocable)
+        if len(picks) >= limit:
+            break
     return picks
 
 
@@ -431,6 +472,7 @@ class TurnState:
     turn_started_at: float = field(default_factory=time.time)
     tool_names: list[str] = field(default_factory=list)
     subagents_invoked: list[str] = field(default_factory=list)
+    skills_invoked: list[str] = field(default_factory=list)
     todo_write: dict | None = None  # {"count": int, "titles": list[str]} or None
 
     def to_json(self) -> dict:
@@ -443,6 +485,7 @@ class TurnState:
             turn_started_at=float(data.get("turn_started_at") or time.time()),
             tool_names=list(data.get("tool_names") or []),
             subagents_invoked=list(data.get("subagents_invoked") or []),
+            skills_invoked=list(data.get("skills_invoked") or []),
             todo_write=data.get("todo_write") if isinstance(data.get("todo_write"), dict) else None,
         )
 
@@ -480,6 +523,7 @@ def record_tool(
     tool_name: str,
     *,
     subagent_type: str | None = None,
+    skill_name: str | None = None,
 ) -> TurnState:
     """Accumulate tool usage into the current turn's state file."""
     turn = load_turn(session_id) or TurnState(session_id=session_id)
@@ -487,6 +531,9 @@ def record_tool(
     # Claude Code's `Task` tool exposes the chosen subagent via tool_input.subagent_type.
     if tool_name == "Task" and subagent_type:
         turn.subagents_invoked.append(subagent_type)
+    # Claude Code's `Skill` tool exposes the invoked skill via tool_input.skill.
+    if tool_name == "Skill" and skill_name:
+        turn.skills_invoked.append(skill_name)
     save_turn(turn)
     return turn
 

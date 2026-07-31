@@ -42,14 +42,33 @@ def skill_roots() -> list[Path]:
     `skills/` is empty — the default `~/.claude` skills are also included so the
     catalog isn't empty. Catalog dedupes by (kind, name); the primary root wins on
     collision.
+
+    Dedupes by resolved path to handle cases where primary subdirectories are
+    symlinks to the default home's subdirectories.
     """
     primary = claude_home()
     default = _home() / ".claude"
-    roots = [primary / "skills", primary / "plugins" / "marketplaces"]
+    candidates = [
+        primary / "skills",
+        primary / "plugins" / "marketplaces",
+        primary / "plugins" / "cache",
+    ]
     if primary.resolve() != default.resolve():
-        for extra in (default / "skills", default / "plugins" / "marketplaces"):
-            if extra not in roots:
-                roots.append(extra)
+        for extra in (
+            default / "skills",
+            default / "plugins" / "marketplaces",
+            default / "plugins" / "cache",
+        ):
+            candidates.append(extra)
+
+    # Dedupe by resolved path, keeping first occurrence of each unique target.
+    seen: set[Path] = set()
+    roots: list[Path] = []
+    for root in candidates:
+        resolved = root.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            roots.append(root)
     return roots
 
 
@@ -128,6 +147,16 @@ def observed_effort_file() -> Path:
 def baseline_file() -> Path:
     """Rolling window + write-back provenance."""
     return cache_dir() / "baseline.json"
+
+
+def centroids_file() -> Path:
+    """Fixed-size online sketch of prompt embeddings (8 x 384 float32, ~12 KB).
+
+    Holds no prompt text and no per-prompt vectors — it is a lossy aggregate of
+    thousands of prompts, not a record of any one of them. Written only when
+    telemetry.events_enabled is already true; removed by `uninstall`.
+    """
+    return cache_dir() / "centroids.npz"
 
 
 def statusline_script() -> Path:

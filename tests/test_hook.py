@@ -118,6 +118,113 @@ def test_hook_silent_when_telemetry_record_fails(isolated_paths):
     assert "brainstorming" in envelope["hookSpecificOutput"]["additionalContext"]
 
 
+def test_hook_folds_the_prompt_into_the_sketch(isolated_paths):
+    import numpy as np
+
+    from skill_advisor import centroids
+
+    _enable_telemetry_in_config(isolated_paths)
+    unit = np.zeros(centroids.DIM, dtype=np.float32)
+    unit[0] = 1.0
+
+    with patch("skill_advisor.hook.matcher.pick", return_value=None), \
+         patch("skill_advisor.hook.index_mod.embed_one", return_value=unit):
+        _run_with_stdin({"prompt": "why is this pod crashlooping in sydcdev", "session_id": "s1"})
+
+    assert centroids.load().observed == 1
+
+
+def test_hook_does_not_write_the_sketch_when_telemetry_is_off(isolated_paths):
+    from skill_advisor import paths
+
+    # No config.toml → events_enabled defaults to False.
+    with patch("skill_advisor.hook.matcher.pick", return_value=None):
+        _run_with_stdin({"prompt": "why is this pod crashlooping in sydcdev", "session_id": "s1"})
+
+    assert not paths.centroids_file().exists()
+
+
+def test_hook_skips_sketch_update_for_triage_skipped_prompts(isolated_paths):
+    """F4: the sketch update was gated only on events_enabled, so it ran even
+    for a prompt matcher.pick() itself never touches the index for —
+    triage.should_skip() rejects trivial acknowledgements like "ok" before
+    matcher.pick() does any real work (outside an active lifecycle). That
+    both wastes latency on a path meant to be near-free (README promises
+    ~0 ms for triage-skipped prompts) and pollutes the 8-slot centroid
+    sketch with chit-chat — a trivial prompt is dissimilar to real work, so
+    it claims one of only 8 slots and then accumulates count, becoming
+    sticky."""
+    import numpy as np
+
+    from skill_advisor import centroids, paths
+
+    _enable_telemetry_in_config(isolated_paths)
+    unit = np.zeros(centroids.DIM, dtype=np.float32)
+    unit[0] = 1.0
+
+    with patch("skill_advisor.hook.matcher.pick", return_value=None), \
+         patch(
+             "skill_advisor.hook.index_mod.embed_one", return_value=unit
+         ) as embed_mock:
+        _run_with_stdin({"prompt": "ok", "session_id": "s1"})
+
+    embed_mock.assert_not_called()
+    assert not paths.centroids_file().exists()
+
+
+def test_a_failing_sketch_update_never_breaks_the_hook(isolated_paths):
+    """Hook paths are silent on error. A broken sketch must not cost a pick."""
+    _enable_telemetry_in_config(isolated_paths)
+    entry = CatalogEntry(kind="skill", name="brainstorming", namespace="user", description="...")
+    result = PickResult(picks=[ResolvedPick(entry=entry, reason="...")], state=None)
+
+    with patch("skill_advisor.hook.matcher.pick", return_value=result), \
+         patch("skill_advisor.hook.index_mod.embed_one", side_effect=RuntimeError("boom")):
+        out = _run_with_stdin({"prompt": "a substantive prompt that should match", "session_id": "s1"})
+
+    assert "brainstorming" in out
+
+
+def test_sketch_update_is_bounded_by_the_hook_alarm(isolated_paths):
+    """A hang inside embed_one() must be interrupted by the SIGALRM budget the
+    hook already arms around matcher.pick(), not run unbounded past it.
+
+    A raising mock (like the other sketch tests here) can prove the failure
+    path is caught, but can never prove an alarm actually exists — only a
+    real sleep racing the real signal can. This is exactly the gap that let
+    an earlier version of this wiring ship with the sketch update running
+    after signal.alarm(0) had already disarmed the timer: every test used
+    side_effect=RuntimeError, which is indistinguishable from "the alarm
+    caught it" even when there was no alarm at all.
+    """
+    import time as time_mod
+
+    import numpy as np
+
+    cfg_path = isolated_paths["config_home"] / "config.toml"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(
+        "[telemetry]\nevents_enabled = true\n\n[matcher]\nbudget_seconds = 2.0\n"
+    )
+
+    def _hang(text):
+        time_mod.sleep(12)
+        return np.zeros(384, dtype=np.float32)
+
+    with patch("skill_advisor.hook.matcher.pick", return_value=None), \
+         patch("skill_advisor.hook.index_mod.embed_one", side_effect=_hang):
+        started = time_mod.monotonic()
+        _run_with_stdin(
+            {"prompt": "why is this pod crashlooping in sydcdev", "session_id": "s1"}
+        )
+        elapsed = time_mod.monotonic() - started
+
+    assert elapsed < 6.0, (
+        f"hook.run() took {elapsed:.1f}s against a 2.0s budget; "
+        "the sketch update escaped the alarm"
+    )
+
+
 def test_hook_records_event_even_when_no_picks(isolated_paths):
     _enable_telemetry_in_config(isolated_paths)
     with patch("skill_advisor.hook.matcher.pick", return_value=None):
@@ -413,6 +520,42 @@ def test_posttooluse_taskcreate_missing_subject_is_silent(monkeypatch):
     turn = lifecycle.load_turn("sess-tc3")
     assert turn is not None
     assert turn.todo_write is None
+
+
+def test_posttooluse_captures_the_invoked_skill_name(monkeypatch):
+    """`tools` records only the string "Skill" — 1,482 times across 3,971 stop
+    events, never which one. invocation_rate is uncomputable without this."""
+    import io
+    import json as _json
+    from skill_advisor import hook, lifecycle
+
+    event = {
+        "session_id": "sess-1",
+        "tool_name": "Skill",
+        "tool_input": {"skill": "superpowers:writing-plans"},
+    }
+    monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps(event)))
+    assert hook.run_posttooluse() == 0
+
+    turn = lifecycle.load_turn("sess-1")   # lifecycle.py:453, returns TurnState | None
+    assert turn is not None
+    assert turn.skills_invoked == ["superpowers:writing-plans"]
+    assert turn.tool_names == ["Skill"]    # existing path still records the tool
+
+
+def test_posttooluse_ignores_a_missing_skill_field(monkeypatch):
+    """Non-Skill tools carry no `skill` key; that must not append an empty name."""
+    import io
+    import json as _json
+    from skill_advisor import hook, lifecycle
+
+    event = {"session_id": "sess-2", "tool_name": "Read", "tool_input": {"file_path": "/x"}}
+    monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps(event)))
+    assert hook.run_posttooluse() == 0
+
+    turn = lifecycle.load_turn("sess-2")
+    assert turn is not None
+    assert turn.skills_invoked == []
 
 
 # ---------------------------------------------------------------------------

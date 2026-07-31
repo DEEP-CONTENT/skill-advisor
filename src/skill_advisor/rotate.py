@@ -1,0 +1,244 @@
+"""Score the rotation pool and propose swaps. Pure functions over data.
+
+No I/O: callers load the catalog, embeddings, sketch and telemetry stats and
+hand them in. That keeps the interesting logic — hysteresis, the exploration
+slice, the recency shield, the floor — testable with plain dataclasses.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import numpy as np
+
+from . import centroids as centroids_mod
+from .catalog import CatalogEntry
+from .config import RotationConfig
+
+# v1 weights. invocation_rate is computed and reported but weighted zero: the
+# telemetry that produces it only started being collected in this same release,
+# so it has no history. Promote the weight once weeks of data exist.
+W_SEMANTIC = 0.6
+W_PICK = 0.4
+W_INVOCATION = 0.0
+
+
+class RotationRefused(Exception):
+    """Rotation declined to act. Carries a message fit to print to the user."""
+
+
+@dataclass(frozen=True)
+class Scored:
+    entry: CatalogEntry
+    semantic_fit: float
+    pick_rate: float
+    invocation_rate: float
+    last_invoked_days: float | None
+    total: float
+
+
+@dataclass
+class Proposal:
+    promote: list[Scored] = field(default_factory=list)
+    demote: list[Scored] = field(default_factory=list)
+    reason_by_name: dict[str, str] = field(default_factory=dict)
+
+
+def score_pool(
+    entries: list[CatalogEntry],
+    embeddings: np.ndarray,
+    sketch: centroids_mod.Sketch,
+    stats: dict[str, dict],
+    cfg: RotationConfig,
+) -> list[Scored]:
+    """Score every entry in `entries` against the sketch and usage `stats`.
+
+    `stats` SHOULD already be scoped to `entries` by the caller — see
+    `cli._cmd_rotate`, which filters telemetry-derived stats down to its
+    rotation pool before calling this, because an entry the matcher
+    recommends but that never belongs in THIS pool (e.g. a subagent or
+    plugin skill — always `enabled`, so it accrues real picks, but
+    `overrides.override_key()` can never address it) would otherwise
+    inflate `max_picks` below and silently deflate every real entry's
+    `pick_rate`. `max_picks` is nonetheless computed only over names present
+    in `entries` here, as a second, defensive layer — every other read of
+    `stats` already goes through `stats.get(entry.name, {})`, so this is the
+    one place an unscoped `stats` dict could otherwise leak in.
+    """
+    if not entries:
+        raise RotationRefused("rotation pool is empty; run `skill-advisor build`")
+    fits = centroids_mod.fit(sketch, embeddings, min_observed=cfg.min_observed_prompts)
+    if fits is None:
+        raise RotationRefused(
+            f"only {sketch.observed} prompts observed; rotation needs "
+            f"{cfg.min_observed_prompts} before the centroid sketch means anything"
+        )
+
+    pool_names = {e.name for e in entries}
+    max_picks = (
+        max(
+            (int(s.get("picks", 0)) for name, s in stats.items() if name in pool_names),
+            default=0,
+        )
+        or 1
+    )
+    out: list[Scored] = []
+    for i, entry in enumerate(entries):
+        st = stats.get(entry.name, {})
+        picks = int(st.get("picks", 0))
+        invocations = int(st.get("invocations", 0))
+        pick_rate = picks / max_picks
+        invocation_rate = (invocations / picks) if picks else 0.0
+        fit = float(fits[i])
+        out.append(
+            Scored(
+                entry=entry,
+                semantic_fit=fit,
+                pick_rate=pick_rate,
+                invocation_rate=invocation_rate,
+                last_invoked_days=st.get("last_invoked_days"),
+                total=W_SEMANTIC * fit + W_PICK * pick_rate + W_INVOCATION * invocation_rate,
+            )
+        )
+    return out
+
+
+def _shielded(s: Scored, cfg: RotationConfig) -> bool:
+    """Recently invoked ⟹ never demote, whatever the score says."""
+    d = s.last_invoked_days
+    return d is not None and d <= cfg.recency_days
+
+
+def propose(scored: list[Scored], cfg: RotationConfig) -> Proposal:
+    ranked = sorted(scored, key=lambda s: s.total, reverse=True)
+    target = max(int(cfg.target_active), 0)
+
+    # F8: clamp defensively. An out-of-range exploration_fraction (e.g. a
+    # negative value from a hand-edited config.toml) turns explore_slots
+    # negative, and `unused[:explore_slots]` below then becomes a
+    # negative-index slice — Python silently reads that as "all but the
+    # last N", which for a large `unused` list promotes nearly everything
+    # with zero usage. Measured with exploration_fraction=-0.1 and
+    # target_active=75: explore_slots=-8, 222 promotions, ending at 292
+    # active against a target of 75. `min_active` is a floor on the
+    # RESULT, not on this arithmetic, so it cannot catch it.
+    exploration_fraction = min(max(cfg.exploration_fraction, 0.0), 1.0)
+    explore_slots = int(round(target * exploration_fraction))
+    merit_slots = max(target - explore_slots, 0)
+
+    chosen: list[Scored] = list(ranked[:merit_slots])
+    chosen_names = {s.entry.name for s in chosen}
+
+    # Exploration slice: highest semantic_fit among skills with no usage at all.
+    # This is the deliberate cost of discovering skills the usage data cannot
+    # recommend, and it is what makes this more than a leaderboard. Tracked
+    # separately because these must BYPASS hysteresis below — an exploration
+    # pick is a reserved slot, not a merit contest it has to win. Subjecting it
+    # to the margin test would reject it every time (it loses on merit by
+    # construction) and silently delete the whole feature.
+    explore_names: set[str] = set()
+    if explore_slots:
+        unused = [
+            s for s in sorted(scored, key=lambda s: s.semantic_fit, reverse=True)
+            if s.pick_rate == 0.0 and s.invocation_rate == 0.0
+            and s.entry.name not in chosen_names
+        ]
+        for s in unused[:explore_slots]:
+            chosen.append(s)
+            chosen_names.add(s.entry.name)
+            explore_names.add(s.entry.name)
+
+    incumbents = {s.entry.name for s in scored if s.entry.enabled}
+    by_name = {s.entry.name: s for s in scored}
+    prop = Proposal()
+
+    # Best incumbent that did NOT make the cut — what a promotion displaces.
+    displaced = [by_name[n].total for n in incumbents if n not in chosen_names]
+    best_displaced = max(displaced, default=None)
+
+    for name in sorted(chosen_names - incumbents):
+        s = by_name[name]
+        if name in explore_names:
+            prop.promote.append(s)
+            prop.reason_by_name[name] = (
+                f"exploration slot: semantic_fit={s.semantic_fit:.3f}, no usage history"
+            )
+            continue
+        # Hysteresis: a swap needs a score margin, not a bare ordering
+        # difference. Without it, near-tied skills thrash every run.
+        if best_displaced is not None and s.total < best_displaced + cfg.hysteresis:
+            continue
+        prop.promote.append(s)
+        prop.reason_by_name[name] = (
+            f"semantic_fit={s.semantic_fit:.3f} pick_rate={s.pick_rate:.3f} "
+            f"total={s.total:.3f} (>= displaced {best_displaced:.3f} + {cfg.hysteresis:.3f})"
+            if best_displaced is not None
+            else f"semantic_fit={s.semantic_fit:.3f} total={s.total:.3f} (free slot)"
+        )
+
+    # Demote only to make room for a promotion that actually happened, or to
+    # come back down to target. Demoting everything outside `chosen` would
+    # shrink the active set even when hysteresis blocked every promotion — a
+    # swap that never happened must not still cost a skill.
+    n_demote = max(0, len(incumbents) + len(prop.promote) - target)
+    candidates = sorted(
+        (by_name[n] for n in incumbents - chosen_names if not _shielded(by_name[n], cfg)),
+        key=lambda s: s.total,
+    )
+    prop.demote = candidates[:n_demote]
+
+    # Determine which incumbents would rank in the top target by merit alone.
+    # This is used to distinguish between demotions due to exploration reserves
+    # vs demotions due to low merit score.
+    top_target_names = {ranked[i].entry.name for i in range(min(target, len(ranked)))}
+
+    # Every entry occupying an exploration slot — whether filling it
+    # required an actual promotion (the entry wasn't already active) or not
+    # (it was already an incumbent, so the explore step added it to
+    # `chosen` without ever touching `prop.promote`). F9: the previous
+    # version derived this from `prop.promote` alone
+    # (`explore_demotions = [e for e in prop.promote if ...]`), which is
+    # EMPTY whenever the explore slot happens to land on an already-enabled
+    # skill. When that happens, a true top-target incumbent bumped out of
+    # `chosen` by that same explore slot still gets demoted (chosen has
+    # merit_slots + explore_slots entries, not `target`, so a low-fit
+    # explore pick displaces a real top-target member) — but with
+    # `explore_demotions` empty, the branch below never fired and the
+    # incumbent was mislabeled "outside the top N" while, by construction,
+    # ranking IN the top N. Measured: an incumbent at merit rank 10 of 10
+    # printed "total=0.810, outside the top 10".
+    explore_entries = [by_name[n] for n in explore_names]
+
+    for s in prop.demote:
+        last = (
+            f"last invoked {s.last_invoked_days:.0f}d ago"
+            if s.last_invoked_days is not None
+            else "never invoked"
+        )
+
+        # If this incumbent ranks in the top target but is demoted, it was
+        # displaced by an exploration slot (a reserved discovery slot that
+        # takes priority over merit ranking). Distinguish this from the
+        # normal "low merit score" case.
+        if s.entry.name in top_target_names and explore_entries:
+            lowest_explore = min(explore_entries, key=lambda e: e.total)
+            prop.reason_by_name[s.entry.name] = (
+                f"displaced by exploration slot ({lowest_explore.entry.name}: "
+                f"semantic_fit={lowest_explore.semantic_fit:.3f}); "
+                f"incumbent scores {s.total:.3f}; {last}"
+            )
+        else:
+            # Displaced on merit: incumbent's score is outside the top target.
+            prop.reason_by_name[s.entry.name] = (
+                f"total={s.total:.3f}, outside the top {target}; {last}"
+            )
+
+    # The recency shield can legitimately leave the set above target — a skill
+    # used yesterday is never demoted whatever it scores. That overshoot is
+    # intended; `min_active` is the only hard bound.
+    resulting = len(incumbents) + len(prop.promote) - len(prop.demote)
+    if resulting < cfg.min_active:
+        raise RotationRefused(
+            f"proposal would leave {resulting} skills active, below the floor of "
+            f"{cfg.min_active}; refusing"
+        )
+    return prop

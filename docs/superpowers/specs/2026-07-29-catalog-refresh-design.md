@@ -7,6 +7,46 @@
 
 ---
 
+> **Status 2026-07-30: implemented.** See
+> `docs/superpowers/plans/2026-07-30-catalog-refresh.md` for the task-by-task
+> implementation and `docs/superpowers/notes/2026-07-30-skilloverrides-verification.md`
+> for the verification-gate result. The plan's "Audit corrections" table is
+> **authoritative wherever it disagrees with this document.** Beyond that
+> table, five things were learned during implementation that this document
+> does not know about:
+>
+> 1. **"`skillOverrides` becomes the single source of truth" (§2,
+>    "`exclude_names` is migrated and deleted") is false as written.**
+>    `catalog.exclude_names` mutes skills, subagents, and slash commands
+>    alike; `skillOverrides` can only address user skills. `migrate-excludes`
+>    is therefore **partial by design**: it migrates only names that resolve
+>    to a `skillOverrides`-addressable catalog entry and leaves the rest in
+>    `exclude_names`. Measured on the author's machine: of 428 excluded
+>    names, 417 classify as migratable and 11 are retained — 8 match nothing
+>    on disk, 3 are built-in subagents (`Explore`,
+>    `feature-dev:code-architect`, `feature-dev:code-explorer`) that
+>    `skillOverrides` has no key for.
+> 2. **The verification gate below passed, and answered more than it
+>    asked.** `skillOverrides` via `--settings` works and merges per key, so
+>    `rotate --apply` writes a delta rather than the complete pool-sized map
+>    — the gate's replace-semantics contingency was not needed. The gate
+>    also proved plugin skills are **not addressable via `skillOverrides` at
+>    all**: a namespaced key (`plugin:skill`) is silently accepted by the
+>    settings file and ignored by Claude Code.
+> 3. **`invocation_rate` is weighted 0.0 in v1** (see the corrected Scoring
+>    table below) — the telemetry that produces it only started shipping on
+>    this branch, so it has no history to score against yet.
+> 4. **The pool is 727 parseable names, not 947.** 216 of 947 `SKILL.md`
+>    files on disk carry no parseable YAML frontmatter and are invisible to
+>    `catalog.scan()`; `skill-advisor doctor` now reports this split.
+> 5. **Only user skills are rotatable.** Subagents, slash commands, and
+>    plugin skills are permanently enabled and outside `skillOverrides`'s
+>    reach, so `rotate` excludes them from its pool entirely (and reports
+>    how many it excluded) rather than scoring entries it could never
+>    promote or demote.
+
+---
+
 ## Problem
 
 Two problems, one root cause: `skill-advisor` has no idea which skills Claude Code can
@@ -101,9 +141,14 @@ The central correction. The catalog stops being a single flat list and carries a
 | **Pickable** | skills whose `skillOverrides` value is not `off` | what `matcher` may recommend |
 | **Rotation pool** | every skill on disk, enabled or not | what `rotate` may promote or retire |
 
-`catalog.scan()` continues to walk all 947 skills and gains an `enabled: bool` field per
-entry, resolved from `skillOverrides`. The matcher filters to `enabled == True`; the
-rotation operates over the whole pool.
+`catalog.scan()` continues to walk every parseable skill — 727 of the 947 `SKILL.md`
+files on disk; the rest carry no parseable YAML frontmatter and are invisible to the
+scanner (see the status banner above) — and gains an `enabled: bool` field per entry,
+resolved from `skillOverrides`. **Two fix sites, not one:** the matcher filters to
+`enabled == True`, and so does `lifecycle.pick_candidates_for_phase()` — the
+hardcoded per-phase preference list, which turned out to be the single largest source
+of un-invocable recommendations (490 of them from one entry, `plan-writing`, alone).
+The rotation operates over the whole pool.
 
 This is what fixes the 58.6% without sacrificing the rotation's ability to reach back into
 the disabled majority.
@@ -127,13 +172,17 @@ should be read carefully rather than applied blind.
 
 Each skill in the pool gets a score from three signals:
 
-| Signal | Source | Applies to |
-|---|---|---|
-| `invocation_rate` | telemetry: picks followed by an actual Skill invocation in the same session | enabled skills only |
-| `pick_rate` | telemetry: how often the matcher chose it | enabled skills only |
-| `semantic_fit` | cosine of the skill's embedding against the nearest prompt centroid | **every skill, enabled or not** |
+| Signal | Source | Applies to | v1 weight |
+|---|---|---|---|
+| `invocation_rate` | telemetry: picks followed by an actual Skill invocation in the same session | enabled skills only | **0.0** |
+| `pick_rate` | telemetry: how often the matcher chose it | enabled skills only | 0.4 |
+| `semantic_fit` | cosine of the skill's embedding against the nearest prompt centroid | **every skill, enabled or not** | 0.6 |
 
-`semantic_fit` is what makes promotion possible.
+`invocation_rate` is computed and reported but weighted zero in v1: the telemetry that
+produces it (which skill a `Skill` tool call actually invoked, not just that some skill
+was invoked) only started being captured on this branch, so it has no history yet to
+score against. Promote its weight once weeks of data exist. `semantic_fit` is what
+makes promotion possible today.
 
 #### The centroid sketch
 

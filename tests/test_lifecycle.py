@@ -39,7 +39,9 @@ def test_is_trigger_negatives(prompt):
     assert lifecycle.is_trigger(prompt) is False
 
 
-@pytest.mark.parametrize("p", ["go", "next", "continue", "OK", "ship it", "do it", "proceed"])
+@pytest.mark.parametrize(
+    "p", ["go", "next", "continue", "OK", "ship it", "do it", "proceed"]
+)
 def test_is_continue_signal(p):
     assert lifecycle.is_continue_signal(p) is True
 
@@ -56,7 +58,9 @@ def test_is_complete_signal(p):
 
 def test_mentions_issues():
     assert lifecycle.mentions_issues("there are 3 bugs to fix") is True
-    assert lifecycle.mentions_issues("all good, no problems") is True  # "problems" is in text
+    assert (
+        lifecycle.mentions_issues("all good, no problems") is True
+    )  # "problems" is in text
     assert lifecycle.mentions_issues("great work") is False
 
 
@@ -66,8 +70,12 @@ def test_mentions_issues():
 def test_linear_progression():
     assert lifecycle.next_phase(lifecycle.PLANNING) == lifecycle.IMPLEMENTATION
     assert lifecycle.next_phase(lifecycle.IMPLEMENTATION) == lifecycle.REVIEW
-    assert lifecycle.next_phase(lifecycle.REVIEW, had_issues=False) == lifecycle.COMPLETE
-    assert lifecycle.next_phase(lifecycle.REVIEW, had_issues=True) == lifecycle.CORRECTION
+    assert (
+        lifecycle.next_phase(lifecycle.REVIEW, had_issues=False) == lifecycle.COMPLETE
+    )
+    assert (
+        lifecycle.next_phase(lifecycle.REVIEW, had_issues=True) == lifecycle.CORRECTION
+    )
     assert lifecycle.next_phase(lifecycle.CORRECTION) == lifecycle.REVIEW
 
 
@@ -98,7 +106,7 @@ def test_cycle_cap_forces_complete(isolated_paths):
     # Simulate 3 correction cycles.
     for _ in range(lifecycle.MAX_CORRECTION_CYCLES):
         lifecycle.advance(state, had_issues=True)  # correction
-        lifecycle.advance(state)                   # review
+        lifecycle.advance(state)  # review
     assert state.cycles[lifecycle.CORRECTION] == lifecycle.MAX_CORRECTION_CYCLES
     # One more review-with-issues → forced complete.
     lifecycle.advance(state, had_issues=True)
@@ -166,6 +174,117 @@ def test_pick_candidates_respects_kind_mismatch():
     assert picks == []
 
 
+def test_phase_candidates_skip_disabled_and_fall_through():
+    """Live trace 2026-07-30: PLANNING resolved to
+       Plan (enabled) · writing-plans (enabled) · plan-writing (OFF)
+    so every planning turn emitted a disabled skill as pick #3 — 490 times.
+    The ordered list already contains enabled alternatives further down; they
+    were simply never reached."""
+
+    def _skill(name, enabled):
+        return CatalogEntry(
+            kind="skill",
+            name=name,
+            namespace="user",
+            description="d",
+            path=f"/s/{name}/SKILL.md",
+            enabled=enabled,
+        )
+
+    catalog = [
+        CatalogEntry(
+            kind="subagent", name="Plan", namespace="builtin", description="d"
+        ),
+        _skill("writing-plans", True),
+        _skill("plan-writing", False),
+        _skill("brainstorming", True),
+    ]
+    picks = lifecycle.pick_candidates_for_phase(lifecycle.PLANNING, catalog, limit=3)
+    names = [e.name for e in picks]
+    assert "plan-writing" not in names
+    assert names == ["Plan", "writing-plans", "brainstorming"]
+
+
+def test_phase_candidates_return_empty_when_all_are_disabled():
+    """Callers already fall back to the embedding matcher on an empty list."""
+    catalog = [
+        CatalogEntry(
+            kind="skill",
+            name="plan-writing",
+            namespace="user",
+            description="d",
+            path="/s/plan-writing/SKILL.md",
+            enabled=False,
+        ),
+    ]
+    assert (
+        lifecycle.pick_candidates_for_phase(lifecycle.PLANNING, catalog, limit=3) == []
+    )
+
+
+def test_pick_candidates_for_phase_resolves_bare_and_namespaced_separately():
+    """F2: a bare directory name can exist in BOTH the user skills and the
+    plugin cache — e.g. a user skill `brainstorming` AND a plugin skill
+    whose frontmatter `name:` is ALSO "brainstorming" but whose invocable
+    identity is "superpowers:brainstorming". Keying the phase-preference
+    lookup on `entry.name` (the frontmatter name) collides the two: since
+    plugins/cache is scanned after skills/, last-wins in the dict
+    comprehension silently resolves the BARE "brainstorming" preference to
+    the PLUGIN entry, not the user's.
+
+    Here the plugin entry is disabled and the user's is enabled, so the old
+    bug loses the pick entirely: the bare preference mis-resolves to the
+    disabled plugin entry and is filtered out by `pickable_only`, and the
+    namespaced preference ("superpowers:brainstorming") never matches
+    anything at all under the old code, because no catalog entry's
+    frontmatter `name:` is ever namespaced. The user's perfectly enabled
+    skill is unreachable either way."""
+
+    def _entry(name, namespace, invoke_name, enabled):
+        return CatalogEntry(
+            kind="skill",
+            name=name,
+            namespace=namespace,
+            description="d",
+            path=f"/s/{name}/SKILL.md",
+            enabled=enabled,
+            invoke_name=invoke_name,
+        )
+
+    # Scan order matters: skills/ is scanned before plugins/cache, so the
+    # plugin entry appears LATER in the catalog list — reproducing the exact
+    # last-wins collision `catalog.scan()` produces in practice.
+    catalog = [
+        _entry("brainstorming", "user", "brainstorming", enabled=True),
+        _entry(
+            "brainstorming",
+            "plugin:superpowers",
+            "superpowers:brainstorming",
+            enabled=False,
+        ),
+    ]
+    picks = lifecycle.pick_candidates_for_phase(lifecycle.PLANNING, catalog, limit=3)
+    assert [p.invoke_name for p in picks] == ["brainstorming"]
+
+
+def test_phase_candidates_can_opt_out_of_filtering():
+    """The rotation needs to see what a phase WOULD pick from the whole pool."""
+    catalog = [
+        CatalogEntry(
+            kind="skill",
+            name="plan-writing",
+            namespace="user",
+            description="d",
+            path="/s/plan-writing/SKILL.md",
+            enabled=False,
+        ),
+    ]
+    picks = lifecycle.pick_candidates_for_phase(
+        lifecycle.PLANNING, catalog, limit=3, pickable_only=False
+    )
+    assert [e.name for e in picks] == ["plan-writing"]
+
+
 # ---------- advance(source=...) + TurnState ----------
 
 
@@ -218,6 +337,7 @@ def test_turn_state_roundtrip(isolated_paths):
 
 def test_turn_state_records_todo_write(isolated_paths):
     from skill_advisor import lifecycle
+
     turn = lifecycle.record_todo_write(
         session_id="sess-xyz",
         todos=["Write parser", "Wire CLI flag", "Add tests"],
@@ -254,7 +374,7 @@ def test_append_todo_title_skips_blank(isolated_paths):
 
     lifecycle.append_todo_title("sess-blank", "real one")
     lifecycle.append_todo_title("sess-blank", "   ")  # whitespace-only → skip
-    lifecycle.append_todo_title("sess-blank", "")     # empty → skip
+    lifecycle.append_todo_title("sess-blank", "")  # empty → skip
     turn = lifecycle.load_turn("sess-blank")
     assert turn is not None
     assert turn.todo_write == {"count": 1, "titles": ["real one"]}
@@ -290,21 +410,28 @@ def test_append_todo_title_coexists_with_record_todo_write(isolated_paths):
 def test_turn_state_json_roundtrip_without_todo_write():
     # Older turn files on disk don't have the field — must still load.
     from skill_advisor import lifecycle
-    turn = lifecycle.TurnState.from_json({
-        "session_id": "sess-legacy",
-        "turn_started_at": 1234.0,
-        "tool_names": ["Edit"],
-        "subagents_invoked": [],
-    })
+
+    turn = lifecycle.TurnState.from_json(
+        {
+            "session_id": "sess-legacy",
+            "turn_started_at": 1234.0,
+            "tool_names": ["Edit"],
+            "subagents_invoked": [],
+        }
+    )
     assert turn.todo_write is None
 
 
 def test_parallelization_check_phase_constants():
     from skill_advisor import lifecycle
+
     assert lifecycle.PARALLELIZATION_CHECK == "parallelization_check"
     assert lifecycle.PARALLELIZATION_CHECK in lifecycle.ACTIVE_PHASES
     assert lifecycle.PARALLELIZATION_CHECK in lifecycle.PHASE_CANDIDATES
-    names = [name for _kind, name in lifecycle.PHASE_CANDIDATES[lifecycle.PARALLELIZATION_CHECK]]
+    names = [
+        name
+        for _kind, name in lifecycle.PHASE_CANDIDATES[lifecycle.PARALLELIZATION_CHECK]
+    ]
     # Must reference the canonical superpowers variants first.
     assert "superpowers:dispatching-parallel-agents" in names
     assert "superpowers:using-git-worktrees" in names
@@ -312,6 +439,7 @@ def test_parallelization_check_phase_constants():
 
 def test_enter_parallelization_check_sets_pending_todos():
     from skill_advisor import lifecycle
+
     state = lifecycle.start("sess-p", "build multi-part feature")
     assert state.phase == lifecycle.PLANNING
     assert state.pending_todos == []
@@ -328,10 +456,15 @@ def test_enter_parallelization_check_sets_pending_todos():
 
 def test_next_phase_parallelization_check_to_implementation():
     from skill_advisor import lifecycle
-    assert lifecycle.next_phase(lifecycle.PARALLELIZATION_CHECK) == lifecycle.IMPLEMENTATION
+
+    assert (
+        lifecycle.next_phase(lifecycle.PARALLELIZATION_CHECK)
+        == lifecycle.IMPLEMENTATION
+    )
 
 
 def test_phase_next_description_parallelization_check():
     from skill_advisor import lifecycle
+
     desc = lifecycle.phase_next_description(lifecycle.PARALLELIZATION_CHECK)
     assert "implementation" in desc.lower()
