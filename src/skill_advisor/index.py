@@ -95,12 +95,14 @@ def embed_one(text: str) -> np.ndarray:
     return _normalise(q)[0]
 
 
-def top_k(
-    prompt: str, index: Index, k: int, *, pickable_only: bool = True
+def _rank_prescored(
+    q: np.ndarray, index: Index, k: int, pickable_only: bool
 ) -> list[tuple[CatalogEntry, float]]:
-    if index.embeddings.shape[0] == 0 or k <= 0:
-        return []
-    q = embed_one(prompt)
+    """Cosine-rank `index` against an already-embedded query `q`.
+
+    Split out of `top_k` so `embed_and_rank` can hand back the query vector
+    it built without embedding the same prompt a second time.
+    """
     scores = index.embeddings @ q  # cosine because both sides are unit vectors
 
     if pickable_only and index.pickable is not None:
@@ -116,3 +118,30 @@ def top_k(
     top_idx = np.argpartition(-scores, k - 1)[:k]
     top_idx = top_idx[np.argsort(-scores[top_idx])]
     return [(index.catalog[i], float(scores[i])) for i in top_idx]
+
+
+def top_k(
+    prompt: str, index: Index, k: int, *, pickable_only: bool = True
+) -> list[tuple[CatalogEntry, float]]:
+    if index.embeddings.shape[0] == 0 or k <= 0:
+        return []
+    q = embed_one(prompt)
+    return _rank_prescored(q, index, k, pickable_only)
+
+
+def embed_and_rank(
+    prompt: str, index: Index, k: int, *, pickable_only: bool = True
+) -> tuple[list[tuple[CatalogEntry, float]], np.ndarray | None]:
+    """Like `top_k`, but also returns the query embedding.
+
+    A caller that needs the same prompt's vector again afterward (matcher.py
+    folding it into the centroid sketch — see `matcher.JudgeTrace.query_embedding`)
+    can reuse it instead of paying for a second ~100ms fastembed call on a
+    path the README promises is fast. Returns `(ranked, None)` in the same
+    short-circuit case `top_k` takes — empty catalog or `k<=0` — so no
+    embedding is computed there either.
+    """
+    if index.embeddings.shape[0] == 0 or k <= 0:
+        return [], None
+    q = embed_one(prompt)
+    return _rank_prescored(q, index, k, pickable_only), q

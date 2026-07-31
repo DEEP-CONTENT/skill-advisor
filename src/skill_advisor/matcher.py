@@ -5,6 +5,8 @@ import dataclasses
 import logging
 from dataclasses import dataclass
 
+import numpy as np
+
 from . import effort as effort_mod
 from . import index as index_mod
 from . import judge, lifecycle, parallelization, triage
@@ -40,15 +42,25 @@ class StatelessResult:
 
 @dataclass
 class JudgeTrace:
-    """Mutable out-parameter recording what the judge actually did this call.
+    """Mutable out-parameter recording what a call to `pick`/`pick_stateless`
+    actually did, independent of what it returns.
 
     Deliberately not folded into the return value: `_pick_inner` returns None
     whenever there are no picks, and the most important case to count — the
     judge running and declining — produces exactly that. A collector survives
     the None.
+
+    `query_embedding` rides the same mechanism for the same reason: whenever
+    `pick_stateless` embeds the prompt to rank candidates, it stashes that
+    vector here so a caller like `hook.run()` can fold it into the centroid
+    sketch afterward without embedding the same prompt a second time — even
+    on the many `_pick_inner` branches that end up returning `None` or a
+    `PickResult` built without ever calling `pick_stateless`, where there is
+    no return-value field to carry it on.
     """
     ran: bool = False
     failure: str | None = None
+    query_embedding: "np.ndarray | None" = None
 
 
 def _embedding_picks(
@@ -90,7 +102,8 @@ def pick_stateless(
     Overrides default to config values when None; `index` is injectable for tests.
 
     `trace`, if given, is populated with what the judge actually did this call
-    — see `JudgeTrace` for why this can't just be read off the return value.
+    and the query embedding this call computed (if any) — see `JudgeTrace`
+    for why neither can just be read off the return value.
     """
     idx = index if index is not None else _load_index()
     if idx is None:
@@ -103,7 +116,9 @@ def pick_stateless(
     k_picks = min(k_picks, k_candidates)
     min_score = cfg.matcher.min_embedding_score if threshold is None else threshold
 
-    ranked = index_mod.top_k(prompt, idx, k_candidates)
+    ranked, query_embedding = index_mod.embed_and_rank(prompt, idx, k_candidates)
+    if trace is not None:
+        trace.query_embedding = query_embedding
 
     if use_judge:
         cand_entries = [e for e, _ in ranked]
