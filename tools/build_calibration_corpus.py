@@ -27,10 +27,17 @@ contaminated reply was >1. This is intermittent (the hook fires on its own
 conditions), not constant, and is an artifact of collecting on a dev machine
 with extra ambient hooks — not a property of the judge itself. The collector
 detects it via `num_turns` and retries once (bounded, so a pathological
-prompt can't loop); if still contaminated after retrying, the row is recorded
-as `judge_failure: "hook_contaminated"` rather than folded into a genuine
-`unparseable`, and the contamination rate is written to stderr at the end so
-it doesn't require re-deriving from the corpus.
+prompt can't loop); if still contaminated after retrying, the row's PRIMARY
+outcome is recorded as `judge_failure: "hook_contaminated"` (not folded into
+a genuine `unparseable`) so nothing downstream treats it as clean data by
+default. But `num_turns > 1` alone does not prove the reply was unusable — a
+hijacked session can still return a parseable, on-schema verdict. Rather than
+pre-deciding that judgment call by discarding it, every contaminated attempt's
+actual parse result is preserved under `contaminated_picks`, so a later task
+can check empirically whether contaminated-but-parseable verdicts agree with
+clean ones instead of trusting a collection-time guess. The contamination
+rate is written to stderr at the end so it doesn't require re-deriving from
+the corpus.
 
 Writes no prompt text. The hash is for dedup only.
 """
@@ -89,6 +96,10 @@ class _RawCall:
     num_turns: int | None
     cost_usd: float | None
     elapsed_ms: int
+
+    @property
+    def contaminated(self) -> bool:
+        return self.num_turns is not None and self.num_turns > 1
 
 
 def _rank_raw(
@@ -190,26 +201,41 @@ def judge_with_contamination_guard(
     """Calls the judge, retrying once (bounded by `max_attempts`) whenever
     `num_turns > 1` signals a hook-hijacked nested session. Returns the
     verdict to record plus bookkeeping (attempts made, how many were
-    contaminated, and total cost across all attempts — the wasted
-    contaminated call still cost real money and belongs in the total).
+    contaminated, total cost across all attempts — the wasted contaminated
+    call still cost real money and belongs in the total — and the raw parse
+    result of every contaminated attempt, so a downstream task can decide
+    empirically whether a hijacked-but-parseable reply agreed with a clean
+    one, rather than that judgment being pre-made here by discarding it).
     """
     attempts: list[_RawCall] = []
     for _ in range(max_attempts):
         call = _rank_raw(prompt, candidates, config, timeout)
         attempts.append(call)
-        if call.num_turns is None or call.num_turns <= 1:
+        if not call.contaminated:
             break
 
     final = attempts[-1]
-    contaminated_attempts = sum(
-        1 for c in attempts if c.num_turns is not None and c.num_turns > 1
-    )
+    contaminated_attempts = sum(1 for c in attempts if c.contaminated)
     costs = [c.cost_usd for c in attempts if c.cost_usd is not None]
     total_cost = round(sum(costs), 6) if costs else None
 
-    if final.num_turns is not None and final.num_turns > 1:
-        # Exhausted retries and still contaminated — don't trust picks that
-        # may have parsed by coincidence out of a hijacked session's reply.
+    # What every contaminated attempt's parser actually produced — kept even
+    # though num_turns > 1 alone doesn't prove the reply was unusable; a
+    # hijacked session can still return a parseable, on-schema verdict.
+    contaminated_picks = [
+        {
+            "num_turns": c.num_turns,
+            "parsed": c.verdict.failure is None,
+            "picks": [p.name for p in c.verdict.picks],
+        }
+        for c in attempts
+        if c.contaminated
+    ]
+
+    if final.contaminated:
+        # The row's PRIMARY outcome stays a failure so nothing downstream
+        # treats it as clean data by default. What the hijacked session
+        # actually said is not lost — it's in contaminated_picks above.
         verdict = judge.JudgeResult(picks=[], failure=FAILURE_HOOK_CONTAMINATED)
     else:
         verdict = final.verdict
@@ -221,6 +247,7 @@ def judge_with_contamination_guard(
         "judge_ms": final.elapsed_ms,
         "attempts": len(attempts),
         "contaminated_attempts": contaminated_attempts,
+        "contaminated_picks": contaminated_picks,
     }
 
 
@@ -316,6 +343,7 @@ def main() -> int:
                         "judge_ms": result["judge_ms"],
                         "judge_attempts": result["attempts"],
                         "judge_contaminated_attempts": result["contaminated_attempts"],
+                        "contaminated_picks": result["contaminated_picks"],
                         "num_turns": result["num_turns"],
                         "cost_usd": result["cost_usd"],
                     }
