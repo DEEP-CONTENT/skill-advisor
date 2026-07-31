@@ -220,8 +220,8 @@ def test_scan_keeps_both_user_and_plugin_skills_with_same_name(isolated_paths):
 
 
 def test_scan_dedupes_multiple_versions_of_same_plugin_skill(isolated_paths):
-    """Multiple installed versions of the same plugin skill collapse to one entry,
-    with the lowest version string winning due to sorted() in the glob."""
+    """Multiple installed versions of the same plugin skill collapse to one
+    entry, with the HIGHEST version winning."""
     from skill_advisor import catalog
     from skill_advisor.config import Config
 
@@ -246,10 +246,47 @@ def test_scan_dedupes_multiple_versions_of_same_plugin_skill(isolated_paths):
     entries = catalog.scan(Config(), overrides_table={})
     writing_plans = [e for e in entries if e.invoke_name == "superpowers:writing-plans"]
 
-    # Only one entry should survive; the lowest version string wins
+    # Only one entry should survive; the highest version wins
     assert len(writing_plans) == 1
     assert writing_plans[0].namespace == "plugin:superpowers"
     assert writing_plans[0].name == "writing-plans"
+    assert writing_plans[0].description == "Plan skill v6.2.0."
+
+
+def test_scan_plugin_cache_dedup_compares_versions_numerically_not_lexicographically(
+    isolated_paths,
+):
+    """Neither the lexicographically-smallest NOR the lexicographically-largest
+    of these four version strings is the true highest version:
+    sorted(["10.0.0", "20.0.0", "6.2.0", "9.0.0"]) — "10.0.0" sorts first
+    (the old bug's pick, keeping whatever sorted() yielded first) and
+    "9.0.0" sorts last (what a naive max()-on-strings "fix" would wrongly
+    pick instead). Only real numeric version comparison gets "20.0.0"."""
+    from skill_advisor import catalog
+    from skill_advisor.config import Config
+
+    for version in ("6.2.0", "9.0.0", "10.0.0", "20.0.0"):
+        d = (
+            isolated_paths["claude_home"]
+            / "plugins"
+            / "cache"
+            / "official"
+            / "superpowers"
+            / version
+            / "skills"
+            / "writing-plans"
+        )
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            f'---\nname: writing-plans\ndescription: "Plan skill v{version}."\n---\n',
+            encoding="utf-8",
+        )
+
+    entries = catalog.scan(Config(), overrides_table={})
+    writing_plans = [e for e in entries if e.invoke_name == "superpowers:writing-plans"]
+
+    assert len(writing_plans) == 1
+    assert writing_plans[0].description == "Plan skill v20.0.0."
 
 
 def test_from_json_ignores_unknown_keys():

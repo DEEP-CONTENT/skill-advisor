@@ -30,7 +30,17 @@ def _dir_name(path: str) -> str:
     return Path(path).parent.name if path else ""
 
 
-def override_key(*, kind: str, namespace: str, path: str, name: str) -> str | None:
+def dir_name_for(path: str) -> str:
+    """Public wrapper around `_dir_name`, for a caller that needs to compute
+    it once and hand it to both `override_key` and `invoke_name` — avoiding
+    the double `Path(path).parent.name` those would otherwise each do on the
+    same path (see `catalog._entries_from_skill_file`)."""
+    return _dir_name(path)
+
+
+def override_key(
+    *, kind: str, namespace: str, path: str, name: str, dir_name: str | None = None
+) -> str | None:
     """The `skillOverrides` key governing this entry, or None if none does.
 
     `skillOverrides` covers skills only — subagents and slash commands are not
@@ -45,19 +55,38 @@ def override_key(*, kind: str, namespace: str, path: str, name: str) -> str | No
     through `skillOverrides` at all and stays enabled regardless of what the
     table contains — the namespaced form is silently ignored too (case C).
     So a plugin entry must resolve to no key, not to the shared dirname.
+
+    Same reasoning excludes `namespace == "extra"`: `config.catalog.extra_roots`
+    skills are scanned in place from an arbitrary directory the user pointed
+    the advisor at (README, "Scanning team-internal skills in place") — they
+    are never copied under `$CLAUDE_HOME/skills/`, so Claude Code's own skill
+    discovery (and therefore `skillOverrides`, which is keyed off of that same
+    discovery) has no idea they exist. A dirname key for one would silently
+    govern nothing, or worse, collide with an unrelated user/plugin skill that
+    happens to share the same directory name.
+
+    `dir_name`, if given, is the caller's own `Path(path).parent.name` —
+    passed in to avoid recomputing it when the caller (`catalog.
+    _entries_from_skill_file`) already needs it for `invoke_name` too.
     """
     if kind != "skill":
         return None
-    if namespace.startswith("plugin:"):
+    if namespace.startswith("plugin:") or namespace == "extra":
         return None
-    return _dir_name(path) or name
+    return (dir_name if dir_name is not None else _dir_name(path)) or name
 
 
-def invoke_name(*, kind: str, namespace: str, path: str, name: str) -> str:
-    """The exact string Claude Code's Skill tool accepts for this entry."""
+def invoke_name(
+    *, kind: str, namespace: str, path: str, name: str, dir_name: str | None = None
+) -> str:
+    """The exact string Claude Code's Skill tool accepts for this entry.
+
+    `dir_name`, if given, is the caller's own `Path(path).parent.name` — see
+    `override_key`'s matching parameter.
+    """
     if kind != "skill":
         return name
-    dirname = _dir_name(path) or name
+    dirname = (dir_name if dir_name is not None else _dir_name(path)) or name
     if namespace.startswith("plugin:"):
         plugin = namespace.split(":", 1)[1]
         return f"{plugin}:{dirname}"
