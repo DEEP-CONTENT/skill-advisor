@@ -14,6 +14,7 @@ none.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -50,12 +51,21 @@ def empty(k: int = DEFAULT_K) -> Sketch:
     )
 
 
-def load() -> Sketch:
-    """Never raises. A missing or wrong-shaped file degrades to an empty sketch,
-    which suppresses semantic_fit and makes rotation refuse to run."""
+def load(k: int = DEFAULT_K) -> Sketch:
+    """Never raises. A missing or wrong-shaped file degrades to an empty sketch
+    of `k` centroids, which suppresses semantic_fit and makes rotation refuse
+    to run.
+
+    `k` only matters for a COLD START (no file yet, or an unreadable one) —
+    once a valid sketch exists on disk, its own shape wins regardless of `k`;
+    the centroid count is fixed at creation time, same as `min_observed_prompts`
+    and every other cold-start-only setting. Callers pass
+    `cfg.rotation.centroid_count` so a configured value actually takes effect
+    instead of always seeding `DEFAULT_K`.
+    """
     f = paths.centroids_file()
     if not f.is_file():
-        return empty()
+        return empty(k)
     try:
         with np.load(f) as data:
             vectors = data["vectors"].astype(np.float32, copy=False)
@@ -63,29 +73,50 @@ def load() -> Sketch:
             observed = int(data["observed"])
     except Exception as exc:
         log.warning("centroids unreadable (%s); starting empty", exc)
-        return empty()
+        return empty(k)
     if (
         vectors.ndim != 2
         or vectors.shape[1] != DIM
         or counts.shape != (vectors.shape[0],)
     ):
         log.warning("centroids wrong shape %s; starting empty", vectors.shape)
-        return empty()
+        return empty(k)
     return Sketch(vectors=vectors, counts=counts, observed=observed)
 
 
 def save(sketch: Sketch) -> bool:
+    """Write `sketch` to disk atomically: temp file, then `Path.replace()`.
+
+    `np.savez()` writes straight to the file it's given, with no atomicity of
+    its own — a crash mid-write (killed process, disk full) leaves a
+    truncated, corrupt `.npz` sitting at the real path. Every other writer in
+    this codebase (`overrides.write`/`remove_keys`, `_write_config_toml`)
+    already goes through a `.tmp.<pid>` file + atomic replace; this matches
+    that. The temp file is opened ourselves and handed to `np.savez` as a
+    file object rather than a path, because `np.savez` silently appends
+    `.npz` to any path argument that doesn't already end in `.npz` — passing
+    it `centroids.npz.tmp.<pid>` as a *path* would actually write to
+    `centroids.npz.tmp.<pid>.npz`, breaking the rename below.
+    """
+    target = paths.centroids_file()
+    tmp = target.with_suffix(f".npz.tmp.{os.getpid()}")
     try:
         paths.ensure_dirs()
-        np.savez(
-            paths.centroids_file(),
-            vectors=sketch.vectors,
-            counts=sketch.counts,
-            observed=np.int64(sketch.observed),
-        )
+        with tmp.open("wb") as f:
+            np.savez(
+                f,
+                vectors=sketch.vectors,
+                counts=sketch.counts,
+                observed=np.int64(sketch.observed),
+            )
+        tmp.replace(target)
         return True
     except OSError as exc:
         log.debug("centroids save failed: %s", exc)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
         return False
 
 
