@@ -185,8 +185,23 @@ def run() -> int:
         # score a never-used skill was losing capacity to chit-chat.
         if cfg.telemetry.events_enabled and not triage.should_skip(prompt, cfg):
             try:
-                sketch = centroids.load()
-                centroids.observe(sketch, index_mod.embed_one(prompt))
+                sketch = centroids.load(k=cfg.rotation.centroid_count)
+                # Task 11 (deferred): reuse the query embedding matcher.pick()
+                # already computed for scoring — threaded out via
+                # JudgeTrace.query_embedding since _pick_inner has many
+                # branches that return without ever building a PickResult
+                # carrying it. Only branches that actually ran the stateless
+                # matcher (pick_stateless -> index_mod.embed_and_rank) set it;
+                # every other branch (phase picks, parallelization, a
+                # lifecycle signal handled without falling back to the
+                # matcher, ...) leaves it None, so this falls back to the
+                # original unconditional embed_one() call exactly as before.
+                vec = (
+                    trace.query_embedding
+                    if trace.query_embedding is not None
+                    else index_mod.embed_one(prompt)
+                )
+                centroids.observe(sketch, vec)
                 centroids.save(sketch)
             except Exception as exc:  # pragma: no cover - defensive; hooks never raise
                 log.debug("centroid update failed: %s", exc, exc_info=True)

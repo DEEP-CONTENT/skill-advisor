@@ -134,6 +134,87 @@ def test_hook_folds_the_prompt_into_the_sketch(isolated_paths):
     assert centroids.load().observed == 1
 
 
+def test_hook_creates_the_sketch_with_the_configured_centroid_count(isolated_paths):
+    """rotation.centroid_count was parsed but never read — a cold-start
+    sketch was always centroids.DEFAULT_K=8 regardless of what config.toml
+    said. The hook's centroid-fold step must thread cfg.rotation.centroid_count
+    into centroids.load()."""
+    import numpy as np
+
+    from skill_advisor import centroids
+
+    cfg = isolated_paths["config_home"] / "config.toml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(
+        "[telemetry]\nevents_enabled = true\nprompt_hash_salt = \"fixed\"\n"
+        "\n[rotation]\ncentroid_count = 3\n",
+        encoding="utf-8",
+    )
+    unit = np.zeros(centroids.DIM, dtype=np.float32)
+    unit[0] = 1.0
+
+    with patch("skill_advisor.hook.matcher.pick", return_value=None), \
+         patch("skill_advisor.hook.index_mod.embed_one", return_value=unit):
+        _run_with_stdin({"prompt": "why is this pod crashlooping in sydcdev", "session_id": "s1"})
+
+    raw = centroids.load()  # file now exists; its own shape reflects what was created
+    assert raw.vectors.shape[0] == 3
+
+
+def test_hook_embeds_the_prompt_only_once_end_to_end(isolated_paths):
+    """Task 11 (deferred): before the fix, matcher.pick() embeds the prompt
+    once inside index_mod.top_k() to rank candidates, and then hook.run()'s
+    sketch-fold step embeds the SAME prompt again via a separate
+    index_mod.embed_one() call — the same ~100ms fastembed call twice on a
+    path the README promises is fast. This drives matcher.pick() for real
+    (no mock) so both embed sites are actually exercised, and counts calls
+    to the real index_mod.embed_one — after the fix, hook.run() reuses the
+    query vector matcher.pick() already computed via
+    JudgeTrace.query_embedding instead of re-embedding."""
+    import numpy as np
+
+    from skill_advisor import catalog as catalog_mod
+    from skill_advisor import index as index_mod
+    from skill_advisor.catalog import CatalogEntry
+
+    _enable_telemetry_in_config(isolated_paths)
+
+    entries = [
+        CatalogEntry(
+            kind="skill",
+            name="brainstorming",
+            namespace="user",
+            description="brainstorm ideas for a new feature",
+            path="/skills/brainstorming/SKILL.md",
+        ),
+    ]
+    rng = np.random.default_rng(7)
+    embeddings = rng.standard_normal((1, 8)).astype(np.float32)
+    embeddings /= np.linalg.norm(embeddings, axis=1, keepdims=True)
+    catalog_mod.save(entries)
+    index_mod.save(entries, embeddings, "hash")
+
+    real_embed_one = index_mod.embed_one
+    embed_calls: list[str] = []
+
+    def _counting_embed_one(text):
+        embed_calls.append(text)
+        return real_embed_one(text)
+
+    class _Stub:
+        def embed(self, texts):
+            for _ in texts:
+                yield rng.standard_normal(8).astype(np.float32)
+
+    # No session_id: takes the "Default: stateless matcher" branch directly,
+    # with no lifecycle-trigger ambiguity to reason about.
+    with patch.object(index_mod, "_embed_model", return_value=_Stub()), \
+         patch.object(index_mod, "embed_one", side_effect=_counting_embed_one):
+        _run_with_stdin({"prompt": "help me brainstorm ideas for a new feature"})
+
+    assert len(embed_calls) == 1
+
+
 def test_hook_does_not_write_the_sketch_when_telemetry_is_off(isolated_paths):
     from skill_advisor import paths
 

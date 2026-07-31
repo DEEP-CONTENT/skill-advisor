@@ -77,6 +77,44 @@ def test_top_k_empty_catalog_returns_empty():
     assert index_mod.top_k("anything", idx, k=5) == []
 
 
+def test_embed_and_rank_matches_top_k_and_returns_the_query_vector(monkeypatch):
+    """embed_and_rank is top_k's ranking plus the query embedding it built —
+    both must agree on the ranking, and the vector it hands back must be the
+    one actually used to score (not some independently re-derived value)."""
+    entries = _make_catalog()
+    embeddings = np.array(
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32
+    )
+
+    class FakeModel:
+        def embed(self, texts):
+            for _ in texts:
+                yield np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+    monkeypatch.setattr(index_mod, "_embed_model", lambda: FakeModel())
+    idx = index_mod.Index(catalog=entries, embeddings=embeddings)
+
+    ranked, q = index_mod.embed_and_rank("beta", idx, k=2)
+
+    assert len(ranked) == 2
+    assert ranked[0][0].name == "beta"  # the one exact match, unambiguously first
+    assert ranked[0][1] == 1.0
+    assert q is not None
+    assert np.array_equal(q, np.array([0.0, 1.0, 0.0], dtype=np.float32))
+    # Reusing the returned q to rank directly must reproduce the same result.
+    assert index_mod.top_k("beta", idx, k=2) == ranked
+
+
+def test_embed_and_rank_empty_catalog_returns_empty_and_no_query_vector():
+    """Matches top_k's short-circuit: an empty catalog computes no embedding
+    at all (not just an empty ranking) — a caller like hook.py must not
+    mistake a None here for "the prompt was embedded but scored nothing"."""
+    idx = index_mod.Index(catalog=[], embeddings=np.zeros((0, 4), dtype=np.float32))
+    ranked, q = index_mod.embed_and_rank("anything", idx, k=5)
+    assert ranked == []
+    assert q is None
+
+
 def test_top_k_skips_disabled_entries(isolated_paths):
     """The 58.6% bug, at the index layer. Must fail against today's code."""
     import numpy as np
@@ -193,7 +231,6 @@ def test_top_k_clamps_when_k_exceeds_the_pickable_count(isolated_paths):
 def test_load_derives_the_pickable_mask(isolated_paths):
     import numpy as np
 
-    from skill_advisor import catalog as catalog_mod
     from skill_advisor import index as index_mod
     from skill_advisor.catalog import CatalogEntry
 

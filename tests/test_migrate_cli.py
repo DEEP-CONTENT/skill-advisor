@@ -407,3 +407,54 @@ def test_stacked_migrate_then_revert_restores_from_real_backup_byte_identical(
 
     assert paths.settings_file().is_file()
     assert paths.settings_file().read_bytes() == after_first_migrate
+
+
+def test_revert_of_a_corrupt_absent_marker_fails_loudly_instead_of_reporting_success(
+    isolated_paths, capsys
+):
+    """A corrupt `.pre-migrate.absent` marker can't tell --revert which keys
+    to remove. Before the fix, this silently degraded to an empty key list
+    and still printed a "restored:" heading with exit 0 — a caller checking
+    only the exit code would believe the revert completed while the
+    migrated `off` entry was still sitting in skillOverrides untouched."""
+    _write_user_skill(isolated_paths["claude_home"], "xi")
+    _write_config(isolated_paths["config_home"], ["xi"])
+    assert cli._cmd_migrate_excludes(_ns(create_settings=True)) == 0
+
+    settings_absent_path = paths.settings_file().with_name(
+        paths.settings_file().name + ".pre-migrate.absent"
+    )
+    assert settings_absent_path.is_file()
+    settings_absent_path.write_text("{ not json", encoding="utf-8")
+
+    rc = cli._cmd_migrate_excludes(_ns(revert=True))
+    out = capsys.readouterr().out
+
+    assert rc != 0
+    assert "restored:" not in out
+    assert "ERROR" in out
+    # The settings file (and the migrated entry) must survive untouched —
+    # nothing was actually removed, so nothing may be reported as removed.
+    assert paths.settings_file().is_file()
+    settings = json.loads(paths.settings_file().read_text(encoding="utf-8"))
+    assert settings["skillOverrides"] == {"xi": "off"}
+    # The marker is kept so --revert can be retried.
+    assert settings_absent_path.is_file()
+
+
+def test_revert_of_a_wrong_shaped_absent_marker_also_fails_loudly(isolated_paths):
+    """Valid JSON that isn't the expected {"keys": [...]} shape is just as
+    unusable as a parse error — must not silently degrade to "remove
+    nothing" either."""
+    _write_user_skill(isolated_paths["claude_home"], "omicron2")
+    _write_config(isolated_paths["config_home"], ["omicron2"])
+    assert cli._cmd_migrate_excludes(_ns(create_settings=True)) == 0
+
+    settings_absent_path = paths.settings_file().with_name(
+        paths.settings_file().name + ".pre-migrate.absent"
+    )
+    settings_absent_path.write_text(json.dumps(["not", "the", "expected", "shape"]))
+
+    assert cli._cmd_migrate_excludes(_ns(revert=True)) != 0
+    settings = json.loads(paths.settings_file().read_text(encoding="utf-8"))
+    assert settings["skillOverrides"] == {"omicron2": "off"}

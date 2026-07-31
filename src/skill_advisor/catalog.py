@@ -79,8 +79,12 @@ def _entries_from_skill_file(
         return None
     name = str(name).strip()
     path = str(skill_md)
+    # Computed once and handed to both calls below — override_key() and
+    # invoke_name() each independently derive Path(path).parent.name, and
+    # this is the one call site that needs both for the same path.
+    dir_name = overrides.dir_name_for(path)
     key = overrides.override_key(
-        kind="skill", namespace=namespace, path=path, name=name
+        kind="skill", namespace=namespace, path=path, name=name, dir_name=dir_name
     )
     return CatalogEntry(
         kind="skill",
@@ -90,7 +94,7 @@ def _entries_from_skill_file(
         path=path,
         enabled=overrides.is_enabled(key, table),
         invoke_name=overrides.invoke_name(
-            kind="skill", namespace=namespace, path=path, name=name
+            kind="skill", namespace=namespace, path=path, name=name, dir_name=dir_name
         ),
     )
 
@@ -120,6 +124,24 @@ def _scan_plugin_skills(root: Path, table: dict[str, str]) -> Iterable[CatalogEn
             yield entry
 
 
+def _version_sort_key(version: str) -> tuple:
+    """Comparable key for a dotted version string, e.g. "10.2.0" > "9.0.0".
+
+    `sorted()`/`max()` on the raw path strings compares lexicographically,
+    which ranks "10.0.0" below "9.0.0" (and, more subtly, before "6.2.0")
+    because it compares character-by-character rather than component-by-
+    component. Each dot-separated segment is wrapped as `(0, int)` when
+    numeric or `(1, str)` otherwise, so every key is uniformly comparable
+    (numeric segments always sort before non-numeric ones at the same
+    position) without raising on an unexpected pre-release-style segment
+    like "6.2.0-beta".
+    """
+    key: list[tuple[int, int | str]] = []
+    for part in version.split("."):
+        key.append((0, int(part)) if part.isdigit() else (1, part))
+    return tuple(key)
+
+
 def _scan_plugin_cache_skills(
     root: Path, table: dict[str, str]
 ) -> Iterable[CatalogEntry]:
@@ -128,10 +150,34 @@ def _scan_plugin_cache_skills(
     Distinct from `plugins/marketplaces/`, which is the *catalogue* of available
     plugins. The cache is what is actually installed and invocable, and it
     interposes a version segment — so the marketplaces glob misses it entirely.
+
+    When multiple versions of the same plugin skill are installed side by
+    side, the highest version wins. This is decided HERE, by tracking the
+    best `(plugin_name, skill_dir_name)` seen so far, rather than relying on
+    `catalog.scan()`'s `_accept()` dedup (which keeps whichever entry it saw
+    *first* — previously whatever `sorted()` on the raw glob happened to
+    yield first, i.e. the LOWEST version string).
     """
     if not root.is_dir():
         return
-    for skill_md in sorted(root.glob("*/*/*/skills/*/SKILL.md")):
+    best: dict[tuple[str, str], tuple[tuple, Path]] = {}
+    for skill_md in root.glob("*/*/*/skills/*/SKILL.md"):
+        try:
+            plugin_name = skill_md.parents[3].name
+            version = skill_md.parents[2].name
+        except IndexError:
+            plugin_name = "unknown"
+            version = ""
+        key = (plugin_name, skill_md.parent.name)
+        vkey = _version_sort_key(version)
+        current = best.get(key)
+        if current is None or vkey > current[0]:
+            best[key] = (vkey, skill_md)
+
+    # Sorted by path for a deterministic scan order (matches every other
+    # scanner here) — the version comparison above already picked the
+    # winner per (plugin, skill dir); this only orders the winners.
+    for _vkey, skill_md in sorted(best.values(), key=lambda item: str(item[1])):
         try:
             plugin_name = skill_md.parents[3].name
         except IndexError:

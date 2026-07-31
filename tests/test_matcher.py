@@ -250,6 +250,40 @@ def test_pick_stateless_no_index_returns_empty(isolated_paths):
     assert result.picks == []
 
 
+def test_pick_stateless_populates_trace_query_embedding(isolated_paths):
+    """Task 11 (deferred): the query vector pick_stateless already builds to
+    rank candidates must be exposed to the caller via `trace`, not just
+    discarded — so hook.py can fold it into the centroid sketch instead of
+    embedding the same prompt a second time. `PickResult`/`StatelessResult`
+    can't carry it because many `_pick_inner` branches return None or a
+    PickResult without ever calling pick_stateless."""
+    from skill_advisor.config import Config
+
+    stub = _prime_stateless_index([0.9, 0.7, 0.5])
+    trace = matcher.JudgeTrace()
+    with patch.object(index_mod, "_embed_model", return_value=stub):
+        matcher.pick_stateless("q", Config(), top_k=3, candidates=3, threshold=0.0, trace=trace)
+
+    assert trace.query_embedding is not None
+    assert trace.query_embedding.shape == (3,)
+    # The fixed stub always embeds to [1, 0, 0].
+    assert trace.query_embedding[0] == 1.0
+
+
+def test_pick_stateless_leaves_trace_query_embedding_none_when_there_is_no_index(
+    isolated_paths,
+):
+    """No catalog.json/embeddings.npz on disk -> pick_stateless returns before
+    ever computing an embedding. trace must stay at its None default, not
+    some stale/default vector."""
+    from skill_advisor.config import Config
+
+    trace = matcher.JudgeTrace()
+    matcher.pick_stateless("q", Config(), top_k=3, candidates=3, threshold=0.0, trace=trace)
+
+    assert trace.query_embedding is None
+
+
 def test_pick_stateless_parity_with_pick_on_nonlifecycle(isolated_paths):
     """Property: for a prompt that doesn't trigger lifecycle, stateless and pick()
     return the same list of (name, reason) tuples."""

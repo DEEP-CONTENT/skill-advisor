@@ -94,6 +94,23 @@ def test_fit_is_suppressed_before_the_cold_start_floor(isolated_paths):
     assert centroids.fit(s, np.stack([_unit(1.0)]), min_observed=200) is None
 
 
+def test_load_uses_the_given_k_for_a_cold_start_sketch(isolated_paths):
+    """rotation.centroid_count was parsed into RotationConfig but never
+    threaded to centroids.empty()/load() — a cold-start sketch was always
+    DEFAULT_K=8 regardless of what the config said. `k` only matters when
+    there's no file yet (or an unreadable one); this pins that path."""
+    assert not paths.centroids_file().is_file()
+    s = centroids.load(k=16)
+    assert s.vectors.shape == (16, centroids.DIM)
+
+
+def test_load_falls_back_to_the_given_k_on_a_corrupt_file_too(isolated_paths):
+    paths.ensure_dirs()
+    paths.centroids_file().write_bytes(b"")
+    s = centroids.load(k=3)
+    assert s.vectors.shape == (3, centroids.DIM)
+
+
 def test_load_returns_empty_on_a_wrong_shaped_file(isolated_paths):
     paths.ensure_dirs()
     np.savez(
@@ -132,3 +149,37 @@ def test_load_returns_empty_on_a_zero_byte_file(isolated_paths):
     s = centroids.load()
     assert s.observed == 0
     assert s.vectors.shape == (centroids.DEFAULT_K, centroids.DIM)
+
+
+def test_save_is_atomic_a_failed_write_leaves_the_existing_file_untouched(
+    isolated_paths, monkeypatch
+):
+    """save() used to call np.savez() straight at the real path — a crash
+    mid-write (killed process, disk full) would leave a truncated, corrupt
+    .npz there. It must write to a temp file and atomically replace, like
+    every other writer in this codebase (overrides.write/remove_keys,
+    _write_config_toml)."""
+    from pathlib import Path
+
+    s = centroids.empty(k=2)
+    s.observed = 3
+    assert centroids.save(s) is True
+    before = paths.centroids_file().read_bytes()
+
+    def _boom(self, target):
+        raise OSError("disk full (simulated)")
+
+    monkeypatch.setattr(Path, "replace", _boom)
+
+    s2 = centroids.empty(k=2)
+    s2.observed = 99
+    assert centroids.save(s2) is False
+
+    assert paths.centroids_file().read_bytes() == before
+    assert list(paths.centroids_file().parent.glob("*.tmp.*")) == []
+
+
+def test_save_leaves_no_leftover_temp_file_on_success(isolated_paths):
+    s = centroids.empty(k=2)
+    assert centroids.save(s) is True
+    assert list(paths.centroids_file().parent.glob("*.tmp.*")) == []

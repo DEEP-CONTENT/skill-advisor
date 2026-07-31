@@ -58,6 +58,36 @@ def test_override_key_is_none_for_plugin_skills_even_when_dir_matches_a_table_ke
     assert key is None
 
 
+def test_override_key_is_none_for_extra_root_skills():
+    """`config.catalog.extra_roots` skills are scanned in place from an
+    arbitrary directory the user configured — never copied under
+    `$CLAUDE_HOME/skills/`, so Claude Code's own skill discovery (and hence
+    `skillOverrides`, keyed off that discovery) has no idea they exist.
+    Resolving to the shared dirname key would silently govern nothing, or
+    collide with an unrelated user/plugin skill of the same directory name."""
+    key = overrides.override_key(
+        kind="skill",
+        namespace="extra",
+        path="/team/skill-library/analytics/SKILL.md",
+        name="team-analytics",
+    )
+    assert key is None
+
+
+def test_override_key_accepts_a_precomputed_dir_name():
+    """The `dir_name` kwarg lets a caller that already computed
+    Path(path).parent.name (catalog._entries_from_skill_file, so it isn't
+    recomputed for invoke_name() too) skip doing it again here."""
+    key = overrides.override_key(
+        kind="skill",
+        namespace="user",
+        path="/home/u/.claude/skills/xlsx/SKILL.md",
+        name="xlsx-official",
+        dir_name="xlsx",
+    )
+    assert key == "xlsx"
+
+
 def test_invoke_name_namespaces_plugin_skills():
     """Claude Code invokes plugin skills as `<plugin>:<skill>`; the catalog
     currently emits the bare frontmatter name, which the Skill tool rejects."""
@@ -78,6 +108,11 @@ def test_invoke_name_is_the_directory_name_for_user_skills():
         name="xlsx-official",
     )
     assert got == "xlsx"
+
+
+def test_dir_name_for_matches_what_override_key_derives_internally():
+    assert overrides.dir_name_for("/home/u/.claude/skills/xlsx/SKILL.md") == "xlsx"
+    assert overrides.dir_name_for("") == ""
 
 
 def test_missing_key_means_enabled():
@@ -135,3 +170,68 @@ def test_write_rejects_a_namespaced_key():
 
     with pytest.raises(ValueError):
         overrides.write({"superpowers:brainstorming": "off"})
+
+
+# --- remove_keys(): the surgical counterpart to write(), used by
+# `migrate-excludes --revert` — had no direct unit test in this file,
+# unlike write(), despite being the surgical-revert path. ---
+
+
+def test_remove_keys_drops_exactly_the_given_keys(isolated_paths):
+    paths.settings_file().write_text(
+        json.dumps({"skillOverrides": {"a": "off", "b": "off", "c": "off"}}),
+        encoding="utf-8",
+    )
+    assert overrides.remove_keys(["a", "c"]) is True
+
+    data = json.loads(paths.settings_file().read_text(encoding="utf-8"))
+    assert data["skillOverrides"] == {"b": "off"}
+
+
+def test_remove_keys_leaves_other_top_level_keys_alone(isolated_paths):
+    """A settings file written by this tool isn't the only writer of it —
+    `baseline._write_settings_effort` and `install.render_settings` both do
+    their own read-modify-write of the same file. remove_keys() must not
+    disturb anything it didn't add."""
+    paths.settings_file().write_text(
+        json.dumps({"effortLevel": "high", "skillOverrides": {"a": "off", "b": "off"}}),
+        encoding="utf-8",
+    )
+    assert overrides.remove_keys(["a"]) is True
+
+    data = json.loads(paths.settings_file().read_text(encoding="utf-8"))
+    assert data["effortLevel"] == "high"
+    assert data["skillOverrides"] == {"b": "off"}
+
+
+def test_remove_keys_missing_key_is_a_noop():
+    paths.settings_file().parent.mkdir(parents=True, exist_ok=True)
+    paths.settings_file().write_text(
+        json.dumps({"skillOverrides": {"a": "off"}}), encoding="utf-8"
+    )
+    assert overrides.remove_keys(["never-there"]) is True
+
+    data = json.loads(paths.settings_file().read_text(encoding="utf-8"))
+    assert data["skillOverrides"] == {"a": "off"}
+
+
+def test_remove_keys_missing_file_is_a_noop_returning_true():
+    assert overrides.remove_keys(["a"]) is True
+    assert not paths.settings_file().is_file()
+
+
+def test_remove_keys_aborts_on_unparseable_settings_leaving_bytes_identical(
+    isolated_paths,
+):
+    paths.settings_file().write_text("{ not json", encoding="utf-8")
+    before = paths.settings_file().read_bytes()
+    assert overrides.remove_keys(["a"]) is False
+    assert paths.settings_file().read_bytes() == before
+
+
+def test_remove_keys_no_leftover_temp_file_on_success(isolated_paths):
+    paths.settings_file().write_text(
+        json.dumps({"skillOverrides": {"a": "off"}}), encoding="utf-8"
+    )
+    assert overrides.remove_keys(["a"]) is True
+    assert list(paths.settings_file().parent.glob("*.tmp.*")) == []
