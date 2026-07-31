@@ -613,8 +613,11 @@ Scores the **rotation pool** — every catalog entry `skillOverrides` can actual
 govern, which today means user skills only — against usage and semantic fit,
 and proposes swapping low-scoring active skills for higher-scoring inactive
 ones. Subagents, slash commands, and plugin-namespaced skills are permanently
-enabled in Claude Code and outside `skillOverrides`'s reach, so they're excluded
-from the pool entirely; the summary line reports how many and why.
+enabled in Claude Code and outside `skillOverrides`'s reach; `extra_roots`
+skills are excluded for a different reason but the same effect — they're
+scanned in place from a directory Claude Code's own skill discovery never
+looks at, so `skillOverrides` can't address them either. All four are
+excluded from the pool entirely; the summary line reports how many and why.
 
 **A dry run writes nothing.** Without `--apply`, `rotate` only prints the
 proposal — every settings write happens strictly after the printed output, and
@@ -821,13 +824,12 @@ veto_cooldown_sessions = 10
 ultracode_nudge = true
 
 [rotation]
-# Reserved for a future automatic-rotation mode ("rotate every N sessions,
-# announced via systemMessage", mirroring the effort write-back). NOT
-# consulted by anything today — `skill-advisor rotate` runs unconditionally
-# regardless of this flag. The only way to rotate today is running the
-# command yourself. Off by default because the scoring is unvalidated: a
-# wrong rotation silently removes a skill you rely on.
-enabled = false
+# There is no automatic-rotation mode ("rotate every N sessions") and no
+# master toggle for one — `skill-advisor rotate` is a CLI verb you run
+# yourself, dry-run by default, and every write still needs --apply. That is
+# the safety rail: the scoring is unvalidated, and a wrong rotation silently
+# removes a skill you rely on, so the human stays in the loop by construction
+# rather than by a config flag that could be flipped once and forgotten.
 
 # How many user skills `rotate` tries to keep active. Within the 50-100 band
 # the design settled on. Override per-run with `rotate --target N`.
@@ -854,9 +856,10 @@ recency_days = 30
 # refuses to run rather than score against an unformed sketch.
 min_observed_prompts = 200
 
-# Declared but not wired up today: the sketch is always 8 centroids
-# (`centroids.DEFAULT_K`) regardless of this value. Left here as the
-# intended knob for when that's made configurable.
+# How many centroids the sketch keeps (see "The centroid sketch" below).
+# Only takes effect on a cold start — once centroids.npz exists on disk, its
+# shape is fixed until it's deleted (e.g. `skill-advisor uninstall`) and
+# re-created, same as any other cold-start-only setting here.
 centroid_count = 8
 ```
 
