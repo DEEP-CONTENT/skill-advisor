@@ -181,9 +181,10 @@ breakdown accrues from install. The report labels which population each table is
 
 ## Privacy
 
-**Identifiers only — no free-form `tool_input`.** No file paths, no shell commands, no prompt
-text, no arguments. This matches how prompts are already reduced to `prompt_sha256`, and is
-covered by an explicit test rather than left to reviewer vigilance.
+**Identifiers only — no free-form `tool_input` in the event log.** No file paths, no shell
+commands, no prompt text, no arguments reach `events.jsonl`. This matches how prompts are
+already reduced to `prompt_sha256`, and is covered by an explicit test rather than left to
+reviewer vigilance.
 
 Stated precisely, because "tool names only" was the earlier wording and it is not true:
 exactly **two `tool_input` values** reach the event, both deliberately.
@@ -201,7 +202,13 @@ free text from the model's tool call rather than a validated enum. Both are ther
 **length-capped at 64 chars in `record_tool`** — a bound, not a truncation anyone meets: the
 longest skill name on the live log is 42 chars.
 
-Nothing else from `tool_input` is read, stored, or written anywhere.
+Nothing else from `tool_input` reaches `events.jsonl`. That does not extend to the local
+turn-state file: `TodoWrite`/`TaskCreate` task titles (`tool_input.todos[].content` /
+`tool_input.subject`) are stored there too, via `record_todo_write`/`append_todo_title`, up to
+50 items with no per-item length cap. That file is per-session and deleted when `run_stop`
+processes the turn, and its `todo_write` field is never passed to `telemetry.record_stop` — so
+none of it reaches the event log — but it is real data on disk while the turn is active, and the
+sentence above is a claim about the event log, not about everything `tool_input` touches.
 
 ---
 

@@ -1786,15 +1786,24 @@ and latency stats. Off by default.
 - Prompts are stored as `sha256(salt + prompt)[:16]` — never plaintext.
 - Session ids are hashed the same way — raw Claude Code session ids never land
   on disk.
-- **Tool calls contribute identifiers, never free-form `tool_input`.** No file
-  paths, no shell commands, no arguments. Exactly two `tool_input` *values*
-  reach the log, both deliberately: `tool_input.skill` on a `Skill` call (the
-  basis of per-skill attribution, landing in the `stop` event's `skills`) and
+- **Tool calls contribute identifiers, never free-form `tool_input`, to the
+  event log.** No file paths, no shell commands, no arguments in
+  `events.jsonl`. Exactly two `tool_input` *values* reach the log, both
+  deliberately: `tool_input.skill` on a `Skill` call (the basis of per-skill
+  attribution, landing in the `stop` event's `skills`) and
   `tool_input.subagent_type` on an `Agent`/`Task` call (landing in
   `subagents`). Both are free text from the model's tool call rather than a
   validated enum, so both are length-capped at 64 characters when recorded —
   a bound, not a truncation anyone meets (the longest real skill name is 42).
-  Nothing else from `tool_input` is read, stored, or written.
+  Nothing else from `tool_input` reaches the event log.
+- **The local turn-state file is a separate, narrower-scoped disk surface,
+  and this guarantee does not extend to it.** While a turn is in progress,
+  `TodoWrite`/`TaskCreate` task titles (`tool_input.todos[].content` /
+  `tool_input.subject`) are also written there — up to 50 items, with no
+  per-item length cap — to drive the parallelization-check nudge. That file
+  is deleted when the turn ends and is never passed to the event-log writer,
+  so none of it reaches `events.jsonl`; the claim above is scoped to the
+  event log, not to everything `tool_input` touches on disk.
 - The salt auto-generates once at `~/.cache/skill-advisor/telemetry.salt`
   (mode `0600`) unless you pin one in `config.toml`. Wiping the salt file
   anonymises historical events.

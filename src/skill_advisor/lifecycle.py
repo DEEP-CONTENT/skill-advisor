@@ -534,14 +534,23 @@ def delete_turn(session_id: str) -> bool:
 # pattern already used above for TodoWrite/TaskCreate.
 SUBAGENT_LAUNCHER_TOOLS = frozenset({"Task", "Agent"})
 
-# `subagent_type` and `skill` are the only `tool_input` VALUES that reach the
-# turn file and, from there, `events.jsonl`. Both are free text from the
-# model's tool call, not a validated enum, so they are length-capped at the
-# storage boundary — an event log documented as carrying identifiers must not
-# be able to accumulate an arbitrarily long string because one caller passed
-# one. 64 is far above every real name (the longest skill observed on the live
-# log is 42 chars, the longest agent type well under that), so the cap
-# describes a bound, not a truncation anyone will meet.
+# `subagent_type` and `skill` are the only `tool_input` VALUES that reach
+# `events.jsonl`. They are NOT the only `tool_input` values that reach the
+# turn FILE on disk: `record_todo_write`/`append_todo_title` below store
+# TodoWrite's `todos[].content` and TaskCreate's `subject` there too — up to
+# 50 items, with no per-item length cap. That data is scoped to the turn
+# file: `run_stop` deletes the file before telemetry is written and never
+# passes `todo_write` to `telemetry.record_stop`, so it never reaches the
+# event log — but "only tool_input value on disk" would be a false claim,
+# so this comment does not make it.
+#
+# `subagent_type` and `skill` ARE free text from the model's tool call, not a
+# validated enum, so they are length-capped at the storage boundary — an
+# event log documented as carrying identifiers must not be able to
+# accumulate an arbitrarily long string because one caller passed one. 64 is
+# far above every real name (the longest skill observed on the live log is
+# 42 chars, the longest agent type well under that), so the cap describes a
+# bound, not a truncation anyone will meet.
 _TURN_NAME_CAP = 64
 
 
