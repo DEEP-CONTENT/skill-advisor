@@ -955,3 +955,50 @@ def test_posttooluse_wires_the_mark_into_turn_state(monkeypatch, isolated_paths)
     turn = lifecycle.load_turn("sess-wire")
     assert turn.tool_names == ["Read", "Bash"]
     assert len(turn.tool_marks) == 2, "PostToolUse did not record a timestamp"
+
+
+def test_stop_wires_marks_into_spans(monkeypatch, isolated_paths):
+    """Goes RED if run_stop stops converting marks into spans."""
+    import io
+    import json as _json
+    from skill_advisor import hook, lifecycle, paths
+
+    config_path = paths.config_file()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("[telemetry]\nevents_enabled = true\n", encoding="utf-8")
+
+    turn = lifecycle.TurnState(session_id="sess-spans", turn_started_at=1000.0)
+    turn.tool_names = ["Read", "Bash"]
+    turn.tool_marks = [1000.5, 1003.5]
+    lifecycle.save_turn(turn)
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps({"session_id": "sess-spans"})))
+    assert hook.run_stop() == 0
+
+    rows = [_json.loads(l) for l in paths.events_file().read_text().splitlines() if l.strip()]
+    stop = [r for r in rows if r.get("kind") == "stop"][-1]
+    assert stop["tool_spans"] == [["Read", 500], ["Bash", 3000]]
+
+
+def test_stop_drops_spans_when_marks_desync(monkeypatch, isolated_paths):
+    """A torn write must produce NO spans, never a guessed alignment."""
+    import io
+    import json as _json
+    from skill_advisor import hook, lifecycle, paths
+
+    config_path = paths.config_file()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("[telemetry]\nevents_enabled = true\n", encoding="utf-8")
+
+    turn = lifecycle.TurnState(session_id="sess-desync", turn_started_at=1000.0)
+    turn.tool_names = ["Read", "Bash", "Edit"]
+    turn.tool_marks = [1000.5, 1003.5]  # one short
+    lifecycle.save_turn(turn)
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps({"session_id": "sess-desync"})))
+    assert hook.run_stop() == 0
+
+    rows = [_json.loads(l) for l in paths.events_file().read_text().splitlines() if l.strip()]
+    stop = [r for r in rows if r.get("kind") == "stop"][-1]
+    assert "tool_spans" not in stop
+    assert stop["tools"] == ["Read", "Bash", "Edit"]  # names still recorded

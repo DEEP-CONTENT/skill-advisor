@@ -465,11 +465,22 @@ def run_stop() -> int:
     # ingestion rate. Lifecycle auto-advance is a separate concern below.
     if cfg.telemetry.events_enabled:
         try:
+            # Marks are index-parallel to tool_names. A desync means a torn write —
+            # emit no spans rather than guessing an alignment.
+            spans: list[tuple[str, int]] = []
+            if len(turn.tool_marks) == len(turn.tool_names):
+                previous = turn.turn_started_at
+                for name, mark in zip(turn.tool_names, turn.tool_marks):
+                    # Clamp: a clock adjustment mid-turn must never yield a negative.
+                    spans.append((name, max(0, int((mark - previous) * 1000))))
+                    previous = mark
+
             telemetry.record_stop(
                 session_id=session_id,
                 tools=turn.tool_names,
                 subagents=turn.subagents_invoked,
                 skills=turn.skills_invoked,
+                tool_spans=spans,
                 config=cfg.telemetry,
             )
         except Exception as exc:
