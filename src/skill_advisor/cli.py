@@ -617,6 +617,14 @@ def _cmd_bleed(args: argparse.Namespace) -> int:
     tools = bleed_mod.tool_stats(turns, threshold_ms=threshold_ms)
     with_spans, total = bleed_mod.span_coverage(turns)
 
+    # With no span data anywhere, every attributed_ms is 0, so ranking by it
+    # sorts every row on the same zero and silently degenerates to the
+    # alphabetical tie-break — a "cost ranking" that is really a name sort.
+    # Rank by the measurement that DOES exist, and say so.
+    spans_absent = with_spans == 0
+    if spans_absent:
+        skills = sorted(skills, key=lambda s: (-s.p50_turn_s, s.name))
+
     if args.json:
         print(json.dumps({
             "turns": total,
@@ -634,6 +642,9 @@ def _cmd_bleed(args: argparse.Namespace) -> int:
     print(f"turns: {total} · spans: {with_spans} of {total} "
           f"({(with_spans / total * 100) if total else 0:.1f}%) · "
           f"idle threshold: {args.idle_threshold:.0f}s")
+    if spans_absent and total:
+        print("no span data yet — ranking by turn time; "
+              "per-tool cost and idle time need spans, which accrue from install")
     if unpaired:
         print(f"unpaired prompts: {unpaired} (turns that used no tools write no stop event)")
     if malformed:
@@ -643,9 +654,9 @@ def _cmd_bleed(args: argparse.Namespace) -> int:
     print()
 
     if args.by in ("skill", "both"):
-        _print_bleed_skills(skills, below, args)
+        _print_bleed_skills(skills, below, args, spans_absent)
     if args.by in ("tool", "both"):
-        _print_bleed_tools(tools, args)
+        _print_bleed_tools(tools, args, spans_absent)
     return 0
 
 
@@ -677,18 +688,31 @@ def _load_events_counting_failures(cutoff) -> tuple[list[dict], int]:
                 continue
             if cutoff is not None:
                 ts = bleed_mod.parse_ts(row.get("ts"))
-                if ts is None or ts < cutoff:
+                # Only drop rows that legitimately fall outside the window. A
+                # row whose ts will not parse falls THROUGH, so `pair_turns`
+                # counts it as malformed — one source of truth for that count
+                # rather than a second one here that could drift.
+                if ts is not None and ts < cutoff:
                     continue
             events.append(row)
     return events, skipped
 
 
-def _print_bleed_skills(skills, below, args) -> None:
-    print(f"{'SKILL':42} {'n':>4} {'p50 turn':>9} {'attributed':>11} {'idle':>9} {'idle turns':>11}")
-    for s in skills[: args.limit]:
-        print(f"{s.name[:42]:42} {s.n:>4} {s.p50_turn_s:>8.0f}s "
-              f"{s.attributed_ms / 3_600_000:>10.2f}h {s.idle_ms / 3_600_000:>8.2f}h "
-              f"{s.turns_with_idle:>11}")
+def _print_bleed_skills(skills, below, args, spans_absent: bool = False) -> None:
+    """`n` and `p50 turn` are turn-level and always available; `attributed`,
+    `idle` and `idle turns` are span-derived. When no turn carries spans the
+    span-derived columns are omitted entirely rather than printed as a row of
+    zeros, because "0.00h" and "not measured yet" are different claims."""
+    if spans_absent:
+        print(f"{'SKILL':42} {'n':>4} {'p50 turn':>9}")
+        for s in skills[: args.limit]:
+            print(f"{s.name[:42]:42} {s.n:>4} {s.p50_turn_s:>8.0f}s")
+    else:
+        print(f"{'SKILL':42} {'n':>4} {'p50 turn':>9} {'attributed':>11} {'idle':>9} {'idle turns':>11}")
+        for s in skills[: args.limit]:
+            print(f"{s.name[:42]:42} {s.n:>4} {s.p50_turn_s:>8.0f}s "
+                  f"{s.attributed_ms / 3_600_000:>10.2f}h {s.idle_ms / 3_600_000:>8.2f}h "
+                  f"{s.turns_with_idle:>11}")
     if len(skills) > args.limit:
         print(f"  +{len(skills) - args.limit} more")
     if below:
@@ -696,7 +720,13 @@ def _print_bleed_skills(skills, below, args) -> None:
     print()
 
 
-def _print_bleed_tools(tools, args) -> None:
+def _print_bleed_tools(tools, args, spans_absent: bool = False) -> None:
+    if not tools:
+        # A bare header with no rows reads as "no tools were used". Say which
+        # it actually is.
+        print("TOOL — no span data yet. Spans accrue from install; "
+              "re-run after some turns.")
+        return
     print(f"{'TOOL':24} {'calls':>7} {'p50':>9} {'attributed':>11}")
     for t in tools[: args.limit]:
         print(f"{t.name[:24]:24} {t.calls:>7} {t.p50_ms / 1000:>8.1f}s "

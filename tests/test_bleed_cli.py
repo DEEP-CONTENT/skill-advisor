@@ -160,6 +160,46 @@ def test_bleed_with_no_events_exits_zero_with_an_explanation(isolated_paths, cap
     assert "no telemetry events" in capsys.readouterr().out
 
 
+def test_bleed_counts_a_malformed_timestamp_under_a_since_window(
+    isolated_paths, capsys
+):
+    """R5: a row whose ts will not parse must not vanish under --since. It is
+    NOT out-of-window — it has no window position at all — so it falls through
+    to pair_turns and is counted as malformed."""
+    _write_events(
+        _pair("2026-08-06T10:00:00Z", "2026-08-06T10:05:00Z", ["s"], [("Read", 10)])
+        + [{"kind": "prompt", "session_sha256": "z", "ts": "not-a-date"}]
+    )
+    cli._cmd_bleed(_ns(min_n=1, since="3650d"))
+    assert "malformed rows: 1" in capsys.readouterr().out
+
+
+def test_bleed_ranks_by_turn_time_when_no_turn_has_spans(isolated_paths, capsys):
+    """R6: with every attributed_ms at 0, ranking by it degenerates to the
+    alphabetical tie-break. Rank by the measurement that exists instead."""
+    _write_events(
+        _pair("2026-08-06T10:00:00Z", "2026-08-06T10:01:00Z", ["aaa-fast"], session="a")
+        + _pair(
+            "2026-08-06T11:00:00Z", "2026-08-06T11:30:00Z", ["zzz-slow"], session="b"
+        )
+    )
+    cli._cmd_bleed(_ns(min_n=1))
+    out = capsys.readouterr().out
+
+    assert "no span data yet" in out
+    # zzz-slow took 30 min vs aaa-fast's 1 min, so it must rank FIRST despite
+    # sorting last alphabetically — this fails if the fallback rank is dropped.
+    assert out.index("zzz-slow") < out.index("aaa-fast")
+    # The span-derived columns are omitted, not printed as a row of zeros.
+    assert "attributed" not in out
+
+
+def test_bleed_says_the_tool_table_is_empty_for_want_of_spans(isolated_paths, capsys):
+    _write_events(_pair("2026-08-06T10:00:00Z", "2026-08-06T10:05:00Z", ["s"]))
+    cli._cmd_bleed(_ns(min_n=1))
+    assert "no span data yet. Spans accrue from install" in capsys.readouterr().out
+
+
 def test_bleed_is_registered_as_a_subcommand(isolated_paths):
     """The parser wiring is a separate failure mode from the handler."""
     args = cli._build_parser().parse_args(["bleed", "--min-n", "3"])
