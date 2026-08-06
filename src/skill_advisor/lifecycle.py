@@ -471,6 +471,11 @@ class TurnState:
     session_id: str
     turn_started_at: float = field(default_factory=time.time)
     tool_names: list[str] = field(default_factory=list)
+    # One epoch-second mark per tool call, index-parallel to `tool_names`.
+    # Written here rather than derived later because PostToolUse is the only
+    # place that knows when a call finished. Raw on purpose: the idle threshold
+    # is applied at read time by bleed.py, so it stays retroactively tunable.
+    tool_marks: list[float] = field(default_factory=list)
     subagents_invoked: list[str] = field(default_factory=list)
     skills_invoked: list[str] = field(default_factory=list)
     todo_write: dict | None = None  # {"count": int, "titles": list[str]} or None
@@ -484,6 +489,7 @@ class TurnState:
             session_id=str(data.get("session_id") or ""),
             turn_started_at=float(data.get("turn_started_at") or time.time()),
             tool_names=list(data.get("tool_names") or []),
+            tool_marks=[float(m) for m in (data.get("tool_marks") or [])],
             subagents_invoked=list(data.get("subagents_invoked") or []),
             skills_invoked=list(data.get("skills_invoked") or []),
             todo_write=data.get("todo_write") if isinstance(data.get("todo_write"), dict) else None,
@@ -518,6 +524,36 @@ def delete_turn(session_id: str) -> bool:
     return False
 
 
+# The subagent-launcher tool is named "Agent" as of this measurement —
+# confirmed against the real event log: 3,267 `stop` events carry "Agent",
+# zero carry "Task". "Task" is kept in the set as the name the original
+# (buggy) code assumed; we have no positive evidence it was ever the real
+# name here, only that watching it costs nothing and dropping it risks
+# repeating the exact silent-zero this fix exists to correct. Watch both so
+# a future rename doesn't silently zero out subagent capture again, the same
+# pattern already used above for TodoWrite/TaskCreate.
+SUBAGENT_LAUNCHER_TOOLS = frozenset({"Task", "Agent"})
+
+# `subagent_type` and `skill` are the only `tool_input` VALUES that reach
+# `events.jsonl`. They are NOT the only `tool_input` values that reach the
+# turn FILE on disk: `record_todo_write`/`append_todo_title` below store
+# TodoWrite's `todos[].content` and TaskCreate's `subject` there too — up to
+# 50 items, with no per-item length cap. That data is scoped to the turn
+# file: `run_stop` deletes the file before telemetry is written and never
+# passes `todo_write` to `telemetry.record_stop`, so it never reaches the
+# event log — but "only tool_input value on disk" would be a false claim,
+# so this comment does not make it.
+#
+# `subagent_type` and `skill` ARE free text from the model's tool call, not a
+# validated enum, so they are length-capped at the storage boundary — an
+# event log documented as carrying identifiers must not be able to
+# accumulate an arbitrarily long string because one caller passed one. 64 is
+# far above every real name (the longest skill observed on the live log is
+# 42 chars, the longest agent type well under that), so the cap describes a
+# bound, not a truncation anyone will meet.
+_TURN_NAME_CAP = 64
+
+
 def record_tool(
     session_id: str,
     tool_name: str,
@@ -528,12 +564,14 @@ def record_tool(
     """Accumulate tool usage into the current turn's state file."""
     turn = load_turn(session_id) or TurnState(session_id=session_id)
     turn.tool_names.append(tool_name)
-    # Claude Code's `Task` tool exposes the chosen subagent via tool_input.subagent_type.
-    if tool_name == "Task" and subagent_type:
-        turn.subagents_invoked.append(subagent_type)
+    turn.tool_marks.append(time.time())
+    # The subagent-launcher tool exposes the chosen subagent via
+    # tool_input.subagent_type, extracted by hook.py's run_posttooluse.
+    if tool_name in SUBAGENT_LAUNCHER_TOOLS and subagent_type:
+        turn.subagents_invoked.append(subagent_type[:_TURN_NAME_CAP])
     # Claude Code's `Skill` tool exposes the invoked skill via tool_input.skill.
     if tool_name == "Skill" and skill_name:
-        turn.skills_invoked.append(skill_name)
+        turn.skills_invoked.append(skill_name[:_TURN_NAME_CAP])
     save_turn(turn)
     return turn
 

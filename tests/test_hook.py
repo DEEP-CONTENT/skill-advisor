@@ -639,6 +639,34 @@ def test_posttooluse_ignores_a_missing_skill_field(monkeypatch):
     assert turn.skills_invoked == []
 
 
+def test_posttooluse_captures_the_invoked_subagent(monkeypatch):
+    """`subagents_invoked` was 0/4,348 in the real event log. The real tool
+    name for launching a subagent is "Agent" (confirmed by 3,267 real `stop`
+    events carrying it), not "Task" — the string `record_tool` (lifecycle.py)
+    actually gates on. Drive the real hook with the real tool name, not the
+    stale one, and assert the capture that was silently dead is now wired."""
+    import io
+    import json as _json
+    from skill_advisor import hook, lifecycle
+
+    event = {
+        "session_id": "sess-agent",
+        "tool_name": "Agent",
+        "tool_input": {
+            "subagent_type": "Explore",
+            "description": "find the config loader",
+            "prompt": "...",
+        },
+    }
+    monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps(event)))
+    assert hook.run_posttooluse() == 0
+
+    turn = lifecycle.load_turn("sess-agent")
+    assert turn is not None
+    assert turn.subagents_invoked == ["Explore"]
+    assert turn.tool_names == ["Agent"]
+
+
 # ---------------------------------------------------------------------------
 # Effort: nudge builder + rate-limited state
 # ---------------------------------------------------------------------------
@@ -931,3 +959,247 @@ def test_hook_nudge_shown_once_across_two_successful_emits(isolated_paths):
     env2 = json.loads(out2)
     assert env1.get("systemMessage")
     assert "systemMessage" not in env2
+
+
+def test_posttooluse_wires_the_mark_into_turn_state(monkeypatch, isolated_paths):
+    """Goes RED if record_tool stops appending the mark.
+
+    The aggregator can be perfectly unit-tested and still report nothing if this
+    call is missing, and an empty report reads as "no time bleeders found"
+    rather than as a bug. Drive the real hook, not lifecycle directly.
+    """
+    import io
+    import json as _json
+    from skill_advisor import hook, lifecycle
+
+    for tool in ("Read", "Bash"):
+        monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps({
+            "session_id": "sess-wire",
+            "tool_name": tool,
+            "tool_input": {},
+        })))
+        assert hook.run_posttooluse() == 0
+
+    turn = lifecycle.load_turn("sess-wire")
+    assert turn.tool_names == ["Read", "Bash"]
+    assert len(turn.tool_marks) == 2, "PostToolUse did not record a timestamp"
+
+
+def test_stop_wires_marks_into_spans(monkeypatch, isolated_paths):
+    """Goes RED if run_stop stops converting marks into spans.
+
+    Hand-built marks pin the exact millisecond arithmetic deterministically,
+    which a sleep-driven test cannot. It does NOT pin the anchor: the state
+    below is one the collector can never produce (`turn_started_at` is set in
+    the same breath as `tool_marks[0]`), which is precisely why an anchor bug
+    survived here. `test_stop_spans_are_measured_from_the_previous_tool`
+    covers the anchor from collector-produced state.
+    """
+    import io
+    import json as _json
+    from skill_advisor import hook, lifecycle, paths
+
+    config_path = paths.config_file()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("[telemetry]\nevents_enabled = true\n", encoding="utf-8")
+
+    turn = lifecycle.TurnState(session_id="sess-spans", turn_started_at=1000.0)
+    turn.tool_names = ["Read", "Bash", "Edit"]
+    turn.tool_marks = [1000.5, 1003.5, 1004.25]
+    lifecycle.save_turn(turn)
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps({"session_id": "sess-spans"})))
+    assert hook.run_stop() == 0
+
+    rows = [_json.loads(line) for line in paths.events_file().read_text().splitlines() if line.strip()]
+    stop = [r for r in rows if r.get("kind") == "stop"][-1]
+    # "Read" is the first tool: it has no predecessor, so it gets no span.
+    assert stop["tool_spans"] == [["Bash", 3000], ["Edit", 750]]
+    assert stop["span_anchor"] == "previous_tool"
+
+
+def test_stop_spans_are_measured_from_the_previous_tool(monkeypatch, isolated_paths):
+    """Built from COLLECTOR-produced state, not hand-written marks.
+
+    `turn_started_at` and `tool_marks[0]` are set two statements apart inside
+    `record_tool`, so anchoring the first span on the turn start charged the
+    first tool a structural 0 ms on every real turn. A hand-built state with a
+    turn start 500 ms before the first mark hid that entirely.
+
+    Goes RED if the first tool regains a span (len becomes 3, and the first
+    entry is a ~0 ms "Read"), or if the loop stops emitting spans at all.
+    """
+    import io
+    import json as _json
+    import time as _time
+    from skill_advisor import hook, paths
+
+    config_path = paths.config_file()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("[telemetry]\nevents_enabled = true\n", encoding="utf-8")
+
+    for tool in ("Read", "Bash", "Edit"):
+        monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps({
+            "session_id": "sess-real", "tool_name": tool, "tool_input": {},
+        })))
+        assert hook.run_posttooluse() == 0
+        _time.sleep(0.05)
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps({"session_id": "sess-real"})))
+    assert hook.run_stop() == 0
+
+    rows = [_json.loads(ln) for ln in paths.events_file().read_text().splitlines() if ln.strip()]
+    stop = [r for r in rows if r.get("kind") == "stop"][-1]
+    spans = stop["tool_spans"]
+
+    assert [n for n, _ in spans] == ["Bash", "Edit"], "the first tool must carry no span"
+    # Each sleep is 50 ms; allow slack upward for a slow machine but nothing
+    # may be zero — a zero here is the bug this test exists for.
+    for name, ms in spans:
+        assert 40 <= ms < 5_000, f"{name} span {ms} ms is not a real measurement"
+    assert stop["tools"] == ["Read", "Bash", "Edit"]  # names still complete
+
+
+def test_stop_omits_spans_for_a_single_tool_turn(monkeypatch, isolated_paths):
+    """A one-tool turn has no interval to measure, so it must drop out of span
+    coverage entirely rather than be counted as covered by a meaningless zero.
+
+    Goes RED if the first tool regains a span: the row would carry
+    `tool_spans == [["Read", 0]]`, which `bleed.span_coverage` counts as
+    span-carrying.
+    """
+    import io
+    import json as _json
+    from skill_advisor import hook, paths
+
+    config_path = paths.config_file()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("[telemetry]\nevents_enabled = true\n", encoding="utf-8")
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps({
+        "session_id": "sess-one", "tool_name": "Read", "tool_input": {},
+    })))
+    assert hook.run_posttooluse() == 0
+    monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps({"session_id": "sess-one"})))
+    assert hook.run_stop() == 0
+
+    rows = [_json.loads(ln) for ln in paths.events_file().read_text().splitlines() if ln.strip()]
+    stop = [r for r in rows if r.get("kind") == "stop"][-1]
+    assert "tool_spans" not in stop
+    assert "span_anchor" not in stop
+    assert stop["tools"] == ["Read"]
+
+
+def test_stop_drops_spans_when_marks_desync(monkeypatch, isolated_paths):
+    """A torn write must produce NO spans, never a guessed alignment."""
+    import io
+    import json as _json
+    from skill_advisor import hook, lifecycle, paths
+
+    config_path = paths.config_file()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("[telemetry]\nevents_enabled = true\n", encoding="utf-8")
+
+    turn = lifecycle.TurnState(session_id="sess-desync", turn_started_at=1000.0)
+    turn.tool_names = ["Read", "Bash", "Edit"]
+    turn.tool_marks = [1000.5, 1003.5]  # one short
+    lifecycle.save_turn(turn)
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps({"session_id": "sess-desync"})))
+    assert hook.run_stop() == 0
+
+    rows = [_json.loads(line) for line in paths.events_file().read_text().splitlines() if line.strip()]
+    stop = [r for r in rows if r.get("kind") == "stop"][-1]
+    assert "tool_spans" not in stop
+    assert stop["tools"] == ["Read", "Bash", "Edit"]  # names still recorded
+
+
+def test_stop_clamps_negative_deltas_to_zero(monkeypatch, isolated_paths):
+    """Clock adjustments mid-turn must never produce negative spans.
+
+    The max(0, ...) clamp at hook.py:475 is the only defense against
+    a mark earlier than its predecessor producing a negative millisecond
+    value that could later be misinterpreted as valid data.
+    """
+    import io
+    import json as _json
+    from skill_advisor import hook, lifecycle, paths
+
+    config_path = paths.config_file()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("[telemetry]\nevents_enabled = true\n", encoding="utf-8")
+
+    turn = lifecycle.TurnState(session_id="sess-negative", turn_started_at=1000.0)
+    turn.tool_names = ["Read", "Bash", "Edit"]
+    turn.tool_marks = [1000.5, 999.0, 1002.0]  # second mark is BEFORE first
+    lifecycle.save_turn(turn)
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps({"session_id": "sess-negative"})))
+    assert hook.run_stop() == 0
+
+    rows = [_json.loads(line) for line in paths.events_file().read_text().splitlines() if line.strip()]
+    stop = [r for r in rows if r.get("kind") == "stop"][-1]
+    # "Read" is the first tool and carries no span; "Bash" lands 1.5s before it.
+    assert stop["tool_spans"] == [["Bash", 0], ["Edit", 3000]]
+
+
+def test_stop_desync_guard_reverse_direction(monkeypatch, isolated_paths):
+    """Desync guard must reject both directions: marks > names and marks < names.
+
+    Existing coverage only has fewer marks than names. This tests the
+    reverse: more marks than names. Both must emit no spans.
+    """
+    import io
+    import json as _json
+    from skill_advisor import hook, lifecycle, paths
+
+    config_path = paths.config_file()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("[telemetry]\nevents_enabled = true\n", encoding="utf-8")
+
+    turn = lifecycle.TurnState(session_id="sess-desync-rev", turn_started_at=1000.0)
+    turn.tool_names = ["Read", "Bash"]
+    turn.tool_marks = [1000.5, 1003.5, 1006.0]  # one extra mark
+    lifecycle.save_turn(turn)
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps({"session_id": "sess-desync-rev"})))
+    assert hook.run_stop() == 0
+
+    rows = [_json.loads(line) for line in paths.events_file().read_text().splitlines() if line.strip()]
+    stop = [r for r in rows if r.get("kind") == "stop"][-1]
+    assert "tool_spans" not in stop
+    assert stop["tools"] == ["Read", "Bash"]  # names still recorded
+
+
+def test_stop_still_records_the_event_when_span_math_raises(monkeypatch, isolated_paths):
+    """A bad span computation must cost only the spans, not the whole row.
+
+    `json.loads` accepts `Infinity`, so a torn turn file can yield a mark that
+    makes `int(delta * 1000)` raise `OverflowError`. Sharing one `try` with
+    `record_stop` turned that into a lost stop event — tool names, skills and
+    subagents all gone. Goes RED if the span block is folded back into the
+    outer try: no `stop` row is written at all.
+    """
+    import io
+    import json as _json
+    from skill_advisor import hook, lifecycle, paths
+
+    config_path = paths.config_file()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("[telemetry]\nevents_enabled = true\n", encoding="utf-8")
+
+    turn = lifecycle.TurnState(session_id="sess-inf", turn_started_at=1000.0)
+    turn.tool_names = ["Read", "Bash"]
+    turn.tool_marks = [1000.0, float("inf")]
+    lifecycle.save_turn(turn)
+    # The mark really does survive a round-trip through the turn file.
+    assert lifecycle.load_turn("sess-inf").tool_marks[1] == float("inf")
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps({"session_id": "sess-inf"})))
+    assert hook.run_stop() == 0
+
+    rows = [_json.loads(ln) for ln in paths.events_file().read_text().splitlines() if ln.strip()]
+    stops = [r for r in rows if r.get("kind") == "stop"]
+    assert stops, "the stop event was suppressed by a span-only failure"
+    assert stops[-1]["tools"] == ["Read", "Bash"]
+    assert "tool_spans" not in stops[-1]

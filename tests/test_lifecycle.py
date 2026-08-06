@@ -468,3 +468,72 @@ def test_phase_next_description_parallelization_check():
 
     desc = lifecycle.phase_next_description(lifecycle.PARALLELIZATION_CHECK)
     assert "implementation" in desc.lower()
+
+
+def test_record_tool_appends_a_mark_parallel_to_the_name(isolated_paths):
+    from skill_advisor import lifecycle
+
+    lifecycle.record_tool("sess-marks", "Read")
+    lifecycle.record_tool("sess-marks", "Bash")
+    turn = lifecycle.load_turn("sess-marks")
+
+    assert turn.tool_names == ["Read", "Bash"]
+    assert len(turn.tool_marks) == 2
+    assert turn.tool_marks[1] >= turn.tool_marks[0]
+    assert turn.tool_marks[0] >= turn.turn_started_at
+
+
+def test_tool_input_derived_names_are_length_capped(isolated_paths):
+    """`subagent_type` and `skill` are the only `tool_input` VALUES that reach
+    the turn file and, from there, `events.jsonl`. They are free text from the
+    model's tool call, not a validated enum, so an event log documented as
+    carrying identifiers must bound them at the storage boundary.
+
+    Goes RED if either append drops its slice.
+    """
+    from skill_advisor import lifecycle
+
+    long_name = "x" * 500
+    lifecycle.record_tool("sess-cap", "Agent", subagent_type=long_name)
+    lifecycle.record_tool("sess-cap", "Skill", skill_name=long_name)
+    turn = lifecycle.load_turn("sess-cap")
+
+    assert len(turn.subagents_invoked[0]) == lifecycle._TURN_NAME_CAP
+    assert len(turn.skills_invoked[0]) == lifecycle._TURN_NAME_CAP
+
+
+def test_real_length_names_survive_the_cap_untouched(isolated_paths):
+    """The cap must describe a bound, not a truncation anyone meets: the
+    longest skill name observed on the live log is 42 chars."""
+    from skill_advisor import lifecycle
+
+    real = "superpowers:finishing-a-development-branch"  # 42 chars
+    assert len(real) == 42
+    lifecycle.record_tool("sess-real-name", "Skill", skill_name=real)
+    assert lifecycle.load_turn("sess-real-name").skills_invoked == [real]
+
+
+def test_from_json_without_tool_marks_yields_empty_list(isolated_paths):
+    """A turn file written before this feature must load, not crash."""
+    from skill_advisor.lifecycle import TurnState
+
+    turn = TurnState.from_json({
+        "session_id": "old",
+        "turn_started_at": 1000.0,
+        "tool_names": ["Read", "Bash"],
+    })
+
+    assert turn.tool_names == ["Read", "Bash"]
+    assert turn.tool_marks == []
+
+
+def test_tool_marks_survive_a_save_load_round_trip(isolated_paths):
+    from skill_advisor import lifecycle
+
+    lifecycle.record_tool("sess-rt", "Grep")
+    first = lifecycle.load_turn("sess-rt").tool_marks
+    lifecycle.record_tool("sess-rt", "Edit")
+    second = lifecycle.load_turn("sess-rt").tool_marks
+
+    assert second[0] == first[0]  # the earlier mark was not rewritten
+    assert len(second) == 2

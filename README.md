@@ -502,6 +502,134 @@ Flags:
 - `--purge-older-than DURATION` — rewrite the log, keeping only events newer
   than `DURATION`, and exit. Manual retention tool; the hook itself never prunes.
 
+### `skill-advisor bleed [options]`
+
+Rank skills and tools by the time they actually cost, with idle time flagged
+separately rather than folded into the total. Reads the same opt-in event log
+as `report` (`~/.cache/skill-advisor/advisor.events.jsonl`), pairing each
+`kind=prompt` row with the next `kind=stop` row in the same session and, where
+present, charging the `stop` row's `tool_spans` — the raw per-tool-call
+timestamp deltas the PostToolUse/Stop hooks write — to whichever skill(s) and
+tool(s) were active that turn.
+
+A span measures **the interval since the previous tool call finished**, so the
+first tool of a turn carries no span: there is no predecessor to measure from,
+and the prompt→first-tool interval belongs to no tool. A turn that used exactly
+one tool therefore records no spans at all and counts as *not span-carrying* in
+the `spans: N of M` line — deliberately, because a fabricated `0 ms` for that
+tool would be counted as coverage the report does not have.
+
+Because of that, the TOOL table prints `calls` and `spans` as two separate
+columns rather than one. `calls` is the real invocation count (from every
+recorded tool call, regardless of whether it left a span); `spans` is how many
+of those calls actually got measured. The two diverge most for a tool that is
+usually a turn's first call — `Skill` above all, being the one this whole
+feature exists to reason about — since the leading call in every turn is
+exactly the one with no predecessor to measure from. `p50` and `attributed`
+are computed over the `spans` population only, never `calls`.
+
+```bash
+skill-advisor bleed
+# turns: 3942 · spans: 0 of 3942 (0.0%) · idle threshold: 120s
+# no span data yet — ranking by turn time; per-tool cost and idle time need spans, which accrue from install
+# unpaired prompts: 1387 (turns that used no tools write no stop event)
+#
+# SKILL                                         n  p50 turn
+# superpowers:finishing-a-development-branch    8     2110s
+# superpowers:subagent-driven-development      12     1633s
+# ai-code-review                               13     1153s
+# ...
+#   20 skill(s) below n=5 (not ranked)
+#
+# TOOL — no span data yet. Spans accrue from install; re-run after some turns.
+```
+
+`tool_spans` did not exist before this feature shipped, so events recorded
+earlier carry none — the `spans: 0 of N (0.0%)` line above is the real output
+on a log that predates it, not a bug. Until spans accrue, `bleed` ranks skills
+by turn time (`p50 turn`) instead of cost and prints that fallback explicitly
+rather than silently sorting a column of zeros.
+
+Flags:
+
+- `--since DURATION` — time window (e.g. `7d`, `24h`; default: all history).
+- `--min-n N` — minimum turns before a skill is ranked (default: 5). Skills
+  under the floor are still counted (`N skill(s) below n=5 (not ranked)`),
+  never silently dropped from the total.
+- `--idle-threshold SECONDS` — seconds above which a span is treated as idle
+  (default: 120).
+- `--by {skill,tool,both}` — which tables to print (default: both).
+- `--limit N` — rows per table; overflow past the limit is reported as
+  `+N more`, never truncated without saying so (default: 20). Applies to the
+  **human tables only** — see `--json` below.
+- `--json` — emit machine-readable JSON instead of tables (default: off).
+
+In `--json` mode the `skills` and `tools` arrays are **complete**: `--limit` is
+not applied, and the payload says so with `"limit_applied": false`. Truncating
+there would be a silent drop with no `+N more` line to notice it by. The
+payload also carries `"ranked_by"`, naming the field the arrays are sorted on —
+`"attributed_ms"` normally, but `"p50_turn_s"` on the no-spans path, where a
+consumer reading array order as a cost ranking would otherwise be reading a
+turn-time ranking without knowing it. Names longer than the column are elided
+in the *middle* in the human tables (`mcp__plugin…rowser_click`) so that tools
+sharing a long prefix stay distinguishable; `--json` always carries the full
+name.
+
+**The idle threshold is applied at read time, not baked into what's
+recorded.** Every `stop` event stores the raw per-tool-call deltas; `bleed`
+decides at read time which spans exceed `--idle-threshold` and caps them
+there (the excess is charged to idle, never to the tool — "cap-and-spill",
+not all-or-nothing). That means the entire history can be re-read at a
+different `--idle-threshold` after the fact — nothing needs to be
+re-recorded, and lowering the threshold retroactively reclassifies old long
+spans as idle.
+
+**A turn that used no tools writes no stop event at all**, because the Stop
+hook returns early when there was nothing to record — a purely conversational
+turn leaves a `prompt` row with no matching `stop`. `bleed` counts these as
+`unpaired prompts` rather than silently shrinking the turn count, but there is
+no span to attribute time to: that turn cannot be measured, not "measured as
+zero".
+
+**A long span cannot tell an absent user apart from a genuinely slow tool,
+and `bleed` does not pretend otherwise.** PostToolUse reports only when a
+call *finished*, never when it started relative to the user's attention, so
+nothing in the data can distinguish "the user stepped away for ten minutes"
+from "that test suite genuinely took ten minutes." Every span over
+`--idle-threshold` is capped and the excess goes to `idle`, never to the
+tool's attributed cost. A skill whose time is mostly idle therefore reads as
+**unmeasured, not as fast or slow** — that is what the `idle` and
+`idle turns` columns are for: so a large `p50 turn` isn't misread as "this
+skill is slow" when it may just mean the user walked away mid-turn.
+
+**Subagent time is not part of what `bleed` reports.** Each turn's state
+tracks which subagents ran (`subagents_invoked`, echoed into the `stop`
+event's `subagents` field), but `bleed`'s skill and tool tables don't consume
+that field today — there is no subagent column in either `--by` table or in
+`--json`. Separately, that capture was also dead across the entire measured
+history up to this change: the code only recognized the tool name `"Task"`,
+but the tool that actually launches a subagent is named `"Agent"` (confirmed
+directly against this log — thousands of real `stop` events carry `"Agent"`,
+zero carry `"Task"`), so `subagents_invoked` was silently empty on every real
+turn regardless of how much subagent use actually happened. That name
+mismatch is fixed as of this change, so turns recorded from here on capture
+it correctly — but every `subagents_invoked` from before the fix is a false
+negative, not evidence subagents went unused, and `bleed` still won't surface
+it either way until a future change reads the field.
+
+This fix has a side effect outside `bleed` entirely, worth knowing about even
+though it's invisible in `bleed`'s own output: `subagents_invoked` also feeds
+the [`on_plan_subagent_done` auto-advance rule](#auto-advance)
+(`PLANNING → IMPLEMENTATION` when a `Plan` subagent completed). That rule was
+just as silently inert as the telemetry field, for the same reason — it
+checked the same always-empty list. If you have
+`lifecycle.auto_advance.enabled = true`, this fix makes that rule fire for
+the first time on the next `Plan`/`writing-plans` subagent call in a
+`PLANNING`-phase turn, where it previously never did. This is the config's
+documented intent finally working, not a new behavior being introduced — but
+it is a real, observable change in when your session auto-advances, not just
+a reporting change.
+
 ### `skill-advisor doctor`
 
 End-to-end diagnosis. Checks: `claude` on PATH, settings file present, catalog
@@ -688,7 +816,9 @@ You don't call them manually under normal use. Behavior is a no-op unless you
 opt into [auto-advance](#auto-advance).
 
 - `posttooluse` — reads a PostToolUse event from stdin, records the `tool_name`
-  (and the `subagent_type` when the tool was `Task`) into
+  (and the `subagent_type` when the tool is the subagent launcher — `Agent` in
+  current Claude Code builds; `Task` is also recognized as a defensive fallback,
+  see [`skill-advisor bleed`](#skill-advisor-bleed-options)) into
   `~/.cache/skill-advisor/sessions/<session_id>.turn.json`.
 - `stop` — reads a Stop event from stdin, inspects the per-session turn state,
   and applies the auto-advance rules if enabled. Always clears the turn file.
@@ -980,7 +1110,9 @@ When [auto-advance](#auto-advance) is enabled, `skill-advisor install` also wire
 two sibling handlers into your settings file:
 
 - **`skill-advisor posttooluse`** fires after every tool call. It appends the
-  `tool_name` (and, for `Task` calls, the `subagent_type`) into
+  `tool_name` (and, for subagent-launcher calls, the `subagent_type` —
+  `Agent` in current Claude Code builds; `Task` also recognized defensively,
+  see [`skill-advisor bleed`](#skill-advisor-bleed-options)) into
   `~/.cache/skill-advisor/sessions/<session_id>.turn.json`.
 - **`skill-advisor stop`** fires at the end of each assistant turn. It reads
   the turn file, clears it, then consults the active lifecycle state and the
@@ -1266,9 +1398,15 @@ else changes for sessions that don't trigger a lifecycle.
 Two transitions auto-advance:
 
 - **`PLANNING → IMPLEMENTATION`** when the last turn invoked a `Plan` subagent
-  (via Claude Code's `Task` tool with `subagent_type="Plan"`). Use this when you
+  (`subagent_type="Plan"`, via Claude Code's subagent-launcher tool — `Agent`
+  in current builds, `Task` also recognized defensively). Use this when you
   want the advisor to hand off to the implementer immediately after planning
-  completes, without typing "go".
+  completes, without typing "go". **This rule was silently inert until a
+  recent fix** — it checked a tool name (`Task`) that never occurs in real
+  traffic, so it never fired against actual `Agent` calls. If you already
+  have `auto_advance.enabled = true`, it will fire for the first time now;
+  see [`skill-advisor bleed`](#skill-advisor-bleed-options) for the measured
+  evidence.
 - **`IMPLEMENTATION → REVIEW`** when the last turn ended with any mutating tool
   (`Edit`, `Write`, `NotebookEdit`, `MultiEdit`, `Bash`). If the model only read
   files this turn (`Read`, `Grep`, `Glob`, `LS`), the state stays at
@@ -1404,9 +1542,10 @@ to the user — never auto-resolved.
   false positives/negatives.
 - **Lifecycle is per-session.** Restarting Claude Code creates a new session
   id, so long-running work spanning sessions isn't stitched together.
-- **No `SubagentStop` handling yet.** PostToolUse fires for the parent `Task`
-  invocation, which is enough for the Plan-subagent rule; deep subagent event
-  plumbing is a future enhancement.
+- **No `SubagentStop` handling yet.** PostToolUse fires for the parent
+  `Agent` invocation (Claude Code's current subagent-launcher tool name;
+  `Task` is also recognized), which is enough for the Plan-subagent rule;
+  deep subagent event plumbing is a future enhancement.
 
 ---
 
@@ -1647,6 +1786,24 @@ and latency stats. Off by default.
 - Prompts are stored as `sha256(salt + prompt)[:16]` — never plaintext.
 - Session ids are hashed the same way — raw Claude Code session ids never land
   on disk.
+- **Tool calls contribute identifiers, never free-form `tool_input`, to the
+  event log.** No file paths, no shell commands, no arguments in
+  `events.jsonl`. Exactly two `tool_input` *values* reach the log, both
+  deliberately: `tool_input.skill` on a `Skill` call (the basis of per-skill
+  attribution, landing in the `stop` event's `skills`) and
+  `tool_input.subagent_type` on an `Agent`/`Task` call (landing in
+  `subagents`). Both are free text from the model's tool call rather than a
+  validated enum, so both are length-capped at 64 characters when recorded —
+  a bound, not a truncation anyone meets (the longest real skill name is 42).
+  Nothing else from `tool_input` reaches the event log.
+- **The local turn-state file is a separate, narrower-scoped disk surface,
+  and this guarantee does not extend to it.** While a turn is in progress,
+  `TodoWrite`/`TaskCreate` task titles (`tool_input.todos[].content` /
+  `tool_input.subject`) are also written there — up to 50 items, with no
+  per-item length cap — to drive the parallelization-check nudge. That file
+  is deleted when the turn ends and is never passed to the event-log writer,
+  so none of it reaches `events.jsonl`; the claim above is scoped to the
+  event log, not to everything `tool_input` touches on disk.
 - The salt auto-generates once at `~/.cache/skill-advisor/telemetry.salt`
   (mode `0600`) unless you pin one in `config.toml`. Wiping the salt file
   anonymises historical events.

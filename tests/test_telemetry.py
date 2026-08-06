@@ -333,3 +333,55 @@ def test_stop_event_records_invoked_skills(isolated_paths):
         if line.strip()
     ]
     assert events[-1]["skills"] == ["superpowers:writing-plans"]
+
+
+def test_record_stop_writes_tool_spans(isolated_paths):
+    import json
+    from skill_advisor import paths, telemetry
+    from skill_advisor.config import TelemetryConfig
+
+    telemetry.record_stop(
+        session_id="s1",
+        tools=["Read", "Bash"],
+        subagents=[],
+        skills=["ai-code-review"],
+        tool_spans=[("Read", 412), ("Bash", 138204)],
+        config=TelemetryConfig(events_enabled=True),
+    )
+
+    row = json.loads(paths.events_file().read_text(encoding="utf-8").splitlines()[-1])
+    assert row["tool_spans"] == [["Read", 412], ["Bash", 138204]]
+    assert row["span_anchor"] == "previous_tool"
+
+
+def test_record_stop_omits_spans_when_there_are_none(isolated_paths):
+    """A turn from before the feature must not gain a misleading empty key."""
+    import json
+    from skill_advisor import paths, telemetry
+    from skill_advisor.config import TelemetryConfig
+
+    telemetry.record_stop(
+        session_id="s2", tools=["Read"], subagents=[], skills=[],
+        config=TelemetryConfig(events_enabled=True),
+    )
+
+    row = json.loads(paths.events_file().read_text(encoding="utf-8").splitlines()[-1])
+    assert "tool_spans" not in row
+    assert "span_anchor" not in row
+
+
+def test_record_stop_never_writes_tool_input(isolated_paths):
+    """Privacy: names only. No paths, no commands, no arguments."""
+    from skill_advisor import paths, telemetry
+    from skill_advisor.config import TelemetryConfig
+
+    telemetry.record_stop(
+        session_id="s3",
+        tools=["Bash"], subagents=[], skills=[],
+        tool_spans=[("Bash", 900)],
+        config=TelemetryConfig(events_enabled=True),
+    )
+
+    raw = paths.events_file().read_text(encoding="utf-8")
+    assert "tool_input" not in raw
+    assert "/home/" not in raw

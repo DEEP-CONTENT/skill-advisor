@@ -588,6 +588,220 @@ def _cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_bleed(args: argparse.Namespace) -> int:
+    from datetime import datetime, timezone
+
+    from . import bleed as bleed_mod
+
+    if not paths.events_file().is_file():
+        print("no telemetry events recorded.")
+        print("enable with `events_enabled = true` under [telemetry] in config.toml.")
+        return 0
+
+    cutoff = None
+    if args.since:
+        try:
+            cutoff = datetime.now(timezone.utc) - telemetry.parse_duration(args.since)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+
+    events, skipped, out_of_window = _load_events_counting_failures(cutoff)
+    if not events:
+        # Disclose BEFORE returning. This early return used to fire first and
+        # discard both counts, so three damaged rows read as a clean empty log
+        # and a windowed read of a log full of older events claimed nothing was
+        # ever recorded — which is simply false.
+        if out_of_window:
+            print(f"no telemetry events in the last {args.since} — "
+                  f"{out_of_window} row(s) recorded outside the window.")
+        else:
+            print("no telemetry events recorded.")
+        if skipped:
+            print(f"skipped {skipped} unparseable rows")
+        return 0
+
+    threshold_ms = int(args.idle_threshold * 1000)
+    turns, unpaired, malformed = bleed_mod.pair_turns(events)
+    skills, below = bleed_mod.skill_stats(turns, threshold_ms=threshold_ms, min_n=args.min_n)
+    tools = bleed_mod.tool_stats(turns, threshold_ms=threshold_ms)
+    with_spans, total = bleed_mod.span_coverage(turns)
+
+    # With no span data anywhere, every attributed_ms is 0, so ranking by it
+    # sorts every row on the same zero and silently degenerates to the
+    # alphabetical tie-break — a "cost ranking" that is really a name sort.
+    # Rank by the measurement that DOES exist, and say so.
+    spans_absent = with_spans == 0
+    if spans_absent:
+        skills = sorted(skills, key=lambda s: (-s.p50_turn_s, s.name))
+
+    if args.json:
+        print(json.dumps({
+            "turns": total,
+            "turns_with_spans": with_spans,
+            "unpaired_prompts": unpaired,
+            "malformed_rows": malformed,
+            "skipped_rows": skipped,
+            "out_of_window_rows": out_of_window,
+            "skills_below_min_n": below,
+            "idle_threshold_s": args.idle_threshold,
+            # A machine consumer reads array order as a cost ranking, and on
+            # the first-run path that order comes from turn time, not cost.
+            # Name the key rather than leaving the caller to infer it.
+            "ranked_by": "p50_turn_s" if spans_absent else "attributed_ms",
+            # `--limit` shapes the human tables only. Truncating here would be
+            # a silent drop with no `+N more` to notice it by, so the arrays
+            # stay complete and say so.
+            "limit_applied": False,
+            "skills": [vars(s) for s in skills],
+            "tools": [vars(t) for t in tools],
+        }, indent=2))
+        return 0
+
+    print(f"turns: {total} · spans: {with_spans} of {total} "
+          f"({(with_spans / total * 100) if total else 0:.1f}%) · "
+          f"idle threshold: {args.idle_threshold:.0f}s"
+          + (f" · window: {args.since}" if args.since else ""))
+    if out_of_window:
+        # An exclusion the user asked for is still an exclusion, and the row
+        # count it removed is the difference between "I use this rarely" and
+        # "I set the window too tight".
+        print(f"outside the {args.since} window: {out_of_window} row(s) (not counted)")
+    if spans_absent and total:
+        print("no span data yet — ranking by turn time; "
+              "per-tool cost and idle time need spans, which accrue from install")
+    if unpaired:
+        print(f"unpaired prompts: {unpaired} (turns that used no tools write no stop event)")
+    if malformed:
+        print(f"malformed rows: {malformed} (unparseable timestamp or damaged field)")
+    if skipped:
+        print(f"skipped {skipped} unparseable rows")
+    print()
+
+    if args.by in ("skill", "both"):
+        _print_bleed_skills(skills, below, args, spans_absent)
+    if args.by in ("tool", "both"):
+        _print_bleed_tools(tools, args)
+    return 0
+
+
+def _load_events_counting_failures(cutoff) -> tuple[list[dict], int, int]:
+    """Load events, counting rows that failed to parse.
+
+    Returns (events, skipped, out_of_window).
+
+    `telemetry.iter_events` swallows bad lines, so the count has to happen
+    here. Parse directly rather than subtracting `len(iter_events())` from a
+    line count: under a `--since` window an in-range row legitimately dropped
+    by the cutoff is indistinguishable from a parse failure, and a number that
+    is silently wrong under one flag is worse than no number.
+
+    `out_of_window` is what lets an empty result say WHICH kind of empty it is.
+    "No events recorded" and "no events in this window" are different claims,
+    and printing the first when the second is true is a false statement about
+    the user's own data.
+    """
+    from . import bleed as bleed_mod
+
+    events: list[dict] = []
+    skipped = 0
+    out_of_window = 0
+    with open(paths.events_file(), encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                skipped += 1
+                continue
+            if not isinstance(row, dict):
+                skipped += 1
+                continue
+            if cutoff is not None:
+                ts = bleed_mod.parse_ts(row.get("ts"))
+                # Only drop rows that legitimately fall outside the window. A
+                # row whose ts will not parse falls THROUGH, so `pair_turns`
+                # counts it as malformed — one source of truth for that count
+                # rather than a second one here that could drift.
+                if ts is not None and ts < cutoff:
+                    out_of_window += 1
+                    continue
+            events.append(row)
+    return events, skipped, out_of_window
+
+
+def _elide(name: str, width: int) -> str:
+    """Shorten to `width` by dropping the MIDDLE, never the tail.
+
+    A tail truncation silently merges identifiers that share a long prefix,
+    and these identifiers do: `name[:24]` collapsed 18 distinct MCP tools on
+    the author's live log into a single visible `mcp__plugin_playwright_p`,
+    rendering many table rows with identical names and different numbers while
+    `--limit 20` was consumed by them. The discriminating part of such a name
+    is its tail, so keep both ends and mark the cut with an ellipsis.
+
+    The ellipsis is one character, so the result is exactly `width` wide and
+    the column padding still lines up.
+    """
+    if len(name) <= width:
+        return name
+    if width <= 1:
+        return name[:width]
+    keep = width - 1
+    head = keep // 2
+    return name[:head] + "…" + name[len(name) - (keep - head):]
+
+
+def _print_bleed_skills(skills, below, args, spans_absent: bool = False) -> None:
+    """`n` and `p50 turn` are turn-level and always available; `attributed`,
+    `idle` and `idle turns` are span-derived. When no turn carries spans the
+    span-derived columns are omitted entirely rather than printed as a row of
+    zeros, because "0.00h" and "not measured yet" are different claims."""
+    if spans_absent:
+        print(f"{'SKILL':42} {'n':>4} {'p50 turn':>9}")
+        for s in skills[: args.limit]:
+            print(f"{_elide(s.name, 42):42} {s.n:>4} {s.p50_turn_s:>8.0f}s")
+    else:
+        print(f"{'SKILL':42} {'n':>4} {'p50 turn':>9} {'attributed':>11} {'idle':>9} {'idle turns':>11}")
+        for s in skills[: args.limit]:
+            print(f"{_elide(s.name, 42):42} {s.n:>4} {s.p50_turn_s:>8.0f}s "
+                  f"{s.attributed_ms / 3_600_000:>10.2f}h {s.idle_ms / 3_600_000:>8.2f}h "
+                  f"{s.turns_with_idle:>11}")
+    if len(skills) > args.limit:
+        print(f"  +{len(skills) - args.limit} more")
+    if below:
+        print(f"  {below} skill(s) below n={args.min_n} (not ranked)")
+    print()
+
+
+def _print_bleed_tools(tools, args) -> None:
+    """No `spans_absent` parameter: `tool_stats` yields a row for every span,
+    and `span_coverage` counts exactly the turns that carry one, so an empty
+    table and "no turn has spans" are the same condition. A parameter that
+    could only ever restate its own call site is a second source of truth.
+
+    `calls` and `spans` are printed as separate columns, never one. A span is
+    "time since the previous tool finished", so a turn's leading tool call
+    never emits one — `calls` (from `Turn.tools`) is the real invocation
+    count, `spans` (from measured deltas) is strictly smaller for any tool
+    that is often first in its turn. Collapsing them back into one column is
+    exactly the bug this table used to have."""
+    if not tools:
+        # A bare header with no rows reads as "no tools were used". Say which
+        # it actually is.
+        print("TOOL — no span data yet. Spans accrue from install; "
+              "re-run after some turns.")
+        return
+    print(f"{'TOOL':24} {'calls':>7} {'spans':>7} {'p50':>9} {'attributed':>11}")
+    for t in tools[: args.limit]:
+        print(f"{_elide(t.name, 24):24} {t.calls:>7} {t.spans:>7} "
+              f"{t.p50_ms / 1000:>8.1f}s {t.attributed_ms / 3_600_000:>10.2f}h")
+    if len(tools) > args.limit:
+        print(f"  +{len(tools) - args.limit} more")
+
+
 def _rotation_stats(
     events: list[dict], *, catalog: list | None = None
 ) -> dict[str, dict]:
@@ -1664,6 +1878,24 @@ def _build_parser() -> argparse.ArgumentParser:
     p_report.add_argument("--purge-older-than", dest="purge_older_than", default=None,
                           help="delete events older than this duration and exit (e.g. 90d)")
     p_report.set_defaults(func=_cmd_report)
+
+    p_bleed = sub.add_parser(
+        "bleed",
+        help="rank skills and tools by the time they cost, with idle flagged",
+    )
+    p_bleed.add_argument("--since", default=None,
+                         help="time window (e.g. 7d, 24h; default: all history)")
+    p_bleed.add_argument("--min-n", dest="min_n", type=int, default=5,
+                         help="minimum turns before a skill is ranked (default: 5)")
+    p_bleed.add_argument("--idle-threshold", dest="idle_threshold", type=float, default=120.0,
+                         help="seconds above which a span is treated as idle (default: 120)")
+    p_bleed.add_argument("--by", choices=("skill", "tool", "both"), default="both",
+                         help="which tables to print (default: both)")
+    p_bleed.add_argument("--limit", type=int, default=20,
+                         help="rows per table; overflow is reported (default: 20)")
+    p_bleed.add_argument("--json", action="store_true",
+                         help="emit machine-readable JSON instead of tables")
+    p_bleed.set_defaults(func=_cmd_bleed)
 
     p_sync = sub.add_parser(
         "sync-skills",
