@@ -134,3 +134,106 @@ def pair_turns(events: Iterable[dict]) -> tuple[list[Turn], int, int]:
         if pending is not None:
             unpaired += 1
     return turns, unpaired, malformed
+
+
+def _p50(values: Sequence[float]) -> float:
+    """Upper median. Deterministic on even counts and never interpolates a
+    value that no observation actually had."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    return float(ordered[len(ordered) // 2])
+
+
+@dataclass
+class SkillStat:
+    name: str
+    n: int
+    p50_turn_s: float
+    attributed_ms: int
+    idle_ms: int
+    turns_with_idle: int
+
+
+@dataclass
+class ToolStat:
+    name: str
+    calls: int
+    p50_ms: int
+    attributed_ms: int
+
+
+def span_coverage(turns: Sequence[Turn]) -> tuple[int, int]:
+    """(turns carrying per-tool spans, total turns). Printed always: turn-level
+    and per-tool tables are different populations and must never look like one."""
+    return sum(1 for t in turns if t.spans), len(turns)
+
+
+def skill_stats(
+    turns: Sequence[Turn], *, threshold_ms: int, min_n: int
+) -> tuple[list[SkillStat], int]:
+    """Rank skills by total attributed time. Returns (ranked, below_min_n_count).
+
+    A turn invoking two skills counts fully toward both — this is attribution,
+    not a division of blame, and splitting it would understate every skill that
+    is usually combined with another.
+    """
+    durations: dict[str, list[float]] = {}
+    attributed: dict[str, int] = {}
+    idle: dict[str, int] = {}
+    idle_turns: dict[str, int] = {}
+
+    for turn in turns:
+        a = attribute(turn.spans or [], threshold_ms)
+        charged = sum(a.per_tool.values())
+        for name in set(turn.skills):
+            durations.setdefault(name, []).append(turn.duration_s)
+            attributed[name] = attributed.get(name, 0) + charged
+            idle[name] = idle.get(name, 0) + a.idle_ms
+            if a.idle_gaps:
+                idle_turns[name] = idle_turns.get(name, 0) + 1
+
+    ranked = [
+        SkillStat(
+            name=name,
+            n=len(durations[name]),
+            p50_turn_s=_p50(durations[name]),
+            attributed_ms=attributed.get(name, 0),
+            idle_ms=idle.get(name, 0),
+            turns_with_idle=idle_turns.get(name, 0),
+        )
+        for name in durations
+    ]
+    below = sum(1 for s in ranked if s.n < min_n)
+    kept = [s for s in ranked if s.n >= min_n]
+    kept.sort(key=lambda s: (-s.attributed_ms, s.name))
+    return kept, below
+
+
+def tool_stats(turns: Sequence[Turn], *, threshold_ms: int) -> list[ToolStat]:
+    """Rank tools by total attributed time across every turn that carries spans.
+
+    Both columns are post-idle-rule: `p50_ms` is the median of CAPPED spans,
+    not raw ones, so one row never mixes two meanings. A tool whose calls are
+    all idle-contaminated therefore shows `p50_ms == threshold_ms`, which reads
+    correctly as "we stopped counting here" rather than as a real duration.
+    """
+    samples: dict[str, list[float]] = {}
+    attributed: dict[str, int] = {}
+    for turn in turns:
+        for name, raw in turn.spans or []:
+            charged = attribute([(name, raw)], threshold_ms).per_tool[name]
+            samples.setdefault(name, []).append(float(charged))
+            attributed[name] = attributed.get(name, 0) + charged
+
+    stats = [
+        ToolStat(
+            name=name,
+            calls=len(samples[name]),
+            p50_ms=int(_p50(samples[name])),
+            attributed_ms=attributed.get(name, 0),
+        )
+        for name in samples
+    ]
+    stats.sort(key=lambda s: (-s.attributed_ms, s.name))
+    return stats

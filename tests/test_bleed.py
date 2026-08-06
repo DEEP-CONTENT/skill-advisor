@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 from skill_advisor import bleed
 
 
@@ -119,3 +121,101 @@ def test_out_of_order_rows_are_sorted_before_pairing():
     turns, _, _ = bleed.pair_turns([_stop(), _prompt()])
     assert len(turns) == 1
     assert turns[0].duration_s == 300.0
+
+
+# --- skill and tool statistics ------------------------------------------
+
+
+def _turn(seconds, skills=(), spans=None):
+    """Build a Turn directly — these tests exercise the statistics, not pairing."""
+    start = datetime(2026, 8, 6, 10, 0, 0, tzinfo=timezone.utc)
+    return bleed.Turn(
+        session="s",
+        start=start,
+        stop=start + timedelta(seconds=seconds),
+        skills=list(skills),
+        tools=[n for n, _ in (spans or [])],
+        spans=spans,
+    )
+
+
+def test_skill_stats_rank_by_total_attributed_time():
+    turns = [
+        _turn(600, skills=["slow"], spans=[("Bash", 300_000)]),
+        _turn(60, skills=["fast"], spans=[("Read", 10_000)]),
+        _turn(60, skills=["fast"], spans=[("Read", 10_000)]),
+    ]
+    stats, below = skill_stats_of(turns, min_n=1)
+    assert [s.name for s in stats] == ["slow", "fast"]
+    assert stats[0].attributed_ms == 120_000  # capped at the threshold
+    assert stats[0].idle_ms == 180_000
+    assert stats[1].attributed_ms == 20_000
+    assert below == 0
+
+
+def test_a_skill_below_min_n_is_counted_not_dropped():
+    """Task 13 of the catalog-refresh branch shipped a dry run that silently
+    hid rows. Counted-but-not-ranked is the rule here."""
+    turns = [
+        _turn(60, skills=["rare"], spans=[("Read", 1_000)]),
+        _turn(60, skills=["common"], spans=[("Read", 1_000)]),
+        _turn(60, skills=["common"], spans=[("Read", 1_000)]),
+    ]
+    stats, below = skill_stats_of(turns, min_n=2)
+    assert [s.name for s in stats] == ["common"]
+    assert below == 1
+
+
+def test_a_turn_invoking_two_skills_counts_toward_both():
+    turns = [_turn(60, skills=["a", "b"], spans=[("Read", 4_000)])]
+    stats, _ = skill_stats_of(turns, min_n=1)
+    assert {s.name for s in stats} == {"a", "b"}
+    assert all(s.attributed_ms == 4_000 for s in stats)
+
+
+def test_turns_with_idle_counts_turns_not_gaps():
+    turns = [_turn(600, skills=["s"], spans=[("Bash", 300_000), ("Bash", 300_000)])]
+    stats, _ = skill_stats_of(turns, min_n=1)
+    assert stats[0].turns_with_idle == 1
+
+
+def test_a_span_less_turn_still_counts_toward_n_but_adds_no_time():
+    turns = [
+        _turn(600, skills=["s"], spans=None),
+        _turn(60, skills=["s"], spans=[("Read", 5_000)]),
+    ]
+    stats, _ = skill_stats_of(turns, min_n=1)
+    assert stats[0].n == 2
+    assert stats[0].attributed_ms == 5_000
+
+
+def test_tool_stats_aggregate_calls_and_p50():
+    turns = [_turn(60, spans=[("Read", 100), ("Read", 300), ("Bash", 50_000)])]
+    stats = bleed.tool_stats(turns, threshold_ms=120_000)
+    by_name = {s.name: s for s in stats}
+    assert by_name["Read"].calls == 2
+    assert by_name["Read"].p50_ms == 300  # upper median of [100, 300]
+    assert by_name["Bash"].attributed_ms == 50_000
+    assert [s.name for s in stats] == ["Bash", "Read"]
+
+
+def test_tool_p50_uses_capped_values_not_raw():
+    """One row, one meaning. Without this the fixture spans all sit under the
+    threshold and nothing discriminates capped from raw."""
+    turns = [_turn(600, spans=[("Bash", 300_000), ("Bash", 300_000)])]
+    stats = bleed.tool_stats(turns, threshold_ms=120_000)
+    assert stats[0].p50_ms == 120_000
+    assert stats[0].attributed_ms == 240_000
+
+
+def test_span_coverage_reports_both_populations():
+    turns = [
+        _turn(60, spans=[("Read", 1)]),
+        _turn(60, spans=None),
+        _turn(60, spans=None),
+    ]
+    assert bleed.span_coverage(turns) == (1, 3)
+
+
+def skill_stats_of(turns, *, min_n):
+    return bleed.skill_stats(turns, threshold_ms=120_000, min_n=min_n)
