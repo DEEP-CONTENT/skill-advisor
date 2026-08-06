@@ -71,10 +71,14 @@ close to self-defeating.
 > and PR #7 (`budget_exceeded` event semantics). Its implementation plan has been
 > retired now that the work is merged; `git log` and those PRs are the record.
 >
-> Change 1 (judge escalation) is deferred behind the catalog refresh, because that
-> work shrinks the embedding index from 338 to ~93 entries and invalidates any
-> confidence threshold calibrated before it. See
-> `docs/superpowers/plans/2026-07-30-latency-judge-escalation.md`.
+> **Status 2026-07-31:** change 1 (judge escalation) was calibrated against the
+> refreshed index and **will not ship**. No confidence rule cleared the viability
+> bar; the measured findings are in
+> `docs/superpowers/notes/2026-07-30-escalation-calibration.md`. The calibration
+> tooling and the hot-path latency guard shipped in PR #13; no threshold and no
+> `escalate_to_judge` config field were added. Section 1 below is retained as the
+> record of what was proposed and measured — read it with the note, not as
+> pending work.
 
 Two changes, independent, either shippable alone.
 
@@ -165,21 +169,28 @@ when the judge ran and answered.)
 
 ---
 
-## Expected effect
+## Measured effect
 
-If escalation proves viable at, say, a 25% escalation rate:
+The projection this section used to carry — "if escalation proves viable at, say, a 25%
+escalation rate, p50 → ~600 ms" — was labelled "must be re-measured, not assumed". It was
+measured, and it does not hold. Replaced here with the outcome.
 
-```
-                        now          projected
-p50 latency          9,701 ms       ~600 ms
-p95 latency         24,803 ms      ~8,300 ms
-empty timeouts           432              0
-```
+**Change 2 (shipped, PR #2 + PR #7).** The budget cut plus the embedding fallback removed
+the empty timeouts and took p95 to roughly 8 s, with no quality risk. This is the entire
+realised gain of the spec.
 
-Precise numbers depend entirely on the calibration outcome and must be re-measured, not
-assumed. **Change 2 alone** — the budget cut plus the fallback — removes the empty timeouts
-and takes p95 to roughly 8 s with no quality risk at all, which is why it is worth shipping
-even if change 1 proves infeasible.
+**Change 1 (calibrated, not shipped).** A 25% escalation rate was never reachable. Against a
+250-prompt corpus on the refreshed index, **87.8% of prompts are ones where skipping the
+judge changes the answer** (60.9% would have been declines, 26.9% disagreements) — so the
+headroom the projection assumed does not exist, independently of how good the rule is. No
+candidate signal beat a random skip of the same size by a reproducible margin, and recall
+≥ 0.85 was only reached at escalation rates of 89–100%. Full numbers, the bar, and the two
+options that remain open:
+`docs/superpowers/notes/2026-07-30-escalation-calibration.md`.
+
+Live latency therefore remains judge-bound whenever `use_judge = true`: p50 ~14.8 s,
+p95 ~47 s including failed attempts. The only lever that moves it today is turning the judge
+off, which trades that cost for the judge's declines.
 
 ---
 
@@ -188,7 +199,7 @@ even if change 1 proves infeasible.
 | Failure | Behaviour |
 |---|---|
 | Judge times out under the shorter budget | Emit the embedding picks already computed. Never silent. |
-| Confidence rule cannot be calibrated | Ship change 2 only; escalate the judge decision back to the user. |
+| Confidence rule cannot be calibrated | **This is the branch that was taken.** Change 2 shipped alone; the judge on/off decision is escalated to the user and is still open. See the calibration note. |
 | Confidence rule mis-classifies a prompt as confident | A weaker pick is surfaced. Quality regression, not a failure — must be quantified during calibration, not discovered in use. |
 | `budget_seconds` set below `judge_timeout_seconds + 3` | `doctor` warns, as today. |
 | Embedding index missing | Unchanged: log and exit silent. |
@@ -201,20 +212,22 @@ even if change 1 proves infeasible.
 - **The fallback, driven by a real timeout.** Force the judge to exceed the budget and
   assert embedding picks are emitted rather than nothing. This is the change that recovers
   the 3 wasted hours; it needs a test that fails against today's code.
-- **Escalation gating.** A confident prompt calls the judge zero times; an ambiguous one
-  calls it once. Assert on call count with the judge stubbed, so the test is fast and
-  deterministic.
+- ~~**Escalation gating.** A confident prompt calls the judge zero times; an ambiguous one
+  calls it once.~~ Not built — there is no escalation gate to test. See the calibration note.
 - **The budget interaction.** A config with `budget_seconds` below
   `judge_timeout_seconds + 3` still produces a `doctor` warning after the default changes.
 - **Latency has a regression test.** Assert the embedding-only path stays under a
   wall-clock ceiling with the judge stubbed out. Not a benchmark — a floor-level guard so a
   future change cannot silently reintroduce a subprocess into the hot path.
+  **Shipped** as `tests/test_latency_guard.py` (PR #13), guarding the `use_judge = false`
+  path — the only judge-free path that exists.
 
 **Measure the outcome on real data, not fixtures.** The calibration corpus is the
 deliverable that makes this spec honest; the final report must state the achieved
 escalation rate, the resulting p50/p95, and the measured quality delta against the
 judge-always baseline. If the quality delta is unacceptable, that is a valid result and the
-change should not ship.
+change should not ship. **Done — and it was unacceptable, so it did not ship:**
+`docs/superpowers/notes/2026-07-30-escalation-calibration.md`.
 
 ---
 
