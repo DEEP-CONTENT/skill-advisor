@@ -181,9 +181,27 @@ breakdown accrues from install. The report labels which population each table is
 
 ## Privacy
 
-Tool **names** only. `tool_input` never reaches the event — no file paths, no shell commands,
-no arguments. This matches how prompts are already reduced to `prompt_sha256`, and is covered
-by an explicit test rather than left to reviewer vigilance.
+**Identifiers only — no free-form `tool_input`.** No file paths, no shell commands, no prompt
+text, no arguments. This matches how prompts are already reduced to `prompt_sha256`, and is
+covered by an explicit test rather than left to reviewer vigilance.
+
+Stated precisely, because "tool names only" was the earlier wording and it is not true:
+exactly **two `tool_input` values** reach the event, both deliberately.
+
+| Value | Path | Lands in |
+|---|---|---|
+| `tool_input.subagent_type` (on `Agent`/`Task`) | `run_posttooluse` → `record_tool` → `TurnState.subagents_invoked` | `stop` event `subagents` |
+| `tool_input.skill` (on `Skill`) | `run_posttooluse` → `record_tool` → `TurnState.skills_invoked` | `stop` event `skills` |
+
+The second is the whole basis of per-skill attribution, so it is not optional. The first was
+inert until this branch — the collector watched the wrong tool name, so **0 stop rows ever
+carried a non-empty `subagents`**; the `Task`/`Agent` fix makes it reach `events.jsonl` for the
+first time. Both are agent-type / skill names in practice, so sensitivity is low, but they are
+free text from the model's tool call rather than a validated enum. Both are therefore
+**length-capped at 64 chars in `record_tool`** — a bound, not a truncation anyone meets: the
+longest skill name on the live log is 42 chars.
+
+Nothing else from `tool_input` is read, stored, or written anywhere.
 
 ---
 

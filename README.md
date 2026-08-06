@@ -1777,6 +1777,15 @@ and latency stats. Off by default.
 - Prompts are stored as `sha256(salt + prompt)[:16]` — never plaintext.
 - Session ids are hashed the same way — raw Claude Code session ids never land
   on disk.
+- **Tool calls contribute identifiers, never free-form `tool_input`.** No file
+  paths, no shell commands, no arguments. Exactly two `tool_input` *values*
+  reach the log, both deliberately: `tool_input.skill` on a `Skill` call (the
+  basis of per-skill attribution, landing in the `stop` event's `skills`) and
+  `tool_input.subagent_type` on an `Agent`/`Task` call (landing in
+  `subagents`). Both are free text from the model's tool call rather than a
+  validated enum, so both are length-capped at 64 characters when recorded —
+  a bound, not a truncation anyone meets (the longest real skill name is 42).
+  Nothing else from `tool_input` is read, stored, or written.
 - The salt auto-generates once at `~/.cache/skill-advisor/telemetry.salt`
   (mode `0600`) unless you pin one in `config.toml`. Wiping the salt file
   anonymises historical events.

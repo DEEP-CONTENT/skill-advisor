@@ -534,6 +534,16 @@ def delete_turn(session_id: str) -> bool:
 # pattern already used above for TodoWrite/TaskCreate.
 SUBAGENT_LAUNCHER_TOOLS = frozenset({"Task", "Agent"})
 
+# `subagent_type` and `skill` are the only `tool_input` VALUES that reach the
+# turn file and, from there, `events.jsonl`. Both are free text from the
+# model's tool call, not a validated enum, so they are length-capped at the
+# storage boundary — an event log documented as carrying identifiers must not
+# be able to accumulate an arbitrarily long string because one caller passed
+# one. 64 is far above every real name (the longest skill observed on the live
+# log is 42 chars, the longest agent type well under that), so the cap
+# describes a bound, not a truncation anyone will meet.
+_TURN_NAME_CAP = 64
+
 
 def record_tool(
     session_id: str,
@@ -549,10 +559,10 @@ def record_tool(
     # The subagent-launcher tool exposes the chosen subagent via
     # tool_input.subagent_type, extracted by hook.py's run_posttooluse.
     if tool_name in SUBAGENT_LAUNCHER_TOOLS and subagent_type:
-        turn.subagents_invoked.append(subagent_type)
+        turn.subagents_invoked.append(subagent_type[:_TURN_NAME_CAP])
     # Claude Code's `Skill` tool exposes the invoked skill via tool_input.skill.
     if tool_name == "Skill" and skill_name:
-        turn.skills_invoked.append(skill_name)
+        turn.skills_invoked.append(skill_name[:_TURN_NAME_CAP])
     save_turn(turn)
     return turn
 
