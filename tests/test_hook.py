@@ -639,6 +639,34 @@ def test_posttooluse_ignores_a_missing_skill_field(monkeypatch):
     assert turn.skills_invoked == []
 
 
+def test_posttooluse_captures_the_invoked_subagent(monkeypatch):
+    """`subagents_invoked` was 0/4,348 in the real event log. The real tool
+    name for launching a subagent is "Agent" (confirmed by 3,267 real `stop`
+    events carrying it), not "Task" — the string `record_tool` (lifecycle.py)
+    actually gates on. Drive the real hook with the real tool name, not the
+    stale one, and assert the capture that was silently dead is now wired."""
+    import io
+    import json as _json
+    from skill_advisor import hook, lifecycle
+
+    event = {
+        "session_id": "sess-agent",
+        "tool_name": "Agent",
+        "tool_input": {
+            "subagent_type": "Explore",
+            "description": "find the config loader",
+            "prompt": "...",
+        },
+    }
+    monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps(event)))
+    assert hook.run_posttooluse() == 0
+
+    turn = lifecycle.load_turn("sess-agent")
+    assert turn is not None
+    assert turn.subagents_invoked == ["Explore"]
+    assert turn.tool_names == ["Agent"]
+
+
 # ---------------------------------------------------------------------------
 # Effort: nudge builder + rate-limited state
 # ---------------------------------------------------------------------------

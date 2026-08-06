@@ -524,6 +524,14 @@ def delete_turn(session_id: str) -> bool:
     return False
 
 
+# The subagent-launcher tool has been renamed across Claude Code versions —
+# "Task" in early builds, "Agent" in current ones (confirmed against the real
+# event log: 3,267 `stop` events carry "Agent", zero carry "Task"). Watch both
+# so a future rename doesn't silently zero out subagent capture again, the
+# same pattern already used above for TodoWrite/TaskCreate.
+SUBAGENT_LAUNCHER_TOOLS = frozenset({"Task", "Agent"})
+
+
 def record_tool(
     session_id: str,
     tool_name: str,
@@ -535,8 +543,9 @@ def record_tool(
     turn = load_turn(session_id) or TurnState(session_id=session_id)
     turn.tool_names.append(tool_name)
     turn.tool_marks.append(time.time())
-    # Claude Code's `Task` tool exposes the chosen subagent via tool_input.subagent_type.
-    if tool_name == "Task" and subagent_type:
+    # The subagent-launcher tool exposes the chosen subagent via
+    # tool_input.subagent_type, extracted by hook.py's run_posttooluse.
+    if tool_name in SUBAGENT_LAUNCHER_TOOLS and subagent_type:
         turn.subagents_invoked.append(subagent_type)
     # Claude Code's `Skill` tool exposes the invoked skill via tool_input.skill.
     if tool_name == "Skill" and skill_name:
