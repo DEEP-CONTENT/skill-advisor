@@ -250,9 +250,19 @@ One privacy test asserts `tool_input` contents never appear in a written event.
   that work is only worth doing once `bleed` shows the ranking is signal rather than noise.
 - **Separating model thinking from tool execution.** Requires `PreToolUse` and a spawn per
   tool call. Revisit only if a span turns out to be dominated by an unattributable middle.
-- **`events.jsonl` rotation.** Spans add roughly 600 bytes per turn — about 2.6 MB against
-  the current 4.2 MB log over the same period, ~60% growth, with no rotation today. Noted as
-  a follow-up trigger, not built here.
+- **`events.jsonl` rotation.** Spans add roughly **700 bytes per turn — about 3.3 MB against
+  the current 4.24 MB log over the same period, ~80% growth**, with no rotation today. Noted
+  as a follow-up trigger, not built here.
+
+  The earlier estimate here (600 B/turn, 2.6 MB, ~60%) was ~45% low, and this number is the
+  stated trigger for the follow-up, so the basis is spelled out. Measured 2026-08-06 against
+  the live log: 4,782 `stop` rows carrying 200,104 tool calls — **41.8 calls per turn**, not
+  the handful the 600 B figure implied. Dropping the first span (see *Anchoring*) removes one
+  span per turn, giving **40.8 spans/turn**, and 457 one-tool turns (9.6%) now emit no
+  `tool_spans` key at all. A serialized span (`["Read",41200],`) runs 15-17 bytes at the
+  measured mean tool-name length of 4.6 chars, so the payload lands at 3.05-3.44 MB
+  (+72-81%) depending on the digit width of the millisecond values; 700 B/turn and ~80% is
+  the mid-point. The first-span change is worth about 2.4% of the total, not a reprieve.
 - **Acting on the findings automatically** — no auto-demotion of expensive skills, no
   budget enforcement. This spec measures; it does not decide.
 
