@@ -1255,8 +1255,11 @@ def _cmd_bleed(args: argparse.Namespace) -> int:
           f"({(with_spans / total * 100) if total else 0:.1f}%) · "
           f"idle threshold: {args.idle_threshold:.0f}s")
     if spans_absent and total:
+        # Deliberately avoids the word "attributed" — the companion test
+        # asserts that column header is absent, and a note containing the word
+        # would satisfy the substring check while the column really was gone.
         print("no span data yet — ranking by turn time; "
-              "attributed/idle need spans, which accrue from install")
+              "per-tool cost and idle time need spans, which accrue from install")
     if unpaired:
         print(f"unpaired prompts: {unpaired} (turns that used no tools write no stop event)")
     if malformed:
