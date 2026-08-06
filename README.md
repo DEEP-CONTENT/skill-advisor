@@ -502,6 +502,93 @@ Flags:
 - `--purge-older-than DURATION` — rewrite the log, keeping only events newer
   than `DURATION`, and exit. Manual retention tool; the hook itself never prunes.
 
+### `skill-advisor bleed [options]`
+
+Rank skills and tools by the time they actually cost, with idle time flagged
+separately rather than folded into the total. Reads the same opt-in event log
+as `report` (`~/.cache/skill-advisor/advisor.events.jsonl`), pairing each
+`kind=prompt` row with the next `kind=stop` row in the same session and, where
+present, charging the `stop` row's `tool_spans` — the raw per-tool-call
+timestamp deltas the PostToolUse/Stop hooks write — to whichever skill(s) and
+tool(s) were active that turn.
+
+```bash
+skill-advisor bleed
+# turns: 3942 · spans: 0 of 3942 (0.0%) · idle threshold: 120s
+# no span data yet — ranking by turn time; per-tool cost and idle time need spans, which accrue from install
+# unpaired prompts: 1387 (turns that used no tools write no stop event)
+#
+# SKILL                                         n  p50 turn
+# superpowers:finishing-a-development-branch    8     2110s
+# superpowers:subagent-driven-development      12     1633s
+# ai-code-review                               13     1153s
+# ...
+#   20 skill(s) below n=5 (not ranked)
+#
+# TOOL — no span data yet. Spans accrue from install; re-run after some turns.
+```
+
+`tool_spans` did not exist before this feature shipped, so events recorded
+earlier carry none — the `spans: 0 of N (0.0%)` line above is the real output
+on a log that predates it, not a bug. Until spans accrue, `bleed` ranks skills
+by turn time (`p50 turn`) instead of cost and prints that fallback explicitly
+rather than silently sorting a column of zeros.
+
+Flags:
+
+- `--since DURATION` — time window (e.g. `7d`, `24h`; default: all history).
+- `--min-n N` — minimum turns before a skill is ranked (default: 5). Skills
+  under the floor are still counted (`N skill(s) below n=5 (not ranked)`),
+  never silently dropped from the total.
+- `--idle-threshold SECONDS` — seconds above which a span is treated as idle
+  (default: 120).
+- `--by {skill,tool,both}` — which tables to print (default: both).
+- `--limit N` — rows per table; overflow past the limit is reported as
+  `+N more`, never truncated without saying so (default: 20).
+- `--json` — emit machine-readable JSON instead of tables (default: off).
+
+**The idle threshold is applied at read time, not baked into what's
+recorded.** Every `stop` event stores the raw per-tool-call deltas; `bleed`
+decides at read time which spans exceed `--idle-threshold` and caps them
+there (the excess is charged to idle, never to the tool — "cap-and-spill",
+not all-or-nothing). That means the entire history can be re-read at a
+different `--idle-threshold` after the fact — nothing needs to be
+re-recorded, and lowering the threshold retroactively reclassifies old long
+spans as idle.
+
+**A turn that used no tools writes no stop event at all**, because the Stop
+hook returns early when there was nothing to record — a purely conversational
+turn leaves a `prompt` row with no matching `stop`. `bleed` counts these as
+`unpaired prompts` rather than silently shrinking the turn count, but there is
+no span to attribute time to: that turn cannot be measured, not "measured as
+zero".
+
+**A long span cannot tell an absent user apart from a genuinely slow tool,
+and `bleed` does not pretend otherwise.** PostToolUse reports only when a
+call *finished*, never when it started relative to the user's attention, so
+nothing in the data can distinguish "the user stepped away for ten minutes"
+from "that test suite genuinely took ten minutes." Every span over
+`--idle-threshold` is capped and the excess goes to `idle`, never to the
+tool's attributed cost. A skill whose time is mostly idle therefore reads as
+**unmeasured, not as fast or slow** — that is what the `idle` and
+`idle turns` columns are for: so a large `p50 turn` isn't misread as "this
+skill is slow" when it may just mean the user walked away mid-turn.
+
+**Subagent time is not part of what `bleed` reports.** Each turn's state
+tracks which subagents ran (`subagents_invoked`, echoed into the `stop`
+event's `subagents` field), but `bleed`'s skill and tool tables don't consume
+that field today — there is no subagent column in either `--by` table or in
+`--json`. Separately, that capture was also dead across the entire measured
+history up to this change: the code only recognized the tool name `"Task"`,
+but the tool that actually launches a subagent is named `"Agent"` (confirmed
+directly against this log — thousands of real `stop` events carry `"Agent"`,
+zero carry `"Task"`), so `subagents_invoked` was silently empty on every real
+turn regardless of how much subagent use actually happened. That name
+mismatch is fixed as of this change, so turns recorded from here on capture
+it correctly — but every `subagents_invoked` from before the fix is a false
+negative, not evidence subagents went unused, and `bleed` still won't surface
+it either way until a future change reads the field.
+
 ### `skill-advisor doctor`
 
 End-to-end diagnosis. Checks: `claude` on PATH, settings file present, catalog
