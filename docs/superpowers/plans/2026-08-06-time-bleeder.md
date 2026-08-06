@@ -1138,6 +1138,42 @@ def test_bleed_with_no_events_exits_zero_with_an_explanation(isolated_paths, cap
     assert "no telemetry events" in capsys.readouterr().out
 
 
+def test_bleed_counts_a_malformed_timestamp_under_a_since_window(isolated_paths, capsys):
+    """R5: a row whose ts will not parse must not vanish under --since. It is
+    NOT out-of-window — it has no window position at all — so it falls through
+    to pair_turns and is counted as malformed."""
+    _write_events(
+        _pair("2026-08-06T10:00:00Z", "2026-08-06T10:05:00Z", ["s"], [("Read", 10)])
+        + [{"kind": "prompt", "session_sha256": "z", "ts": "not-a-date"}]
+    )
+    cli._cmd_bleed(_ns(min_n=1, since="3650d"))
+    assert "malformed rows: 1" in capsys.readouterr().out
+
+
+def test_bleed_ranks_by_turn_time_when_no_turn_has_spans(isolated_paths, capsys):
+    """R6: with every attributed_ms at 0, ranking by it degenerates to the
+    alphabetical tie-break. Rank by the measurement that exists instead."""
+    _write_events(
+        _pair("2026-08-06T10:00:00Z", "2026-08-06T10:01:00Z", ["aaa-fast"], session="a")
+        + _pair("2026-08-06T11:00:00Z", "2026-08-06T11:30:00Z", ["zzz-slow"], session="b")
+    )
+    cli._cmd_bleed(_ns(min_n=1))
+    out = capsys.readouterr().out
+
+    assert "no span data yet" in out
+    # zzz-slow took 30 min vs aaa-fast's 1 min, so it must rank FIRST despite
+    # sorting last alphabetically — this fails if the fallback rank is dropped.
+    assert out.index("zzz-slow") < out.index("aaa-fast")
+    # The span-derived columns are omitted, not printed as a row of zeros.
+    assert "attributed" not in out
+
+
+def test_bleed_says_the_tool_table_is_empty_for_want_of_spans(isolated_paths, capsys):
+    _write_events(_pair("2026-08-06T10:00:00Z", "2026-08-06T10:05:00Z", ["s"]))
+    cli._cmd_bleed(_ns(min_n=1))
+    assert "no span data yet. Spans accrue from install" in capsys.readouterr().out
+
+
 def test_bleed_is_registered_as_a_subcommand(isolated_paths):
     """The parser wiring is a separate failure mode from the handler."""
     args = cli._build_parser().parse_args(["bleed", "--min-n", "3"])
@@ -1193,6 +1229,14 @@ def _cmd_bleed(args: argparse.Namespace) -> int:
     tools = bleed_mod.tool_stats(turns, threshold_ms=threshold_ms)
     with_spans, total = bleed_mod.span_coverage(turns)
 
+    # With no span data anywhere, every attributed_ms is 0, so ranking by it
+    # sorts every row on the same zero and silently degenerates to the
+    # alphabetical tie-break — a "cost ranking" that is really a name sort.
+    # Rank by the measurement that DOES exist, and say so.
+    spans_absent = with_spans == 0
+    if spans_absent:
+        skills = sorted(skills, key=lambda s: (-s.p50_turn_s, s.name))
+
     if args.json:
         print(json.dumps({
             "turns": total,
@@ -1210,6 +1254,9 @@ def _cmd_bleed(args: argparse.Namespace) -> int:
     print(f"turns: {total} · spans: {with_spans} of {total} "
           f"({(with_spans / total * 100) if total else 0:.1f}%) · "
           f"idle threshold: {args.idle_threshold:.0f}s")
+    if spans_absent and total:
+        print("no span data yet — ranking by turn time; "
+              "attributed/idle need spans, which accrue from install")
     if unpaired:
         print(f"unpaired prompts: {unpaired} (turns that used no tools write no stop event)")
     if malformed:
@@ -1219,9 +1266,9 @@ def _cmd_bleed(args: argparse.Namespace) -> int:
     print()
 
     if args.by in ("skill", "both"):
-        _print_bleed_skills(skills, below, args)
+        _print_bleed_skills(skills, below, args, spans_absent)
     if args.by in ("tool", "both"):
-        _print_bleed_tools(tools, args)
+        _print_bleed_tools(tools, args, spans_absent)
     return 0
 
 
@@ -1253,18 +1300,31 @@ def _load_events_counting_failures(cutoff) -> tuple[list[dict], int]:
                 continue
             if cutoff is not None:
                 ts = bleed_mod.parse_ts(row.get("ts"))
-                if ts is None or ts < cutoff:
+                # Only drop rows that legitimately fall outside the window. A
+                # row whose ts will not parse falls THROUGH, so `pair_turns`
+                # counts it as malformed — one source of truth for that count
+                # rather than a second one here that could drift.
+                if ts is not None and ts < cutoff:
                     continue
             events.append(row)
     return events, skipped
 
 
-def _print_bleed_skills(skills, below, args) -> None:
-    print(f"{'SKILL':42} {'n':>4} {'p50 turn':>9} {'attributed':>11} {'idle':>9} {'idle turns':>11}")
-    for s in skills[: args.limit]:
-        print(f"{s.name[:42]:42} {s.n:>4} {s.p50_turn_s:>8.0f}s "
-              f"{s.attributed_ms / 3_600_000:>10.2f}h {s.idle_ms / 3_600_000:>8.2f}h "
-              f"{s.turns_with_idle:>11}")
+def _print_bleed_skills(skills, below, args, spans_absent: bool = False) -> None:
+    """`n` and `p50 turn` are turn-level and always available; `attributed`,
+    `idle` and `idle turns` are span-derived. When no turn carries spans the
+    span-derived columns are omitted entirely rather than printed as a row of
+    zeros, because "0.00h" and "not measured yet" are different claims."""
+    if spans_absent:
+        print(f"{'SKILL':42} {'n':>4} {'p50 turn':>9}")
+        for s in skills[: args.limit]:
+            print(f"{s.name[:42]:42} {s.n:>4} {s.p50_turn_s:>8.0f}s")
+    else:
+        print(f"{'SKILL':42} {'n':>4} {'p50 turn':>9} {'attributed':>11} {'idle':>9} {'idle turns':>11}")
+        for s in skills[: args.limit]:
+            print(f"{s.name[:42]:42} {s.n:>4} {s.p50_turn_s:>8.0f}s "
+                  f"{s.attributed_ms / 3_600_000:>10.2f}h {s.idle_ms / 3_600_000:>8.2f}h "
+                  f"{s.turns_with_idle:>11}")
     if len(skills) > args.limit:
         print(f"  +{len(skills) - args.limit} more")
     if below:
@@ -1272,7 +1332,13 @@ def _print_bleed_skills(skills, below, args) -> None:
     print()
 
 
-def _print_bleed_tools(tools, args) -> None:
+def _print_bleed_tools(tools, args, spans_absent: bool = False) -> None:
+    if not tools:
+        # A bare header with no rows reads as "no tools were used". Say which
+        # it actually is.
+        print("TOOL — no span data yet. Spans accrue from install; "
+              "re-run after some turns.")
+        return
     print(f"{'TOOL':24} {'calls':>7} {'p50':>9} {'attributed':>11}")
     for t in tools[: args.limit]:
         print(f"{t.name[:24]:24} {t.calls:>7} {t.p50_ms / 1000:>8.1f}s "
@@ -1309,7 +1375,7 @@ Register the subparser next to `report`:
 uv run pytest -q
 ```
 
-Expected: PASS, 621 + 10 = 631.
+Expected: PASS, 621 + 13 = 634.
 
 - [ ] **Step 5: Run it against the real log**
 
