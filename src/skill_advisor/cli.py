@@ -642,8 +642,17 @@ def _cmd_bleed(args: argparse.Namespace) -> int:
             "unpaired_prompts": unpaired,
             "malformed_rows": malformed,
             "skipped_rows": skipped,
+            "out_of_window_rows": out_of_window,
             "skills_below_min_n": below,
             "idle_threshold_s": args.idle_threshold,
+            # A machine consumer reads array order as a cost ranking, and on
+            # the first-run path that order comes from turn time, not cost.
+            # Name the key rather than leaving the caller to infer it.
+            "ranked_by": "p50_turn_s" if spans_absent else "attributed_ms",
+            # `--limit` shapes the human tables only. Truncating here would be
+            # a silent drop with no `+N more` to notice it by, so the arrays
+            # stay complete and say so.
+            "limit_applied": False,
             "skills": [vars(s) for s in skills],
             "tools": [vars(t) for t in tools],
         }, indent=2))
@@ -672,7 +681,7 @@ def _cmd_bleed(args: argparse.Namespace) -> int:
     if args.by in ("skill", "both"):
         _print_bleed_skills(skills, below, args, spans_absent)
     if args.by in ("tool", "both"):
-        _print_bleed_tools(tools, args, spans_absent)
+        _print_bleed_tools(tools, args)
     return 0
 
 
@@ -723,6 +732,28 @@ def _load_events_counting_failures(cutoff) -> tuple[list[dict], int, int]:
     return events, skipped, out_of_window
 
 
+def _elide(name: str, width: int) -> str:
+    """Shorten to `width` by dropping the MIDDLE, never the tail.
+
+    A tail truncation silently merges identifiers that share a long prefix,
+    and these identifiers do: `name[:24]` collapsed 18 distinct MCP tools on
+    the author's live log into a single visible `mcp__plugin_playwright_p`,
+    rendering many table rows with identical names and different numbers while
+    `--limit 20` was consumed by them. The discriminating part of such a name
+    is its tail, so keep both ends and mark the cut with an ellipsis.
+
+    The ellipsis is one character, so the result is exactly `width` wide and
+    the column padding still lines up.
+    """
+    if len(name) <= width:
+        return name
+    if width <= 1:
+        return name[:width]
+    keep = width - 1
+    head = keep // 2
+    return name[:head] + "…" + name[len(name) - (keep - head):]
+
+
 def _print_bleed_skills(skills, below, args, spans_absent: bool = False) -> None:
     """`n` and `p50 turn` are turn-level and always available; `attributed`,
     `idle` and `idle turns` are span-derived. When no turn carries spans the
@@ -731,11 +762,11 @@ def _print_bleed_skills(skills, below, args, spans_absent: bool = False) -> None
     if spans_absent:
         print(f"{'SKILL':42} {'n':>4} {'p50 turn':>9}")
         for s in skills[: args.limit]:
-            print(f"{s.name[:42]:42} {s.n:>4} {s.p50_turn_s:>8.0f}s")
+            print(f"{_elide(s.name, 42):42} {s.n:>4} {s.p50_turn_s:>8.0f}s")
     else:
         print(f"{'SKILL':42} {'n':>4} {'p50 turn':>9} {'attributed':>11} {'idle':>9} {'idle turns':>11}")
         for s in skills[: args.limit]:
-            print(f"{s.name[:42]:42} {s.n:>4} {s.p50_turn_s:>8.0f}s "
+            print(f"{_elide(s.name, 42):42} {s.n:>4} {s.p50_turn_s:>8.0f}s "
                   f"{s.attributed_ms / 3_600_000:>10.2f}h {s.idle_ms / 3_600_000:>8.2f}h "
                   f"{s.turns_with_idle:>11}")
     if len(skills) > args.limit:
@@ -745,7 +776,11 @@ def _print_bleed_skills(skills, below, args, spans_absent: bool = False) -> None
     print()
 
 
-def _print_bleed_tools(tools, args, spans_absent: bool = False) -> None:
+def _print_bleed_tools(tools, args) -> None:
+    """No `spans_absent` parameter: `tool_stats` yields a row for every span,
+    and `span_coverage` counts exactly the turns that carry one, so an empty
+    table and "no turn has spans" are the same condition. A parameter that
+    could only ever restate its own call site is a second source of truth."""
     if not tools:
         # A bare header with no rows reads as "no tools were used". Say which
         # it actually is.
@@ -754,7 +789,7 @@ def _print_bleed_tools(tools, args, spans_absent: bool = False) -> None:
         return
     print(f"{'TOOL':24} {'calls':>7} {'p50':>9} {'attributed':>11}")
     for t in tools[: args.limit]:
-        print(f"{t.name[:24]:24} {t.calls:>7} {t.p50_ms / 1000:>8.1f}s "
+        print(f"{_elide(t.name, 24):24} {t.calls:>7} {t.p50_ms / 1000:>8.1f}s "
               f"{t.attributed_ms / 3_600_000:>10.2f}h")
     if len(tools) > args.limit:
         print(f"  +{len(tools) - args.limit} more")

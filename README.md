@@ -551,8 +551,20 @@ Flags:
   (default: 120).
 - `--by {skill,tool,both}` — which tables to print (default: both).
 - `--limit N` — rows per table; overflow past the limit is reported as
-  `+N more`, never truncated without saying so (default: 20).
+  `+N more`, never truncated without saying so (default: 20). Applies to the
+  **human tables only** — see `--json` below.
 - `--json` — emit machine-readable JSON instead of tables (default: off).
+
+In `--json` mode the `skills` and `tools` arrays are **complete**: `--limit` is
+not applied, and the payload says so with `"limit_applied": false`. Truncating
+there would be a silent drop with no `+N more` line to notice it by. The
+payload also carries `"ranked_by"`, naming the field the arrays are sorted on —
+`"attributed_ms"` normally, but `"p50_turn_s"` on the no-spans path, where a
+consumer reading array order as a cost ranking would otherwise be reading a
+turn-time ranking without knowing it. Names longer than the column are elided
+in the *middle* in the human tables (`mcp__plugin…rowser_click`) so that tools
+sharing a long prefix stay distinguishable; `--json` always carries the full
+name.
 
 **The idle threshold is applied at read time, not baked into what's
 recorded.** Every `stop` event stores the raw per-tool-call deltas; `bleed`

@@ -289,6 +289,107 @@ def test_bleed_says_the_tool_table_is_empty_for_want_of_spans(isolated_paths, ca
     assert "no span data yet. Spans accrue from install" in capsys.readouterr().out
 
 
+def test_bleed_keeps_long_tool_names_distinguishable(isolated_paths, capsys):
+    """`t.name[:24]` collapsed 18 distinct MCP tools on the live log into one
+    visible name (`mcp__plugin_playwright_p`), so the TOOL table rendered rows
+    with identical names and different numbers — and `--limit` was consumed by
+    them. The discriminating part of such a name is its TAIL, so elide the
+    middle instead of truncating."""
+    click = "mcp__plugin_playwright_playwright__browser_click"
+    close = "mcp__plugin_playwright_playwright__browser_close"
+    _write_events(
+        _pair(
+            "2026-08-06T10:00:00Z",
+            "2026-08-06T10:05:00Z",
+            ["s"],
+            [(click, 1000), (close, 2000)],
+        )
+    )
+    cli._cmd_bleed(_ns(min_n=1))
+    out = capsys.readouterr().out
+
+    tool_rows = [
+        line
+        for line in out.splitlines()
+        if line.startswith("mcp__") or line.startswith("mcp")
+    ]
+    assert len(tool_rows) == 2, out
+    rendered = {line.split()[0] for line in tool_rows}
+    assert len(rendered) == 2, f"two distinct tools rendered identically: {rendered}"
+    # The distinguishing suffix survives, which is the whole point.
+    assert "click" in out and "close" in out
+
+
+def test_bleed_keeps_long_skill_names_distinguishable(isolated_paths, capsys):
+    """Skills are safe only by luck today (the longest observed is exactly 42
+    chars). Same elision, so the next long name does not silently collide."""
+    a = "superpowers:a-very-long-prefix-shared-by-both-alpha"
+    b = "superpowers:a-very-long-prefix-shared-by-both-bravo"
+    _write_events(
+        _pair(
+            "2026-08-06T10:00:00Z",
+            "2026-08-06T10:05:00Z",
+            [a],
+            [("Read", 10)],
+            session="a",
+        )
+        + _pair(
+            "2026-08-06T11:00:00Z",
+            "2026-08-06T11:20:00Z",
+            [b],
+            [("Read", 20)],
+            session="b",
+        )
+    )
+    cli._cmd_bleed(_ns(min_n=1))
+    out = capsys.readouterr().out
+    rendered = {
+        line.split()[0] for line in out.splitlines() if line.startswith("superpowers:")
+    }
+    assert len(rendered) == 2, f"two distinct skills rendered identically: {rendered}"
+    assert "alpha" in out and "bravo" in out
+
+
+def test_bleed_json_says_which_key_it_ranked_by(isolated_paths, capsys):
+    """A machine consumer reads array order as a cost ranking. On the first-run
+    path the order comes from `p50_turn_s`, not `attributed_ms`, and nothing in
+    the payload said so."""
+    _write_events(
+        _pair("2026-08-06T10:00:00Z", "2026-08-06T10:01:00Z", ["a"], session="a")
+        + _pair("2026-08-06T11:00:00Z", "2026-08-06T11:30:00Z", ["b"], session="b")
+    )
+    cli._cmd_bleed(_ns(min_n=1, json=True))
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ranked_by"] == "p50_turn_s"
+
+    _write_events(
+        _pair("2026-08-06T10:00:00Z", "2026-08-06T10:01:00Z", ["a"], [("Read", 10)])
+    )
+    cli._cmd_bleed(_ns(min_n=1, json=True))
+    assert json.loads(capsys.readouterr().out)["ranked_by"] == "attributed_ms"
+
+
+def test_bleed_json_arrays_are_complete_and_say_so(isolated_paths, capsys):
+    """`--limit` shapes the human tables only. The JSON arrays stay complete —
+    a machine consumer that got a silently truncated array would have no way to
+    know — and `limit_applied` states it rather than leaving it implied."""
+    rows = []
+    for i in range(5):
+        rows += _pair(
+            f"2026-08-06T1{i}:00:00Z",
+            f"2026-08-06T1{i}:05:00Z",
+            [f"skill-{i}"],
+            [("Read", (i + 1) * 1000)],
+            session=f"s{i}",
+        )
+    _write_events(rows)
+    cli._cmd_bleed(_ns(min_n=1, limit=2, json=True))
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["limit_applied"] is False
+    assert len(payload["skills"]) == 5, "the JSON arrays must not be truncated"
+
+
 def test_bleed_is_registered_as_a_subcommand(isolated_paths):
     """The parser wiring is a separate failure mode from the handler."""
     args = cli._build_parser().parse_args(["bleed", "--min-n", "3"])
