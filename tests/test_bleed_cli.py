@@ -390,6 +390,89 @@ def test_bleed_json_arrays_are_complete_and_say_so(isolated_paths, capsys):
     assert len(payload["skills"]) == 5, "the JSON arrays must not be truncated"
 
 
+def test_span_coverage_counts_a_real_collector_turn_and_not_a_one_tool_turn(
+    monkeypatch, isolated_paths, capsys
+):
+    """Collector -> events.jsonl -> report, end to end.
+
+    The coverage invariant BLOCKING 1 broke lives across this whole chain and
+    at no single point in it: a one-tool turn used to be written with
+    `[["X", 0]]` and counted as span-carrying, so `spans: N of M` claimed
+    measurement the report did not have. Only the stop rows are real here —
+    the prompt rows are synthesised against the session hash the hooks
+    actually wrote, because pairing needs a partner and the UserPromptSubmit
+    path is a different subsystem.
+
+    Goes RED if the collector stops appending marks, if `run_stop` stops
+    emitting spans, if the first tool regains one (the one-tool turn would
+    then count as covered, making it 2 of 2), or if `span_coverage` stops
+    keying on a non-empty list.
+    """
+    import io
+    import time
+    from skill_advisor import hook, paths
+
+    config_path = paths.config_file()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("[telemetry]\nevents_enabled = true\n", encoding="utf-8")
+
+    def _drive(session, tools):
+        for tool in tools:
+            monkeypatch.setattr(
+                "sys.stdin",
+                io.StringIO(
+                    json.dumps(
+                        {
+                            "session_id": session,
+                            "tool_name": tool,
+                            "tool_input": {},
+                        }
+                    )
+                ),
+            )
+            assert hook.run_posttooluse() == 0
+            time.sleep(0.02)
+        monkeypatch.setattr(
+            "sys.stdin", io.StringIO(json.dumps({"session_id": session}))
+        )
+        assert hook.run_stop() == 0
+
+    _drive("many", ["Read", "Bash", "Edit"])
+    _drive("solo", ["Read"])
+
+    stops = [
+        json.loads(line)
+        for line in paths.events_file().read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(stops) == 2
+    rows = []
+    for i, stop in enumerate(stops):
+        stop["skills"] = ["measured"]
+        rows.append(
+            {
+                "kind": "prompt",
+                "session_sha256": stop["session_sha256"],
+                "ts": f"2026-08-06T1{i}:00:00Z",
+            }
+        )
+        stop["ts"] = f"2026-08-06T1{i}:05:00Z"
+        rows.append(stop)
+    _write_events(rows)
+
+    assert cli._cmd_bleed(_ns(min_n=1)) == 0
+    out = capsys.readouterr().out
+    assert "spans: 1 of 2" in out, out
+    # The three-tool turn contributed two spans, to Bash and Edit — never Read.
+    assert "Bash" in out and "Edit" in out
+    tool_names = {
+        line.split()[0]
+        for line in out.split("TOOL")[1].splitlines()[1:]
+        if line.strip() and not line.startswith(" ")
+    }
+    assert tool_names == {"Bash", "Edit"}, tool_names
+
+
 def test_bleed_is_registered_as_a_subcommand(isolated_paths):
     """The parser wiring is a separate failure mode from the handler."""
     args = cli._build_parser().parse_args(["bleed", "--min-n", "3"])
