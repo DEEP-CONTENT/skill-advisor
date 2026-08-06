@@ -108,21 +108,56 @@ threshold out of them to force a "yes".
 
 ---
 
+## What the live config is actually doing
+
+Measured from `~/.cache/skill-advisor/advisor.events.jsonl`, restricted to the post-fast-fail
+era (rows carrying a `judge_failure` key) and to non-triaged prompts — **n = 590**:
+
+```
+p50   14,781 ms      judge_used      142  (24.1%)
+p95   14,887 ms      judge_failure=timeout  343  (58.1%)
+max   15,012 ms      judge_failure=budget_exceeded  5
+                     judge_failure=unparseable      2
+```
+
+**The judge times out more than twice as often as it answers.** The cause is a config
+interaction, not the escalation question. The judge's subprocess timeout is *derived*, not
+configured — `judge.py:127` uses `max(budget_seconds - 0.5, 0.5)`, so at the live
+`budget_seconds = 15.0` it is **14.5 s**, while the judge's measured p50 cost in this corpus
+is **14.8 s**. The timeout sits below the median cost, so the median call cannot finish.
+
+(Note for anyone reaching for the obvious knob: `matcher.judge_timeout_seconds` does not
+exist. `judge_timeout_seconds` is a **`ParallelizationConfig`** field, default 5.0,
+governing the parallelization detector — a different subprocess. The judge's budget can only
+be moved via `budget_seconds`.)
+
+Every one of those 343 prompts pays the full ~14.8 s and then falls back to the embedding
+picks it could have had in 261 ms. The fallback is working exactly as designed — this is not
+a correctness bug, and no prompt returns empty — but it means the judge is currently
+*mostly* a 14.8-second delay in front of the embedding answer.
+
+This reframes the decision below: the realistic choice is not "12 s of judge quality vs.
+261 ms" but "24% chance of judge quality for a guaranteed ~15 s". Raising the budget so the
+judge usually completes is a third option, and it makes prompts slower, not faster.
+
 ## The two remaining options — both the user's call
 
 The plan is explicit that with no viable rule, these are decisions for the user, not for
 the plan:
 
 1. **Turn the judge off** (`use_judge = false`, the shipped default). The embedding path is
-   ~261 ms. Cost: the 60.9% decline rate is lost, so weak picks that the judge currently
-   suppresses would be surfaced.
-2. **Accept its cost.** Every non-triaged prompt pays p50 ~14.8 s. Live config currently
-   sits here (`use_judge = true`, `budget_seconds = 15.0`).
+   ~261 ms. Cost: the 60.9% decline rate is lost, so weak picks the judge currently
+   suppresses would be surfaced — but note that today it only gets to suppress them on the
+   24.1% of prompts where it beats its own timeout.
+2. **Accept its cost.** Live config sits here (`use_judge = true`, `budget_seconds = 15.0`),
+   at the measured p50/p95 above. If this is the choice, raise **`budget_seconds`** to at
+   least ~16 s so the derived judge timeout (`budget_seconds − 0.5`) clears the 14.8 s median
+   and the calls being paid for actually land. Today most of them do not.
 
-Neither is recorded as a deliberate choice anywhere. Change 2 of the spec — the fast-fail
-budget cut and the embedding fallback, PR #2 + PR #7 — already delivered the p95 improvement
-and removed the empty timeouts independently of this outcome, which is why it was sequenced
-first.
+Neither is recorded as a deliberate choice anywhere. Change 2 of the spec — the embedding
+fallback, PR #2 + PR #7 — removed the empty-handed returns independently of this outcome,
+which is why it was sequenced first. Its projected p95 improvement did not materialise,
+because that projection assumed a budget *cut* and the live budget was raised instead.
 
 ---
 

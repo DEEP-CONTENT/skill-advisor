@@ -1753,8 +1753,8 @@ is not one. The judge runs as a nested `claude -p`, which **inherits the calling
 session's hooks**. When one fires — a `Stop` hook, say — it forces extra turns and
 the envelope's `result` becomes the nested session's reply to *that hook* instead
 of the judge's verdict. The reply is valid JSON, so parsing succeeds and the old
-code recorded `unparseable`, sending anyone reading `events.jsonl` after a
-malformed reply or a parser gap that does not exist. The envelope's `num_turns` is
+code recorded `unparseable` — sending anyone reading `events.jsonl` off after a
+malformed reply or a parser gap, neither of which exists. The envelope's `num_turns` is
 the discriminator, checked before `result` is interpreted at all: every clean
 verdict measured had `num_turns == 1`, every contaminated one `> 1`, with zero
 overlap across a 250-row corpus. It was **6.4% of prompts** when measured, each

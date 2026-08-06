@@ -175,9 +175,12 @@ The projection this section used to carry — "if escalation proves viable at, s
 escalation rate, p50 → ~600 ms" — was labelled "must be re-measured, not assumed". It was
 measured, and it does not hold. Replaced here with the outcome.
 
-**Change 2 (shipped, PR #2 + PR #7).** The budget cut plus the embedding fallback removed
-the empty timeouts and took p95 to roughly 8 s, with no quality risk. This is the entire
-realised gain of the spec.
+**Change 2 (shipped, PR #2 + PR #7).** The embedding fallback works: the hook no longer
+returns empty-handed, and 58.1% of live prompts now ride it after a judge timeout instead of
+surfacing nothing. But the projected "p95 to roughly 8 s" **did not materialise**, because it
+assumed the budget cut. Live config raised `budget_seconds` back to 15.0 to accommodate the
+judge, so measured p95 is 14,887 ms — the ceiling, not 8 s. The realised gain of change 2 is
+*never empty*, not *faster*.
 
 **Change 1 (calibrated, not shipped).** A 25% escalation rate was never reachable. Against a
 250-prompt corpus on the refreshed index, **87.8% of prompts are ones where skipping the
@@ -188,9 +191,12 @@ candidate signal beat a random skip of the same size by a reproducible margin, a
 options that remain open:
 `docs/superpowers/notes/2026-07-30-escalation-calibration.md`.
 
-Live latency therefore remains judge-bound whenever `use_judge = true`: p50 ~14.8 s,
-p95 ~47 s including failed attempts. The only lever that moves it today is turning the judge
-off, which trades that cost for the judge's declines.
+Live latency therefore remains judge-bound whenever `use_judge = true`. Measured over 590
+non-triaged prompts in the post-fast-fail era: **p50 14,781 ms, p95 14,887 ms** — pinned at
+the 15 s budget, because the judge's own timeout (`budget_seconds − 0.5` = 14.5 s) sits
+*below* its measured p50 cost of 14.8 s. It therefore times out more often than it answers:
+**58.1% `timeout` against 24.1% `judge_used`.** The only lever that moves this today is
+turning the judge off, which trades the cost for the judge's declines.
 
 ---
 
