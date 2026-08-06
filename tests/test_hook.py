@@ -1002,3 +1002,59 @@ def test_stop_drops_spans_when_marks_desync(monkeypatch, isolated_paths):
     stop = [r for r in rows if r.get("kind") == "stop"][-1]
     assert "tool_spans" not in stop
     assert stop["tools"] == ["Read", "Bash", "Edit"]  # names still recorded
+
+
+def test_stop_clamps_negative_deltas_to_zero(monkeypatch, isolated_paths):
+    """Clock adjustments mid-turn must never produce negative spans.
+
+    The max(0, ...) clamp at hook.py:475 is the only defense against
+    a mark earlier than its predecessor producing a negative millisecond
+    value that could later be misinterpreted as valid data.
+    """
+    import io
+    import json as _json
+    from skill_advisor import hook, lifecycle, paths
+
+    config_path = paths.config_file()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("[telemetry]\nevents_enabled = true\n", encoding="utf-8")
+
+    turn = lifecycle.TurnState(session_id="sess-negative", turn_started_at=1000.0)
+    turn.tool_names = ["Read", "Bash", "Edit"]
+    turn.tool_marks = [1000.5, 999.0, 1002.0]  # second mark is BEFORE first
+    lifecycle.save_turn(turn)
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps({"session_id": "sess-negative"})))
+    assert hook.run_stop() == 0
+
+    rows = [_json.loads(l) for l in paths.events_file().read_text().splitlines() if l.strip()]
+    stop = [r for r in rows if r.get("kind") == "stop"][-1]
+    assert stop["tool_spans"] == [["Read", 500], ["Bash", 0], ["Edit", 3000]]
+
+
+def test_stop_desync_guard_reverse_direction(monkeypatch, isolated_paths):
+    """Desync guard must reject both directions: marks > names and marks < names.
+
+    Existing coverage only has fewer marks than names. This tests the
+    reverse: more marks than names. Both must emit no spans.
+    """
+    import io
+    import json as _json
+    from skill_advisor import hook, lifecycle, paths
+
+    config_path = paths.config_file()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("[telemetry]\nevents_enabled = true\n", encoding="utf-8")
+
+    turn = lifecycle.TurnState(session_id="sess-desync-rev", turn_started_at=1000.0)
+    turn.tool_names = ["Read", "Bash"]
+    turn.tool_marks = [1000.5, 1003.5, 1006.0]  # one extra mark
+    lifecycle.save_turn(turn)
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps({"session_id": "sess-desync-rev"})))
+    assert hook.run_stop() == 0
+
+    rows = [_json.loads(l) for l in paths.events_file().read_text().splitlines() if l.strip()]
+    stop = [r for r in rows if r.get("kind") == "stop"][-1]
+    assert "tool_spans" not in stop
+    assert stop["tools"] == ["Read", "Bash"]  # names still recorded
