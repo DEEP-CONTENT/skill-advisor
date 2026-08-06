@@ -351,7 +351,7 @@ def test_record_stop_writes_tool_spans(isolated_paths):
 
     row = json.loads(paths.events_file().read_text(encoding="utf-8").splitlines()[-1])
     assert row["tool_spans"] == [["Read", 412], ["Bash", 138204]]
-    assert row["span_anchor"] == "first_tool"
+    assert row["span_anchor"] == "previous_tool"
 
 
 def test_record_stop_omits_spans_when_there_are_none(isolated_paths):

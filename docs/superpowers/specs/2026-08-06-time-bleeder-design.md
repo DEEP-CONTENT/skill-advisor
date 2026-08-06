@@ -92,19 +92,30 @@ write — no new process, no new hook.** A `PreToolUse` hook was considered and 
 would cost a process spawn per tool call, and the only thing it buys is separating model
 thinking from tool execution, which this spec does not attempt.
 
-Anchoring: `TurnState.turn_started_at` already exists, but it is set when the `TurnState` is
-constructed — i.e. on the **first tool call**, not at prompt submission. It is therefore the
-correct anchor for the first span, and the prompt→first-tool interval is deliberately not
-part of a tool's span.
+Anchoring: a span is **time since the previous tool call finished**, so the loop starts at the
+second tool. The turn's first tool has no predecessor and therefore gets **no span at all**;
+a one-tool turn emits an empty list and honestly drops out of span coverage rather than being
+counted as covered by a meaningless zero.
+
+`TurnState.turn_started_at` was the original anchor for the first span, and that was wrong:
+`record_tool` sets `turn_started_at` (a `default_factory=time.time`) and appends
+`tool_marks[0]` two statements later, so on every real turn they are the *same instant* — the
+first tool was charged a structural 0 ms. Measured on the live log: 4,780 calls (2.4%)
+permanently zero, and 457 turns (9.6%) whose entire span list was a single `[["X", 0]]`.
+The prompt→first-tool interval is deliberately not part of any tool's span.
 
 ### 2. The stored form
 
 At `Stop`, spans are flushed into the event as deltas in milliseconds:
 
 ```json
-"tool_spans": [["Read", 412], ["Bash", 138204], ["Edit", 890]],
-"span_anchor": "first_tool"
+"tool_spans": [["Bash", 138204], ["Edit", 890]],
+"span_anchor": "previous_tool"
 ```
+
+The turn above used three tools — `Read`, then `Bash`, then `Edit`. `Read` is first and
+carries no span. Both keys are omitted entirely when the list is empty, so a one-tool turn
+looks identical to a pre-feature turn: span-less, not zero.
 
 `span_anchor` is a constant today. It is written anyway so that a later change of anchor
 (e.g. to prompt submission, if `UserPromptSubmit` ever stamps the turn) is distinguishable in

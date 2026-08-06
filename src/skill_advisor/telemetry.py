@@ -135,7 +135,7 @@ def record_stop(
     subagents: Iterable[str],
     skills: Iterable[str] = (),
     tool_spans: Iterable[tuple[str, int]] = (),
-    span_anchor: str = "first_tool",
+    span_anchor: str = "previous_tool",
     config: TelemetryConfig,
 ) -> None:
     """Append a `kind=stop` event with the turn's tool sequence.
@@ -163,9 +163,12 @@ def record_stop(
     spans = [[str(name), int(ms)] for name, ms in tool_spans]
     if spans:
         event["tool_spans"] = spans
-        # Constant today. Written anyway so a later anchor change (e.g. to
-        # prompt submission) is distinguishable in historical rows instead of
-        # silently redefining what a span means.
+        # "previous_tool": each span measures the interval since the PREVIOUS
+        # tool call finished, so the turn's first tool carries no span and a
+        # one-tool turn writes no `tool_spans` key at all. Constant today, but
+        # written anyway so a later anchor change (e.g. to prompt submission)
+        # is distinguishable in historical rows instead of silently redefining
+        # what a span means.
         event["span_anchor"] = span_anchor
 
     paths.ensure_dirs()

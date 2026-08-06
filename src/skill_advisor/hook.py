@@ -464,17 +464,31 @@ def run_stop() -> int:
     # report correlates picks with downstream Skill invocations to compute
     # ingestion rate. Lifecycle auto-advance is a separate concern below.
     if cfg.telemetry.events_enabled:
+        # Its OWN try, nested inside the telemetry block: a span computation
+        # that raises (a torn turn file can hold `Infinity`, and json.loads
+        # accepts it) must cost only the spans, never the whole stop event.
+        spans: list[tuple[str, int]] = []
         try:
             # Marks are index-parallel to tool_names. A desync means a torn write —
             # emit no spans rather than guessing an alignment.
-            spans: list[tuple[str, int]] = []
             if len(turn.tool_marks) == len(turn.tool_names):
-                previous = turn.turn_started_at
-                for name, mark in zip(turn.tool_names, turn.tool_marks):
+                # A span is "time since the PREVIOUS tool call finished", so it
+                # starts at index 1: the first tool of a turn has no predecessor
+                # and gets no span at all. Anchoring it on `turn.turn_started_at`
+                # instead charged it a structural 0 ms on every real turn —
+                # `record_tool` sets `turn_started_at` and appends
+                # `tool_marks[0]` two statements apart, so they are the same
+                # instant. A one-tool turn therefore emits nothing and honestly
+                # drops out of span coverage.
+                for i in range(1, len(turn.tool_names)):
+                    delta = turn.tool_marks[i] - turn.tool_marks[i - 1]
                     # Clamp: a clock adjustment mid-turn must never yield a negative.
-                    spans.append((name, max(0, int((mark - previous) * 1000))))
-                    previous = mark
+                    spans.append((turn.tool_names[i], max(0, int(delta * 1000))))
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("stop span computation failed: %s", exc, exc_info=True)
+            spans = []
 
+        try:
             telemetry.record_stop(
                 session_id=session_id,
                 tools=turn.tool_names,

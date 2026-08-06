@@ -512,6 +512,13 @@ present, charging the `stop` row's `tool_spans` — the raw per-tool-call
 timestamp deltas the PostToolUse/Stop hooks write — to whichever skill(s) and
 tool(s) were active that turn.
 
+A span measures **the interval since the previous tool call finished**, so the
+first tool of a turn carries no span: there is no predecessor to measure from,
+and the prompt→first-tool interval belongs to no tool. A turn that used exactly
+one tool therefore records no spans at all and counts as *not span-carrying* in
+the `spans: N of M` line — deliberately, because a fabricated `0 ms` for that
+tool would be counted as coverage the report does not have.
+
 ```bash
 skill-advisor bleed
 # turns: 3942 · spans: 0 of 3942 (0.0%) · idle threshold: 120s
