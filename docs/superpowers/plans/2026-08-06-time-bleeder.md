@@ -398,7 +398,7 @@ and pass it through:
 uv run pytest -q
 ```
 
-Expected: PASS, 593 + 5 = 598.
+Expected: PASS, 593 + 7 = 600.
 
 - [ ] **Step 6: Mutation-check**
 
@@ -694,7 +694,7 @@ def pair_turns(events: Iterable[dict]) -> tuple[list[Turn], int]:
 uv run pytest tests/test_bleed.py -q
 ```
 
-Expected: PASS, 14 tests.
+Expected: PASS, 12 tests (600 -> 612).
 
 - [ ] **Step 5: Commit**
 
@@ -944,7 +944,7 @@ def tool_stats(turns: Sequence[Turn], *, threshold_ms: int) -> list[ToolStat]:
 uv run pytest -q
 ```
 
-Expected: PASS, 598 + 8 = 606.
+Expected: PASS, 612 + 8 = 620.
 
 - [ ] **Step 5: Mutation-check the min-n guard**
 
@@ -1274,7 +1274,7 @@ Register the subparser next to `report`:
 uv run pytest -q
 ```
 
-Expected: PASS, 606 + 7 = 613.
+Expected: PASS, 620 + 9 = 629.
 
 - [ ] **Step 5: Run it against the real log**
 
