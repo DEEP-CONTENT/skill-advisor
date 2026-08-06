@@ -436,6 +436,7 @@ no spans rather than a guessed alignment."
 - Produces, all importable from `skill_advisor.bleed`:
   - `@dataclass Turn`: `session: str | None`, `start: datetime`, `stop: datetime`, `skills: list[str]`, `tools: list[str]`, `spans: list[tuple[str, int]] | None`
   - `Turn.duration_s -> float`
+  - `parse_ts(text: object) -> datetime | None` — public; the CLI windows with it
   - `pair_turns(events: Iterable[dict]) -> tuple[list[Turn], int]` — returns turns and the count of unpaired prompts
   - `@dataclass Attribution`: `per_tool: dict[str, int]`, `idle_ms: int`, `idle_gaps: int`
   - `attribute(spans: Sequence[tuple[str, int]], threshold_ms: int) -> Attribution`
@@ -585,7 +586,8 @@ from typing import Iterable, Sequence
 TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
-def _parse_ts(text: object) -> datetime | None:
+def parse_ts(text: object) -> datetime | None:
+    """Public: the CLI needs it too, for windowing under `--since`."""
     if not isinstance(text, str):
         return None
     try:
@@ -656,7 +658,7 @@ def pair_turns(events: Iterable[dict]) -> tuple[list[Turn], int]:
         rows.sort(key=lambda r: str(r.get("ts") or ""))
         pending: datetime | None = None
         for row in rows:
-            ts = _parse_ts(row.get("ts"))
+            ts = parse_ts(row.get("ts"))
             if ts is None:
                 continue
             if (row.get("kind") or "prompt") == "prompt":
@@ -802,6 +804,15 @@ def test_tool_stats_aggregate_calls_and_p50():
     assert [s.name for s in stats] == ["Bash", "Read"]
 
 
+def test_tool_p50_uses_capped_values_not_raw():
+    """One row, one meaning. Without this the fixture spans all sit under the
+    threshold and nothing discriminates capped from raw."""
+    turns = [_turn(600, spans=[("Bash", 300_000), ("Bash", 300_000)])]
+    stats = bleed.tool_stats(turns, threshold_ms=120_000)
+    assert stats[0].p50_ms == 120_000
+    assert stats[0].attributed_ms == 240_000
+
+
 def test_span_coverage_reports_both_populations():
     turns = [_turn(60, spans=[("Read", 1)]), _turn(60, spans=None), _turn(60, spans=None)]
     assert bleed.span_coverage(turns) == (1, 3)
@@ -899,14 +910,20 @@ def skill_stats(
 
 
 def tool_stats(turns: Sequence[Turn], *, threshold_ms: int) -> list[ToolStat]:
-    """Rank tools by total attributed time across every turn that carries spans."""
+    """Rank tools by total attributed time across every turn that carries spans.
+
+    Both columns are post-idle-rule: `p50_ms` is the median of CAPPED spans,
+    not raw ones, so one row never mixes two meanings. A tool whose calls are
+    all idle-contaminated therefore shows `p50_ms == threshold_ms`, which reads
+    correctly as "we stopped counting here" rather than as a real duration.
+    """
     samples: dict[str, list[float]] = {}
     attributed: dict[str, int] = {}
     for turn in turns:
         for name, raw in turn.spans or []:
-            one = attribute([(name, raw)], threshold_ms)
-            samples.setdefault(name, []).append(float(raw))
-            attributed[name] = attributed.get(name, 0) + one.per_tool[name]
+            charged = attribute([(name, raw)], threshold_ms).per_tool[name]
+            samples.setdefault(name, []).append(float(charged))
+            attributed[name] = attributed.get(name, 0) + charged
 
     stats = [
         ToolStat(
@@ -1057,6 +1074,18 @@ def test_bleed_counts_unparseable_rows_instead_of_hiding_them(isolated_paths, ca
     assert "skipped 1" in capsys.readouterr().out
 
 
+def test_bleed_counts_unparseable_rows_under_a_since_window_too(isolated_paths, capsys):
+    """Global constraint: every excluded count is printed. A windowed read must
+    not report 0 skipped just because subtraction would be meaningless there."""
+    paths.ensure_dirs()
+    with open(paths.events_file(), "w", encoding="utf-8") as fh:
+        fh.write("{not json\n")
+        for row in _pair("2026-08-06T10:00:00Z", "2026-08-06T10:05:00Z", ["s"], [("Read", 10)]):
+            fh.write(json.dumps(row) + "\n")
+    cli._cmd_bleed(_ns(min_n=1, since="3650d"))
+    assert "skipped 1" in capsys.readouterr().out
+
+
 def test_bleed_threshold_flag_changes_the_attribution(isolated_paths, capsys):
     """The whole reason the stored form is raw: history is re-readable at a
     different threshold."""
@@ -1162,15 +1191,36 @@ def _cmd_bleed(args: argparse.Namespace) -> int:
 
 
 def _load_events_counting_failures(cutoff) -> tuple[list[dict], int]:
-    """iter_events swallows bad lines. Count them so the report can disclose."""
-    total_lines = 0
+    """Load events, counting rows that failed to parse.
+
+    `telemetry.iter_events` swallows bad lines, so the count has to happen
+    here. Parse directly rather than subtracting `len(iter_events())` from a
+    line count: under a `--since` window an in-range row legitimately dropped
+    by the cutoff is indistinguishable from a parse failure, and a number that
+    is silently wrong under one flag is worse than no number.
+    """
+    from . import bleed as bleed_mod
+
+    events: list[dict] = []
+    skipped = 0
     with open(paths.events_file(), encoding="utf-8") as fh:
         for line in fh:
-            if line.strip():
-                total_lines += 1
-    events = list(telemetry.iter_events(cutoff=cutoff))
-    # Only meaningful with no cutoff; a windowed read legitimately drops rows.
-    skipped = max(0, total_lines - len(events)) if cutoff is None else 0
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                skipped += 1
+                continue
+            if not isinstance(row, dict):
+                skipped += 1
+                continue
+            if cutoff is not None:
+                ts = bleed_mod.parse_ts(row.get("ts"))
+                if ts is None or ts < cutoff:
+                    continue
+            events.append(row)
     return events, skipped
 
 
@@ -1284,11 +1334,38 @@ PY
 
 If `subagents_invoked == ["Explore"]`, the capture works and the live zero means subagent use is genuinely absent (consistent with the user's "don't call the Agent tool unless requested" rule) — record that. If it is empty, the payload key differs from `tool_input.subagent_type` and the capture is dead.
 
-- [ ] **Step 2: Record the answer**
+- [ ] **Step 2: Record the answer — and if it is dead, fix it**
 
-If the capture **works**, add one line to the README's `bleed` section stating that subagent time is captured but historically unused, so an empty subagent column means "not used", not "not measured".
+If the capture **works**: add one line to the README's `bleed` section stating that subagent time is captured but historically unused, so an empty subagent column means "not used", not "not measured". Then go to Step 3.
 
-If the capture is **dead**, do not fix it here — it is outside this plan's scope. Open a follow-up and add to the README: "subagent attribution is not currently captured (see issue #N)". A `bleed` report must never imply coverage it does not have.
+If the capture is **dead** (controller ruling 2026-08-06: fix it inside this plan rather than defer it — a `bleed` report must never imply coverage it does not have, and a one-key payload fix is smaller than the disclaimer it would otherwise need):
+
+1. Print the real payload shape to find the actual key:
+
+```bash
+uv run python - <<'PY'
+import io, json, sys
+from skill_advisor import hook
+sys.stdin = io.StringIO(json.dumps({
+    "session_id": "probe-shape", "tool_name": "Task",
+    "tool_input": {"subagent_type": "Explore", "description": "d", "prompt": "p"},
+}))
+# Print what run_posttooluse actually reads, not what we assume it reads.
+import skill_advisor.lifecycle as lc
+orig = lc.record_tool
+def spy(session_id, tool_name, *, subagent_type=None, skill_name=None):
+    print("record_tool got:", tool_name, "subagent_type=", repr(subagent_type))
+    return orig(session_id, tool_name, subagent_type=subagent_type, skill_name=skill_name)
+lc.record_tool = spy
+hook.run_posttooluse()
+PY
+```
+
+2. Write a failing test in `tests/test_hook.py` that drives `run_posttooluse` with a realistic `Task` payload and asserts `turn.subagents_invoked == ["Explore"]`.
+3. Fix the extraction in `hook.py`'s `run_posttooluse` (the `tool_input.get("subagent_type")` read at approximately `hook.py:384`) to use the key the probe actually revealed.
+4. Re-run the full suite; commit as a separate commit with a message naming the measured evidence (`0 of 4,348 turns`) and the key that was wrong.
+
+Either way, the README must state plainly what subagent coverage exists.
 
 - [ ] **Step 3: Document `bleed` in the README**
 
