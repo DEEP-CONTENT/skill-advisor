@@ -1082,10 +1082,10 @@ When [auto-advance](#auto-advance) is enabled, `skill-advisor install` also wire
 two sibling handlers into your settings file:
 
 - **`skill-advisor posttooluse`** fires after every tool call. It appends the
-  `tool_name` (and, for subagent-launcher calls — `Agent` in current Claude
-  Code builds, `Task` also recognized defensively, see
-  [`skill-advisor bleed`](#skill-advisor-bleed-options) — the `subagent_type`)
-  into `~/.cache/skill-advisor/sessions/<session_id>.turn.json`.
+  `tool_name` (and, for subagent-launcher calls, the `subagent_type` —
+  `Agent` in current Claude Code builds; `Task` also recognized defensively,
+  see [`skill-advisor bleed`](#skill-advisor-bleed-options)) into
+  `~/.cache/skill-advisor/sessions/<session_id>.turn.json`.
 - **`skill-advisor stop`** fires at the end of each assistant turn. It reads
   the turn file, clears it, then consults the active lifecycle state and the
   `[lifecycle.auto_advance]` rules to decide whether to advance the phase
@@ -1370,11 +1370,15 @@ else changes for sessions that don't trigger a lifecycle.
 Two transitions auto-advance:
 
 - **`PLANNING → IMPLEMENTATION`** when the last turn invoked a `Plan` subagent
-  (via Claude Code's subagent-launcher tool — `Agent` in current builds, with
-  `subagent_type="Plan"`; `Task` is also recognized defensively, see
-  [`skill-advisor bleed`](#skill-advisor-bleed-options) for the measured
-  evidence). Use this when you want the advisor to hand off to the
-  implementer immediately after planning completes, without typing "go".
+  (`subagent_type="Plan"`, via Claude Code's subagent-launcher tool — `Agent`
+  in current builds, `Task` also recognized defensively). Use this when you
+  want the advisor to hand off to the implementer immediately after planning
+  completes, without typing "go". **This rule was silently inert until a
+  recent fix** — it checked a tool name (`Task`) that never occurs in real
+  traffic, so it never fired against actual `Agent` calls. If you already
+  have `auto_advance.enabled = true`, it will fire for the first time now;
+  see [`skill-advisor bleed`](#skill-advisor-bleed-options) for the measured
+  evidence.
 - **`IMPLEMENTATION → REVIEW`** when the last turn ended with any mutating tool
   (`Edit`, `Write`, `NotebookEdit`, `MultiEdit`, `Bash`). If the model only read
   files this turn (`Read`, `Grep`, `Glob`, `LS`), the state stays at
