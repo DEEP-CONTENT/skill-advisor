@@ -14,6 +14,7 @@ between "the user was away from the keyboard" and "that test run really did
 take four minutes". Idle is therefore never hidden. A skill whose time is
 mostly idle reads as UNMEASURED, not as fast or slow.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -73,13 +74,19 @@ def attribute(spans: Sequence[tuple[str, int]], threshold_ms: int) -> Attributio
     return Attribution(per_tool=per_tool, idle_ms=idle_ms, idle_gaps=idle_gaps)
 
 
-def pair_turns(events: Iterable[dict]) -> tuple[list[Turn], int]:
+def pair_turns(events: Iterable[dict]) -> tuple[list[Turn], int, int]:
     """Pair each prompt with the next stop in the same session.
 
-    Returns (turns, unpaired_prompt_count). A prompt with no following stop is
-    normal, not an error: `run_stop` returns early when the turn used no tools,
-    so a purely conversational turn writes no stop event at all. It is counted
-    so the report can disclose it instead of silently shrinking the corpus.
+    Returns (turns, unpaired_prompt_count, malformed_row_count).
+
+    A prompt with no following stop is normal, not an error: `run_stop` returns
+    early when the turn used no tools, so a purely conversational turn writes no
+    stop event at all. It is counted so the report can disclose it instead of
+    silently shrinking the corpus.
+
+    A row whose timestamp will not parse is data damage, and is counted
+    SEPARATELY rather than folded into `unpaired` — conflating the two would
+    make a corrupted log read as heavy conversational use.
     """
     by_session: dict[str | None, list[dict]] = {}
     for row in events:
@@ -91,12 +98,14 @@ def pair_turns(events: Iterable[dict]) -> tuple[list[Turn], int]:
 
     turns: list[Turn] = []
     unpaired = 0
+    malformed = 0
     for session, rows in by_session.items():
         rows.sort(key=lambda r: str(r.get("ts") or ""))
         pending: datetime | None = None
         for row in rows:
             ts = parse_ts(row.get("ts"))
             if ts is None:
+                malformed += 1
                 continue
             if (row.get("kind") or "prompt") == "prompt":
                 if pending is not None:
@@ -111,15 +120,17 @@ def pair_turns(events: Iterable[dict]) -> tuple[list[Turn], int]:
                 if isinstance(raw_spans, list) and raw_spans
                 else None
             )
-            turns.append(Turn(
-                session=session,
-                start=pending,
-                stop=ts,
-                skills=[str(s) for s in (row.get("skills") or [])],
-                tools=[str(t) for t in (row.get("tools") or [])],
-                spans=spans,
-            ))
+            turns.append(
+                Turn(
+                    session=session,
+                    start=pending,
+                    stop=ts,
+                    skills=[str(s) for s in (row.get("skills") or [])],
+                    tools=[str(t) for t in (row.get("tools") or [])],
+                    spans=spans,
+                )
+            )
             pending = None
         if pending is not None:
             unpaired += 1
-    return turns, unpaired
+    return turns, unpaired, malformed
