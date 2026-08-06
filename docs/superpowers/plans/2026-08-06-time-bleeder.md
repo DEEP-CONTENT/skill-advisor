@@ -437,7 +437,7 @@ no spans rather than a guessed alignment."
   - `@dataclass Turn`: `session: str | None`, `start: datetime`, `stop: datetime`, `skills: list[str]`, `tools: list[str]`, `spans: list[tuple[str, int]] | None`
   - `Turn.duration_s -> float`
   - `parse_ts(text: object) -> datetime | None` — public; the CLI windows with it
-  - `pair_turns(events: Iterable[dict]) -> tuple[list[Turn], int]` — returns turns and the count of unpaired prompts
+  - `pair_turns(events: Iterable[dict]) -> tuple[list[Turn], int, int]` — returns turns, the count of unpaired prompts, and the count of malformed rows (unparseable timestamp). Three-tuple per controller ruling 2026-08-06: corruption is counted separately from the legitimate no-tools case.
   - `@dataclass Attribution`: `per_tool: dict[str, int]`, `idle_ms: int`, `idle_gaps: int`
   - `attribute(spans: Sequence[tuple[str, int]], threshold_ms: int) -> Attribution`
 
@@ -500,7 +500,7 @@ def test_repeated_tools_accumulate():
 # --- turn pairing --------------------------------------------------------
 
 def test_a_prompt_pairs_with_the_next_stop_in_its_session():
-    turns, unpaired = bleed.pair_turns([_prompt(), _stop()])
+    turns, unpaired, malformed = bleed.pair_turns([_prompt(), _stop()])
     assert unpaired == 0
     assert len(turns) == 1
     assert turns[0].duration_s == 300.0
@@ -509,26 +509,26 @@ def test_a_prompt_pairs_with_the_next_stop_in_its_session():
 def test_a_legacy_row_without_a_kind_counts_as_a_prompt():
     """838 rows predate the `kind` key. Dropping them loses the oldest history."""
     legacy = {"session_sha256": "s", "ts": "2026-08-06T10:00:00Z"}
-    turns, _ = bleed.pair_turns([legacy, _stop()])
+    turns, _, _ = bleed.pair_turns([legacy, _stop()])
     assert len(turns) == 1
 
 
 def test_a_prompt_with_no_stop_is_counted_unpaired_not_dropped_silently():
     """run_stop returns early when the turn used no tools, so no stop event is
     written at all. Expected, but it must be visible in the count."""
-    turns, unpaired = bleed.pair_turns([_prompt()])
+    turns, unpaired, malformed = bleed.pair_turns([_prompt()])
     assert turns == []
     assert unpaired == 1
 
 
 def test_turns_do_not_pair_across_sessions():
-    turns, unpaired = bleed.pair_turns([_prompt(session="a"), _stop(session="b")])
+    turns, unpaired, _ = bleed.pair_turns([_prompt(session="a"), _stop(session="b")])
     assert turns == []
     assert unpaired == 1
 
 
 def test_a_second_prompt_before_a_stop_orphans_the_first():
-    turns, unpaired = bleed.pair_turns([
+    turns, unpaired, _ = bleed.pair_turns([
         _prompt(ts="2026-08-06T10:00:00Z"),
         _prompt(ts="2026-08-06T10:01:00Z"),
         _stop(ts="2026-08-06T10:02:00Z"),
@@ -539,15 +539,27 @@ def test_a_second_prompt_before_a_stop_orphans_the_first():
 
 
 def test_spans_are_carried_onto_the_turn_and_absent_ones_are_none():
-    with_spans, _ = bleed.pair_turns([_prompt(), _stop(tool_spans=[["Read", 412]])])
-    without, _ = bleed.pair_turns([_prompt(), _stop()])
+    with_spans, _, _ = bleed.pair_turns([_prompt(), _stop(tool_spans=[["Read", 412]])])
+    without, _, _ = bleed.pair_turns([_prompt(), _stop()])
     assert with_spans[0].spans == [("Read", 412)]
     assert without[0].spans is None
 
 
-def test_an_unparseable_timestamp_does_not_crash_the_pairing():
-    turns, unpaired = bleed.pair_turns([_prompt(ts="not-a-date"), _stop()])
+def test_an_unparseable_timestamp_is_counted_malformed_not_dropped():
+    """A malformed row must not vanish from every output. It is counted
+    separately from `unpaired`, which means the legitimate no-tools case."""
+    turns, unpaired, malformed = bleed.pair_turns([_prompt(ts="not-a-date"), _stop()])
     assert turns == []
+    assert unpaired == 0
+    assert malformed == 1
+
+
+def test_out_of_order_rows_are_sorted_before_pairing():
+    """Deleting the rows.sort() must fail a test. Every other fixture supplies
+    prompt-then-stop in file order, so the sort is otherwise a no-op."""
+    turns, _, _ = bleed.pair_turns([_stop(), _prompt()])
+    assert len(turns) == 1
+    assert turns[0].duration_s == 300.0
 ```
 
 - [ ] **Step 2: Run to verify it fails**
@@ -636,13 +648,19 @@ def attribute(spans: Sequence[tuple[str, int]], threshold_ms: int) -> Attributio
     return Attribution(per_tool=per_tool, idle_ms=idle_ms, idle_gaps=idle_gaps)
 
 
-def pair_turns(events: Iterable[dict]) -> tuple[list[Turn], int]:
+def pair_turns(events: Iterable[dict]) -> tuple[list[Turn], int, int]:
     """Pair each prompt with the next stop in the same session.
 
-    Returns (turns, unpaired_prompt_count). A prompt with no following stop is
-    normal, not an error: `run_stop` returns early when the turn used no tools,
-    so a purely conversational turn writes no stop event at all. It is counted
-    so the report can disclose it instead of silently shrinking the corpus.
+    Returns (turns, unpaired_prompt_count, malformed_row_count).
+
+    A prompt with no following stop is normal, not an error: `run_stop` returns
+    early when the turn used no tools, so a purely conversational turn writes no
+    stop event at all. It is counted so the report can disclose it instead of
+    silently shrinking the corpus.
+
+    A row whose timestamp will not parse is data damage, and is counted
+    SEPARATELY rather than folded into `unpaired` — conflating the two would
+    make a corrupted log read as heavy conversational use.
     """
     by_session: dict[str | None, list[dict]] = {}
     for row in events:
@@ -654,12 +672,14 @@ def pair_turns(events: Iterable[dict]) -> tuple[list[Turn], int]:
 
     turns: list[Turn] = []
     unpaired = 0
+    malformed = 0
     for session, rows in by_session.items():
         rows.sort(key=lambda r: str(r.get("ts") or ""))
         pending: datetime | None = None
         for row in rows:
             ts = parse_ts(row.get("ts"))
             if ts is None:
+                malformed += 1
                 continue
             if (row.get("kind") or "prompt") == "prompt":
                 if pending is not None:
@@ -685,7 +705,7 @@ def pair_turns(events: Iterable[dict]) -> tuple[list[Turn], int]:
             pending = None
         if pending is not None:
             unpaired += 1
-    return turns, unpaired
+    return turns, unpaired, malformed
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -694,7 +714,7 @@ def pair_turns(events: Iterable[dict]) -> tuple[list[Turn], int]:
 uv run pytest tests/test_bleed.py -q
 ```
 
-Expected: PASS, 12 tests (600 -> 612).
+Expected: PASS, 13 tests (600 -> 613).
 
 - [ ] **Step 5: Commit**
 
@@ -944,7 +964,7 @@ def tool_stats(turns: Sequence[Turn], *, threshold_ms: int) -> list[ToolStat]:
 uv run pytest -q
 ```
 
-Expected: PASS, 612 + 8 = 620.
+Expected: PASS, 613 + 8 = 621.
 
 - [ ] **Step 5: Mutation-check the min-n guard**
 
@@ -1101,6 +1121,18 @@ def test_bleed_threshold_flag_changes_the_attribution(isolated_paths, capsys):
     assert tight["skills"][0]["idle_ms"] == 140_000
 
 
+def test_bleed_reports_malformed_rows_separately_from_unpaired(isolated_paths, capsys):
+    """Data damage and the legitimate no-tools case are different things and
+    must not share a counter."""
+    _write_events(
+        _pair("2026-08-06T10:00:00Z", "2026-08-06T10:05:00Z", ["s"], [("Read", 10)])
+        + [{"kind": "prompt", "session_sha256": "z", "ts": "not-a-date"}]
+    )
+    cli._cmd_bleed(_ns(min_n=1))
+    out = capsys.readouterr().out
+    assert "malformed rows: 1" in out
+
+
 def test_bleed_with_no_events_exits_zero_with_an_explanation(isolated_paths, capsys):
     assert cli._cmd_bleed(_ns()) == 0
     assert "no telemetry events" in capsys.readouterr().out
@@ -1156,7 +1188,7 @@ def _cmd_bleed(args: argparse.Namespace) -> int:
         return 0
 
     threshold_ms = int(args.idle_threshold * 1000)
-    turns, unpaired = bleed_mod.pair_turns(events)
+    turns, unpaired, malformed = bleed_mod.pair_turns(events)
     skills, below = bleed_mod.skill_stats(turns, threshold_ms=threshold_ms, min_n=args.min_n)
     tools = bleed_mod.tool_stats(turns, threshold_ms=threshold_ms)
     with_spans, total = bleed_mod.span_coverage(turns)
@@ -1166,6 +1198,7 @@ def _cmd_bleed(args: argparse.Namespace) -> int:
             "turns": total,
             "turns_with_spans": with_spans,
             "unpaired_prompts": unpaired,
+            "malformed_rows": malformed,
             "skipped_rows": skipped,
             "skills_below_min_n": below,
             "idle_threshold_s": args.idle_threshold,
@@ -1179,6 +1212,8 @@ def _cmd_bleed(args: argparse.Namespace) -> int:
           f"idle threshold: {args.idle_threshold:.0f}s")
     if unpaired:
         print(f"unpaired prompts: {unpaired} (turns that used no tools write no stop event)")
+    if malformed:
+        print(f"malformed rows: {malformed} (unparseable timestamp)")
     if skipped:
         print(f"skipped {skipped} unparseable rows")
     print()
@@ -1274,7 +1309,7 @@ Register the subparser next to `report`:
 uv run pytest -q
 ```
 
-Expected: PASS, 620 + 9 = 629.
+Expected: PASS, 621 + 10 = 631.
 
 - [ ] **Step 5: Run it against the real log**
 
