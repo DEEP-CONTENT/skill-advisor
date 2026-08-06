@@ -588,6 +588,123 @@ def _cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_bleed(args: argparse.Namespace) -> int:
+    from datetime import datetime, timezone
+
+    from . import bleed as bleed_mod
+
+    if not paths.events_file().is_file():
+        print("no telemetry events recorded.")
+        print("enable with `events_enabled = true` under [telemetry] in config.toml.")
+        return 0
+
+    cutoff = None
+    if args.since:
+        try:
+            cutoff = datetime.now(timezone.utc) - telemetry.parse_duration(args.since)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+
+    events, skipped = _load_events_counting_failures(cutoff)
+    if not events:
+        print("no telemetry events recorded.")
+        return 0
+
+    threshold_ms = int(args.idle_threshold * 1000)
+    turns, unpaired, malformed = bleed_mod.pair_turns(events)
+    skills, below = bleed_mod.skill_stats(turns, threshold_ms=threshold_ms, min_n=args.min_n)
+    tools = bleed_mod.tool_stats(turns, threshold_ms=threshold_ms)
+    with_spans, total = bleed_mod.span_coverage(turns)
+
+    if args.json:
+        print(json.dumps({
+            "turns": total,
+            "turns_with_spans": with_spans,
+            "unpaired_prompts": unpaired,
+            "malformed_rows": malformed,
+            "skipped_rows": skipped,
+            "skills_below_min_n": below,
+            "idle_threshold_s": args.idle_threshold,
+            "skills": [vars(s) for s in skills],
+            "tools": [vars(t) for t in tools],
+        }, indent=2))
+        return 0
+
+    print(f"turns: {total} · spans: {with_spans} of {total} "
+          f"({(with_spans / total * 100) if total else 0:.1f}%) · "
+          f"idle threshold: {args.idle_threshold:.0f}s")
+    if unpaired:
+        print(f"unpaired prompts: {unpaired} (turns that used no tools write no stop event)")
+    if malformed:
+        print(f"malformed rows: {malformed} (unparseable timestamp)")
+    if skipped:
+        print(f"skipped {skipped} unparseable rows")
+    print()
+
+    if args.by in ("skill", "both"):
+        _print_bleed_skills(skills, below, args)
+    if args.by in ("tool", "both"):
+        _print_bleed_tools(tools, args)
+    return 0
+
+
+def _load_events_counting_failures(cutoff) -> tuple[list[dict], int]:
+    """Load events, counting rows that failed to parse.
+
+    `telemetry.iter_events` swallows bad lines, so the count has to happen
+    here. Parse directly rather than subtracting `len(iter_events())` from a
+    line count: under a `--since` window an in-range row legitimately dropped
+    by the cutoff is indistinguishable from a parse failure, and a number that
+    is silently wrong under one flag is worse than no number.
+    """
+    from . import bleed as bleed_mod
+
+    events: list[dict] = []
+    skipped = 0
+    with open(paths.events_file(), encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                skipped += 1
+                continue
+            if not isinstance(row, dict):
+                skipped += 1
+                continue
+            if cutoff is not None:
+                ts = bleed_mod.parse_ts(row.get("ts"))
+                if ts is None or ts < cutoff:
+                    continue
+            events.append(row)
+    return events, skipped
+
+
+def _print_bleed_skills(skills, below, args) -> None:
+    print(f"{'SKILL':42} {'n':>4} {'p50 turn':>9} {'attributed':>11} {'idle':>9} {'idle turns':>11}")
+    for s in skills[: args.limit]:
+        print(f"{s.name[:42]:42} {s.n:>4} {s.p50_turn_s:>8.0f}s "
+              f"{s.attributed_ms / 3_600_000:>10.2f}h {s.idle_ms / 3_600_000:>8.2f}h "
+              f"{s.turns_with_idle:>11}")
+    if len(skills) > args.limit:
+        print(f"  +{len(skills) - args.limit} more")
+    if below:
+        print(f"  {below} skill(s) below n={args.min_n} (not ranked)")
+    print()
+
+
+def _print_bleed_tools(tools, args) -> None:
+    print(f"{'TOOL':24} {'calls':>7} {'p50':>9} {'attributed':>11}")
+    for t in tools[: args.limit]:
+        print(f"{t.name[:24]:24} {t.calls:>7} {t.p50_ms / 1000:>8.1f}s "
+              f"{t.attributed_ms / 3_600_000:>10.2f}h")
+    if len(tools) > args.limit:
+        print(f"  +{len(tools) - args.limit} more")
+
+
 def _rotation_stats(
     events: list[dict], *, catalog: list | None = None
 ) -> dict[str, dict]:
@@ -1664,6 +1781,24 @@ def _build_parser() -> argparse.ArgumentParser:
     p_report.add_argument("--purge-older-than", dest="purge_older_than", default=None,
                           help="delete events older than this duration and exit (e.g. 90d)")
     p_report.set_defaults(func=_cmd_report)
+
+    p_bleed = sub.add_parser(
+        "bleed",
+        help="rank skills and tools by the time they cost, with idle flagged",
+    )
+    p_bleed.add_argument("--since", default=None,
+                         help="time window (e.g. 7d, 24h; default: all history)")
+    p_bleed.add_argument("--min-n", dest="min_n", type=int, default=5,
+                         help="minimum turns before a skill is ranked (default: 5)")
+    p_bleed.add_argument("--idle-threshold", dest="idle_threshold", type=float, default=120.0,
+                         help="seconds above which a span is treated as idle (default: 120)")
+    p_bleed.add_argument("--by", choices=("skill", "tool", "both"), default="both",
+                         help="which tables to print (default: both)")
+    p_bleed.add_argument("--limit", type=int, default=20,
+                         help="rows per table; overflow is reported (default: 20)")
+    p_bleed.add_argument("--json", action="store_true",
+                         help="emit machine-readable JSON instead of tables")
+    p_bleed.set_defaults(func=_cmd_bleed)
 
     p_sync = sub.add_parser(
         "sync-skills",
