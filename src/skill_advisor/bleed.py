@@ -211,6 +211,7 @@ class SkillStat:
 class ToolStat:
     name: str
     calls: int
+    spans: int
     p50_ms: int
     attributed_ms: int
 
@@ -265,11 +266,37 @@ def skill_stats(
 def tool_stats(turns: Sequence[Turn], *, threshold_ms: int) -> list[ToolStat]:
     """Rank tools by total attributed time across every turn that carries spans.
 
-    Both columns are post-idle-rule: `p50_ms` is the median of CAPPED spans,
-    not raw ones, so one row never mixes two meanings. A tool whose calls are
-    all idle-contaminated therefore shows `p50_ms == threshold_ms`, which reads
+    `calls` and `spans` are two different populations and must not be
+    conflated. A span measures "time since the previous tool call finished"
+    (see `run_stop` in hook.py), so a turn's FIRST tool never emits one — a
+    turn with three real tool calls contributes only two spans. Counting
+    `calls` from spans therefore under-counts every tool, worst for whichever
+    one is most often a turn's leading call. `Skill` usually IS the leading
+    call — it is the one tool this whole feature exists to reason about — so
+    that conflation measured 72% under-counted on the live log (1,761 real
+    calls read back as 493), while `Bash`, rarely first, was only 2% off:
+    close enough that the earlier bug hid behind it.
+
+    `calls` is therefore read from `Turn.tools` — the full per-turn tool list
+    the collector writes independent of span computation — while `spans`
+    keeps the old (correctly-named-now) count of measured spans. A row exists
+    here only for tool names that have at least one span somewhere in the
+    corpus, so `calls` on that row can still undercount a tool's true total by
+    the turns where it was invoked but never once left a span (a turn that
+    used only that one tool); `span_coverage` discloses turn-level presence
+    separately.
+
+    `p50_ms` and `attributed_ms` remain computed over spans only, and remain
+    post-idle-rule: `p50_ms` is the median of CAPPED spans, not raw ones, so
+    one row never mixes two meanings. A tool whose calls are all
+    idle-contaminated therefore shows `p50_ms == threshold_ms`, which reads
     correctly as "we stopped counting here" rather than as a real duration.
     """
+    calls: dict[str, int] = {}
+    for turn in turns:
+        for name in turn.tools:
+            calls[name] = calls.get(name, 0) + 1
+
     samples: dict[str, list[float]] = {}
     attributed: dict[str, int] = {}
     for turn in turns:
@@ -281,7 +308,8 @@ def tool_stats(turns: Sequence[Turn], *, threshold_ms: int) -> list[ToolStat]:
     stats = [
         ToolStat(
             name=name,
-            calls=len(samples[name]),
+            calls=calls.get(name, 0),
+            spans=len(samples[name]),
             p50_ms=int(_p50(samples[name])),
             attributed_ms=attributed.get(name, 0),
         )

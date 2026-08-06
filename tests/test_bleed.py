@@ -277,6 +277,38 @@ def test_tool_stats_aggregate_calls_and_p50():
     assert [s.name for s in stats] == ["Bash", "Read"]
 
 
+def test_tool_stats_calls_counts_invocations_not_spans():
+    """`calls` and `spans` are different populations and must not be conflated.
+
+    A span is "time since the previous tool finished" (see `run_stop` in
+    hook.py), so a turn's FIRST tool never emits one. Here `tools` lists three
+    real invocations — Skill, Bash, Skill — but `spans` holds only two: Bash's
+    span ("since the leading Skill finished") and the second Skill's span
+    ("since Bash finished"). The leading Skill call has no span of its own.
+
+    A conflated implementation that derives `calls` from `len(samples[name])`
+    (the old bug) reports Skill's `calls` as 1, not 2 — this assertion is
+    exactly what goes RED under that code, which is why this test exists:
+    `Skill` is the tool most often first in a turn, so it is the one this bug
+    hurts worst (measured 72% under-count on the live log)."""
+    start = datetime(2026, 8, 6, 10, 0, 0, tzinfo=timezone.utc)
+    turn = bleed.Turn(
+        session="s",
+        start=start,
+        stop=start + timedelta(seconds=60),
+        skills=["multi"],
+        tools=["Skill", "Bash", "Skill"],
+        spans=[("Bash", 1_000), ("Skill", 2_000)],
+    )
+    stats = bleed.tool_stats([turn], threshold_ms=120_000)
+    by_name = {s.name: s for s in stats}
+
+    assert by_name["Skill"].calls == 2, "real invocations, not span count"
+    assert by_name["Skill"].spans == 1, "measured spans, not invocation count"
+    assert by_name["Bash"].calls == 1
+    assert by_name["Bash"].spans == 1
+
+
 def test_tool_p50_uses_capped_values_not_raw():
     """One row, one meaning. Without this the fixture spans all sit under the
     threshold and nothing discriminates capped from raw."""

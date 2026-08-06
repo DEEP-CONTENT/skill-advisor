@@ -780,17 +780,24 @@ def _print_bleed_tools(tools, args) -> None:
     """No `spans_absent` parameter: `tool_stats` yields a row for every span,
     and `span_coverage` counts exactly the turns that carry one, so an empty
     table and "no turn has spans" are the same condition. A parameter that
-    could only ever restate its own call site is a second source of truth."""
+    could only ever restate its own call site is a second source of truth.
+
+    `calls` and `spans` are printed as separate columns, never one. A span is
+    "time since the previous tool finished", so a turn's leading tool call
+    never emits one — `calls` (from `Turn.tools`) is the real invocation
+    count, `spans` (from measured deltas) is strictly smaller for any tool
+    that is often first in its turn. Collapsing them back into one column is
+    exactly the bug this table used to have."""
     if not tools:
         # A bare header with no rows reads as "no tools were used". Say which
         # it actually is.
         print("TOOL — no span data yet. Spans accrue from install; "
               "re-run after some turns.")
         return
-    print(f"{'TOOL':24} {'calls':>7} {'p50':>9} {'attributed':>11}")
+    print(f"{'TOOL':24} {'calls':>7} {'spans':>7} {'p50':>9} {'attributed':>11}")
     for t in tools[: args.limit]:
-        print(f"{_elide(t.name, 24):24} {t.calls:>7} {t.p50_ms / 1000:>8.1f}s "
-              f"{t.attributed_ms / 3_600_000:>10.2f}h")
+        print(f"{_elide(t.name, 24):24} {t.calls:>7} {t.spans:>7} "
+              f"{t.p50_ms / 1000:>8.1f}s {t.attributed_ms / 3_600_000:>10.2f}h")
     if len(tools) > args.limit:
         print(f"  +{len(tools) - args.limit} more")
 

@@ -519,6 +519,15 @@ one tool therefore records no spans at all and counts as *not span-carrying* in
 the `spans: N of M` line — deliberately, because a fabricated `0 ms` for that
 tool would be counted as coverage the report does not have.
 
+Because of that, the TOOL table prints `calls` and `spans` as two separate
+columns rather than one. `calls` is the real invocation count (from every
+recorded tool call, regardless of whether it left a span); `spans` is how many
+of those calls actually got measured. The two diverge most for a tool that is
+usually a turn's first call — `Skill` above all, being the one this whole
+feature exists to reason about — since the leading call in every turn is
+exactly the one with no predecessor to measure from. `p50` and `attributed`
+are computed over the `spans` population only, never `calls`.
+
 ```bash
 skill-advisor bleed
 # turns: 3942 · spans: 0 of 3942 (0.0%) · idle threshold: 120s
