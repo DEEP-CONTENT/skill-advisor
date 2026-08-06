@@ -1011,7 +1011,7 @@ def test_stop_wires_marks_into_spans(monkeypatch, isolated_paths):
     monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps({"session_id": "sess-spans"})))
     assert hook.run_stop() == 0
 
-    rows = [_json.loads(l) for l in paths.events_file().read_text().splitlines() if l.strip()]
+    rows = [_json.loads(line) for line in paths.events_file().read_text().splitlines() if line.strip()]
     stop = [r for r in rows if r.get("kind") == "stop"][-1]
     # "Read" is the first tool: it has no predecessor, so it gets no span.
     assert stop["tool_spans"] == [["Bash", 3000], ["Edit", 750]]
@@ -1108,7 +1108,7 @@ def test_stop_drops_spans_when_marks_desync(monkeypatch, isolated_paths):
     monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps({"session_id": "sess-desync"})))
     assert hook.run_stop() == 0
 
-    rows = [_json.loads(l) for l in paths.events_file().read_text().splitlines() if l.strip()]
+    rows = [_json.loads(line) for line in paths.events_file().read_text().splitlines() if line.strip()]
     stop = [r for r in rows if r.get("kind") == "stop"][-1]
     assert "tool_spans" not in stop
     assert stop["tools"] == ["Read", "Bash", "Edit"]  # names still recorded
@@ -1137,7 +1137,7 @@ def test_stop_clamps_negative_deltas_to_zero(monkeypatch, isolated_paths):
     monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps({"session_id": "sess-negative"})))
     assert hook.run_stop() == 0
 
-    rows = [_json.loads(l) for l in paths.events_file().read_text().splitlines() if l.strip()]
+    rows = [_json.loads(line) for line in paths.events_file().read_text().splitlines() if line.strip()]
     stop = [r for r in rows if r.get("kind") == "stop"][-1]
     # "Read" is the first tool and carries no span; "Bash" lands 1.5s before it.
     assert stop["tool_spans"] == [["Bash", 0], ["Edit", 3000]]
@@ -1165,7 +1165,7 @@ def test_stop_desync_guard_reverse_direction(monkeypatch, isolated_paths):
     monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps({"session_id": "sess-desync-rev"})))
     assert hook.run_stop() == 0
 
-    rows = [_json.loads(l) for l in paths.events_file().read_text().splitlines() if l.strip()]
+    rows = [_json.loads(line) for line in paths.events_file().read_text().splitlines() if line.strip()]
     stop = [r for r in rows if r.get("kind") == "stop"][-1]
     assert "tool_spans" not in stop
     assert stop["tools"] == ["Read", "Bash"]  # names still recorded
