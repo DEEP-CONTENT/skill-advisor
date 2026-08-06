@@ -240,6 +240,23 @@ def test_turns_with_idle_counts_turns_not_gaps():
     assert stats[0].turns_with_idle == 1
 
 
+def test_skill_p50_turn_is_the_upper_median_of_every_turn():
+    """A confirmed live mutation survivor: swapping `_p50` for `min()` in the
+    skill path left the whole suite green, because every existing fixture gives
+    a skill exactly ONE turn — where min, mean, max and p50 all coincide.
+
+    This field is displayed by the CLI and is the primary sort key on the
+    first-run (no-spans) path, so a wrong value silently reorders the report.
+
+    Four turns of 60/120/300/900 s separate every plausible substitution:
+      min 60 · lower median 120 · UPPER MEDIAN 300 · mean 345 · max 900
+    """
+    turns = [_turn(s, skills=["multi"]) for s in (900, 60, 300, 120)]
+    stats, _ = skill_stats_of(turns, min_n=1)
+    assert stats[0].n == 4
+    assert stats[0].p50_turn_s == 300.0
+
+
 def test_a_span_less_turn_still_counts_toward_n_but_adds_no_time():
     turns = [
         _turn(600, skills=["s"], spans=None),
