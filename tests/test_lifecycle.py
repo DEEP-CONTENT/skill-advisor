@@ -468,3 +468,42 @@ def test_phase_next_description_parallelization_check():
 
     desc = lifecycle.phase_next_description(lifecycle.PARALLELIZATION_CHECK)
     assert "implementation" in desc.lower()
+
+
+def test_record_tool_appends_a_mark_parallel_to_the_name(isolated_paths):
+    from skill_advisor import lifecycle
+
+    lifecycle.record_tool("sess-marks", "Read")
+    lifecycle.record_tool("sess-marks", "Bash")
+    turn = lifecycle.load_turn("sess-marks")
+
+    assert turn.tool_names == ["Read", "Bash"]
+    assert len(turn.tool_marks) == 2
+    assert turn.tool_marks[1] >= turn.tool_marks[0]
+    assert turn.tool_marks[0] >= turn.turn_started_at
+
+
+def test_from_json_without_tool_marks_yields_empty_list(isolated_paths):
+    """A turn file written before this feature must load, not crash."""
+    from skill_advisor.lifecycle import TurnState
+
+    turn = TurnState.from_json({
+        "session_id": "old",
+        "turn_started_at": 1000.0,
+        "tool_names": ["Read", "Bash"],
+    })
+
+    assert turn.tool_names == ["Read", "Bash"]
+    assert turn.tool_marks == []
+
+
+def test_tool_marks_survive_a_save_load_round_trip(isolated_paths):
+    from skill_advisor import lifecycle
+
+    lifecycle.record_tool("sess-rt", "Grep")
+    first = lifecycle.load_turn("sess-rt").tool_marks
+    lifecycle.record_tool("sess-rt", "Edit")
+    second = lifecycle.load_turn("sess-rt").tool_marks
+
+    assert second[0] == first[0]  # the earlier mark was not rewritten
+    assert len(second) == 2

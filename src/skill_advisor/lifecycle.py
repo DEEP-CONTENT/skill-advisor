@@ -471,6 +471,11 @@ class TurnState:
     session_id: str
     turn_started_at: float = field(default_factory=time.time)
     tool_names: list[str] = field(default_factory=list)
+    # One epoch-second mark per tool call, index-parallel to `tool_names`.
+    # Written here rather than derived later because PostToolUse is the only
+    # place that knows when a call finished. Raw on purpose: the idle threshold
+    # is applied at read time by bleed.py, so it stays retroactively tunable.
+    tool_marks: list[float] = field(default_factory=list)
     subagents_invoked: list[str] = field(default_factory=list)
     skills_invoked: list[str] = field(default_factory=list)
     todo_write: dict | None = None  # {"count": int, "titles": list[str]} or None
@@ -484,6 +489,7 @@ class TurnState:
             session_id=str(data.get("session_id") or ""),
             turn_started_at=float(data.get("turn_started_at") or time.time()),
             tool_names=list(data.get("tool_names") or []),
+            tool_marks=[float(m) for m in (data.get("tool_marks") or [])],
             subagents_invoked=list(data.get("subagents_invoked") or []),
             skills_invoked=list(data.get("skills_invoked") or []),
             todo_write=data.get("todo_write") if isinstance(data.get("todo_write"), dict) else None,
@@ -528,6 +534,7 @@ def record_tool(
     """Accumulate tool usage into the current turn's state file."""
     turn = load_turn(session_id) or TurnState(session_id=session_id)
     turn.tool_names.append(tool_name)
+    turn.tool_marks.append(time.time())
     # Claude Code's `Task` tool exposes the chosen subagent via tool_input.subagent_type.
     if tool_name == "Task" and subagent_type:
         turn.subagents_invoked.append(subagent_type)

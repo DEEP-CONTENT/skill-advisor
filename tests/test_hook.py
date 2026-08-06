@@ -931,3 +931,27 @@ def test_hook_nudge_shown_once_across_two_successful_emits(isolated_paths):
     env2 = json.loads(out2)
     assert env1.get("systemMessage")
     assert "systemMessage" not in env2
+
+
+def test_posttooluse_wires_the_mark_into_turn_state(monkeypatch, isolated_paths):
+    """Goes RED if record_tool stops appending the mark.
+
+    The aggregator can be perfectly unit-tested and still report nothing if this
+    call is missing, and an empty report reads as "no time bleeders found"
+    rather than as a bug. Drive the real hook, not lifecycle directly.
+    """
+    import io
+    import json as _json
+    from skill_advisor import hook, lifecycle
+
+    for tool in ("Read", "Bash"):
+        monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps({
+            "session_id": "sess-wire",
+            "tool_name": tool,
+            "tool_input": {},
+        })))
+        assert hook.run_posttooluse() == 0
+
+    turn = lifecycle.load_turn("sess-wire")
+    assert turn.tool_names == ["Read", "Bash"]
+    assert len(turn.tool_marks) == 2, "PostToolUse did not record a timestamp"
