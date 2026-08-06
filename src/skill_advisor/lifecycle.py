@@ -524,11 +524,14 @@ def delete_turn(session_id: str) -> bool:
     return False
 
 
-# The subagent-launcher tool has been renamed across Claude Code versions —
-# "Task" in early builds, "Agent" in current ones (confirmed against the real
-# event log: 3,267 `stop` events carry "Agent", zero carry "Task"). Watch both
-# so a future rename doesn't silently zero out subagent capture again, the
-# same pattern already used above for TodoWrite/TaskCreate.
+# The subagent-launcher tool is named "Agent" as of this measurement —
+# confirmed against the real event log: 3,267 `stop` events carry "Agent",
+# zero carry "Task". "Task" is kept in the set as the name the original
+# (buggy) code assumed; we have no positive evidence it was ever the real
+# name here, only that watching it costs nothing and dropping it risks
+# repeating the exact silent-zero this fix exists to correct. Watch both so
+# a future rename doesn't silently zero out subagent capture again, the same
+# pattern already used above for TodoWrite/TaskCreate.
 SUBAGENT_LAUNCHER_TOOLS = frozenset({"Task", "Agent"})
 
 

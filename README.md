@@ -589,6 +589,19 @@ it correctly — but every `subagents_invoked` from before the fix is a false
 negative, not evidence subagents went unused, and `bleed` still won't surface
 it either way until a future change reads the field.
 
+This fix has a side effect outside `bleed` entirely, worth knowing about even
+though it's invisible in `bleed`'s own output: `subagents_invoked` also feeds
+the [`on_plan_subagent_done` auto-advance rule](#auto-advance)
+(`PLANNING → IMPLEMENTATION` when a `Plan` subagent completed). That rule was
+just as silently inert as the telemetry field, for the same reason — it
+checked the same always-empty list. If you have
+`lifecycle.auto_advance.enabled = true`, this fix makes that rule fire for
+the first time on the next `Plan`/`writing-plans` subagent call in a
+`PLANNING`-phase turn, where it previously never did. This is the config's
+documented intent finally working, not a new behavior being introduced — but
+it is a real, observable change in when your session auto-advances, not just
+a reporting change.
+
 ### `skill-advisor doctor`
 
 End-to-end diagnosis. Checks: `claude` on PATH, settings file present, catalog
@@ -775,7 +788,9 @@ You don't call them manually under normal use. Behavior is a no-op unless you
 opt into [auto-advance](#auto-advance).
 
 - `posttooluse` — reads a PostToolUse event from stdin, records the `tool_name`
-  (and the `subagent_type` when the tool was `Task`) into
+  (and the `subagent_type` when the tool is the subagent launcher — `Agent` in
+  current Claude Code builds; `Task` is also recognized as a defensive fallback,
+  see [`skill-advisor bleed`](#skill-advisor-bleed-options)) into
   `~/.cache/skill-advisor/sessions/<session_id>.turn.json`.
 - `stop` — reads a Stop event from stdin, inspects the per-session turn state,
   and applies the auto-advance rules if enabled. Always clears the turn file.
@@ -1067,8 +1082,10 @@ When [auto-advance](#auto-advance) is enabled, `skill-advisor install` also wire
 two sibling handlers into your settings file:
 
 - **`skill-advisor posttooluse`** fires after every tool call. It appends the
-  `tool_name` (and, for `Task` calls, the `subagent_type`) into
-  `~/.cache/skill-advisor/sessions/<session_id>.turn.json`.
+  `tool_name` (and, for subagent-launcher calls — `Agent` in current Claude
+  Code builds, `Task` also recognized defensively, see
+  [`skill-advisor bleed`](#skill-advisor-bleed-options) — the `subagent_type`)
+  into `~/.cache/skill-advisor/sessions/<session_id>.turn.json`.
 - **`skill-advisor stop`** fires at the end of each assistant turn. It reads
   the turn file, clears it, then consults the active lifecycle state and the
   `[lifecycle.auto_advance]` rules to decide whether to advance the phase
@@ -1353,9 +1370,11 @@ else changes for sessions that don't trigger a lifecycle.
 Two transitions auto-advance:
 
 - **`PLANNING → IMPLEMENTATION`** when the last turn invoked a `Plan` subagent
-  (via Claude Code's `Task` tool with `subagent_type="Plan"`). Use this when you
-  want the advisor to hand off to the implementer immediately after planning
-  completes, without typing "go".
+  (via Claude Code's subagent-launcher tool — `Agent` in current builds, with
+  `subagent_type="Plan"`; `Task` is also recognized defensively, see
+  [`skill-advisor bleed`](#skill-advisor-bleed-options) for the measured
+  evidence). Use this when you want the advisor to hand off to the
+  implementer immediately after planning completes, without typing "go".
 - **`IMPLEMENTATION → REVIEW`** when the last turn ended with any mutating tool
   (`Edit`, `Write`, `NotebookEdit`, `MultiEdit`, `Bash`). If the model only read
   files this turn (`Read`, `Grep`, `Glob`, `LS`), the state stays at
@@ -1491,9 +1510,10 @@ to the user — never auto-resolved.
   false positives/negatives.
 - **Lifecycle is per-session.** Restarting Claude Code creates a new session
   id, so long-running work spanning sessions isn't stitched together.
-- **No `SubagentStop` handling yet.** PostToolUse fires for the parent `Task`
-  invocation, which is enough for the Plan-subagent rule; deep subagent event
-  plumbing is a future enhancement.
+- **No `SubagentStop` handling yet.** PostToolUse fires for the parent
+  `Agent` invocation (Claude Code's current subagent-launcher tool name;
+  `Task` is also recognized), which is enough for the Plan-subagent rule;
+  deep subagent event plumbing is a future enhancement.
 
 ---
 
