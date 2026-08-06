@@ -1743,9 +1743,27 @@ it echoed `matcher.use_judge` instead — whether the judge was *configured*, no
 whether it ran — so a triage-skipped or judge-disabled turn could still claim
 `judge_used: true`. `judge_failure` names why the turn emitted no picks: one of
 `judge.py`'s `FAILURE_*` values (`no_candidates`, `cli_missing`, `timeout`,
-`subprocess_error`, `exit_nonzero`, `unparseable`), or `budget_exceeded` when the
-hook's own SIGALRM killed the turn. It is `null` whenever picks were produced
-normally, including when the judge deliberately declined.
+`subprocess_error`, `exit_nonzero`, `unparseable`, `hook_contaminated`), or
+`budget_exceeded` when the hook's own SIGALRM killed the turn. It is `null`
+whenever picks were produced normally, including when the judge deliberately
+declined.
+
+`hook_contaminated` deserves a note, because it looks like a parser problem and
+is not one. The judge runs as a nested `claude -p`, which **inherits the calling
+session's hooks**. When one fires — a `Stop` hook, say — it forces extra turns and
+the envelope's `result` becomes the nested session's reply to *that hook* instead
+of the judge's verdict. The reply is valid JSON, so parsing succeeds and the old
+code recorded `unparseable`, sending anyone reading `events.jsonl` after a
+malformed reply or a parser gap that does not exist. The envelope's `num_turns` is
+the discriminator, checked before `result` is interpreted at all: every clean
+verdict measured had `num_turns == 1`, every contaminated one `> 1`, with zero
+overlap across a 250-row corpus. It was **6.4% of prompts** when measured, each
+burning the full judge round-trip for nothing. Behaviour is unchanged — still a
+judge failure, still falls back to embedding picks — only the diagnosis is honest.
+There is deliberately no retry in the hook path: a second attempt costs another
+full round-trip and `budget_seconds` would fire first, turning a fast degraded
+answer into a silent timeout. `tools/build_calibration_corpus.py` retries offline,
+where the budget does not apply.
 
 The two fields answer different questions — `judge_used` is *did the subprocess
 run and return a verdict*, `judge_failure` is *why did this turn emit nothing* —
