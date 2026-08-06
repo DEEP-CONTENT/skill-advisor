@@ -164,6 +164,32 @@ def test_bleed_reports_malformed_rows_separately_from_unpaired(isolated_paths, c
     assert "malformed rows: 1" in out
 
 
+def test_bleed_survives_a_structurally_damaged_row(isolated_paths, capsys):
+    """End-to-end: one bad `tool_spans` used to raise straight out of the
+    command. The healthy turn must still be reported and the damage disclosed."""
+    rows = _pair(
+        "2026-08-06T10:00:00Z",
+        "2026-08-06T10:05:00Z",
+        ["healthy"],
+        [("Read", 10)],
+        session="ok",
+    )
+    broken = _pair(
+        "2026-08-06T11:00:00Z",
+        "2026-08-06T11:05:00Z",
+        ["hurt"],
+        [("Read", 10)],
+        session="bad",
+    )
+    broken[1]["tool_spans"] = [["Read"]]  # a 1-element pair: valid JSON, unusable
+    _write_events(rows + broken)
+
+    assert cli._cmd_bleed(_ns(min_n=1)) == 0
+    out = capsys.readouterr().out
+    assert "healthy" in out
+    assert "malformed rows: 1" in out
+
+
 def test_bleed_with_no_events_exits_zero_with_an_explanation(isolated_paths, capsys):
     assert cli._cmd_bleed(_ns()) == 0
     assert "no telemetry events" in capsys.readouterr().out
@@ -207,8 +233,13 @@ def test_bleed_names_the_window_and_what_it_excluded(isolated_paths, capsys):
     """A non-empty windowed report must still say how much it left out — the
     difference between 'I use this rarely' and 'my window is too tight'."""
     _write_events(
-        _pair("2020-01-01T10:00:00Z", "2020-01-01T10:05:00Z", ["ancient-skill"],
-              [("Read", 10)], session="a")
+        _pair(
+            "2020-01-01T10:00:00Z",
+            "2020-01-01T10:05:00Z",
+            ["ancient-skill"],
+            [("Read", 10)],
+            session="a",
+        )
         + _pair(_recent(60), _recent(30), ["fresh-skill"], [("Read", 10)], session="b")
     )
     assert cli._cmd_bleed(_ns(min_n=1, since="7d")) == 0

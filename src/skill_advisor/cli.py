@@ -664,7 +664,7 @@ def _cmd_bleed(args: argparse.Namespace) -> int:
     if unpaired:
         print(f"unpaired prompts: {unpaired} (turns that used no tools write no stop event)")
     if malformed:
-        print(f"malformed rows: {malformed} (unparseable timestamp)")
+        print(f"malformed rows: {malformed} (unparseable timestamp or damaged field)")
     if skipped:
         print(f"skipped {skipped} unparseable rows")
     print()

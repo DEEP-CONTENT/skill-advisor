@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from skill_advisor import bleed
 
 
@@ -113,6 +115,65 @@ def test_an_unparseable_timestamp_is_counted_malformed_not_dropped():
     assert turns == []
     assert unpaired == 0
     assert malformed == 1
+
+
+DAMAGED_SPAN_SHAPES = [
+    ("one-element pair", [["Read"]]),
+    ("three-element pair", [["Read", 1, 2]]),
+    ("non-numeric ms", [["Read", "soon"]]),
+    ("null ms", [["Read", None]]),
+    ("list of bare ints", [1, 2, 3]),
+    ("list of bare strings", ["ab", "cd"]),
+    ("nested list as ms", [["Read", [1]]]),
+    ("infinite ms", [["Read", float("inf")]]),
+]
+
+
+@pytest.mark.parametrize(
+    "label,shape", DAMAGED_SPAN_SHAPES, ids=[s[0] for s in DAMAGED_SPAN_SHAPES]
+)
+def test_a_damaged_tool_spans_value_does_not_abort_the_report(label, shape):
+    """Every shape below is valid JSON in a valid dict, and every one of them
+    used to raise out of `pair_turns` — killing the WHOLE report over one row.
+    `_load_events_counting_failures` goes to real trouble to count one shape of
+    damage; dying on another makes that pointless.
+
+    The turn survives (its timestamps are fine, so turn-level stats keep it),
+    the spans degrade to span-less, and the damage is folded into the EXISTING
+    `malformed` counter, which is already returned and already printed.
+    """
+    turns, unpaired, malformed = bleed.pair_turns([_prompt(), _stop(tool_spans=shape)])
+    assert len(turns) == 1, label
+    assert turns[0].spans is None, label
+    assert malformed == 1, label
+
+
+def test_a_span_shape_that_is_not_a_list_stays_span_less_without_counting_damage():
+    """A dict or a string already degraded correctly; keep it that way rather
+    than inflating the damage count with shapes that were never a crash."""
+    for shape in ({"Read": 1}, "Read", 7, None):
+        turns, _, malformed = bleed.pair_turns([_prompt(), _stop(tool_spans=shape)])
+        assert turns[0].spans is None, shape
+        assert malformed == 0, shape
+
+
+def test_a_non_hashable_session_id_does_not_abort_the_report():
+    """`session_sha256` keys the pairing map, so a list there raised
+    `TypeError: unhashable type` before a single turn was built."""
+    turns, _, malformed = bleed.pair_turns(
+        [_prompt(session=["a", "b"]), _prompt(), _stop()]
+    )
+    assert len(turns) == 1  # the well-formed pair still reports
+    assert malformed == 1
+
+
+def test_a_non_iterable_skills_or_tools_value_does_not_abort_the_report():
+    """`[str(s) for s in row["skills"]]` raised `TypeError: 'int' object is not
+    iterable`. Damage in one field must not cost the whole run."""
+    turns, _, malformed = bleed.pair_turns([_prompt(), _stop(skills=3, tools=3)])
+    assert len(turns) == 1
+    assert turns[0].skills == [] and turns[0].tools == []
+    assert malformed == 1  # counted ONCE per row, not once per damaged field
 
 
 def test_out_of_order_rows_are_sorted_before_pairing():

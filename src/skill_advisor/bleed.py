@@ -74,6 +74,48 @@ def attribute(spans: Sequence[tuple[str, int]], threshold_ms: int) -> Attributio
     return Attribution(per_tool=per_tool, idle_ms=idle_ms, idle_gaps=idle_gaps)
 
 
+def _coerce_spans(raw: object) -> tuple[list[tuple[str, int]] | None, bool]:
+    """Return (spans, damaged).
+
+    Every element is unpacked defensively. These rows come back from a JSONL
+    file that another process may have torn mid-write and that an older or
+    newer writer may have shaped differently, so a single bad pair must not be
+    allowed to raise — one damaged row killing the whole report is strictly
+    worse than that row being reported as damaged.
+
+    A list that will not coerce degrades the WHOLE turn to span-less rather
+    than salvaging the pairs that happen to parse: that is the same rule the
+    collector already applies to desynced marks, and guessing an alignment is
+    how a report starts asserting numbers nobody measured.
+
+    A non-list shape (absent, a dict, a string) is simply span-less and NOT
+    damage — those never crashed and never produced a wrong number.
+    """
+    if not isinstance(raw, list) or not raw:
+        return None, False
+    out: list[tuple[str, int]] = []
+    for item in raw:
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            name, ms = item
+            try:
+                out.append((str(name), int(ms)))
+                continue
+            except (TypeError, ValueError, OverflowError):
+                pass  # non-numeric, null, nested, or infinite ms
+        return None, True
+    return out, False
+
+
+def _coerce_names(raw: object) -> tuple[list[str], bool]:
+    """Return (names, damaged). `[str(x) for x in raw]` raises on a non-iterable
+    — an `int` in `skills` or `tools` used to abort the entire run."""
+    if raw is None:
+        return [], False
+    if isinstance(raw, list):
+        return [str(x) for x in raw], False
+    return [], True
+
+
 def pair_turns(events: Iterable[dict]) -> tuple[list[Turn], int, int]:
     """Pair each prompt with the next stop in the same session.
 
@@ -87,18 +129,29 @@ def pair_turns(events: Iterable[dict]) -> tuple[list[Turn], int, int]:
     A row whose timestamp will not parse is data damage, and is counted
     SEPARATELY rather than folded into `unpaired` — conflating the two would
     make a corrupted log read as heavy conversational use.
+
+    `malformed` counts damaged ROWS, not damaged fields: a row with both a
+    broken `skills` and broken `tool_spans` counts once. Every shape of damage
+    lands in this one counter rather than growing a second one the caller
+    would have to remember to print.
     """
+    malformed = 0
     by_session: dict[str | None, list[dict]] = {}
     for row in events:
         # Rows written before the `kind` key exists are prompts.
         kind = row.get("kind") or "prompt"
         if kind not in ("prompt", "stop"):
             continue
-        by_session.setdefault(row.get("session_sha256"), []).append(row)
+        session = row.get("session_sha256")
+        if session is not None and not isinstance(session, str):
+            # This value KEYS the pairing map, and a list is not hashable at
+            # all. The row cannot be paired, so count it and move on.
+            malformed += 1
+            continue
+        by_session.setdefault(session, []).append(row)
 
     turns: list[Turn] = []
     unpaired = 0
-    malformed = 0
     for session, rows in by_session.items():
         rows.sort(key=lambda r: str(r.get("ts") or ""))
         pending: datetime | None = None
@@ -114,19 +167,18 @@ def pair_turns(events: Iterable[dict]) -> tuple[list[Turn], int, int]:
                 continue
             if pending is None:
                 continue  # a stop with no prompt before it
-            raw_spans = row.get("tool_spans")
-            spans = (
-                [(str(n), int(ms)) for n, ms in raw_spans]
-                if isinstance(raw_spans, list) and raw_spans
-                else None
-            )
+            spans, spans_damaged = _coerce_spans(row.get("tool_spans"))
+            skills, skills_damaged = _coerce_names(row.get("skills"))
+            tools, tools_damaged = _coerce_names(row.get("tools"))
+            if spans_damaged or skills_damaged or tools_damaged:
+                malformed += 1
             turns.append(
                 Turn(
                     session=session,
                     start=pending,
                     stop=ts,
-                    skills=[str(s) for s in (row.get("skills") or [])],
-                    tools=[str(t) for t in (row.get("tools") or [])],
+                    skills=skills,
+                    tools=tools,
                     spans=spans,
                 )
             )
