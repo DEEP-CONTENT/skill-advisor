@@ -606,9 +606,19 @@ def _cmd_bleed(args: argparse.Namespace) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
 
-    events, skipped = _load_events_counting_failures(cutoff)
+    events, skipped, out_of_window = _load_events_counting_failures(cutoff)
     if not events:
-        print("no telemetry events recorded.")
+        # Disclose BEFORE returning. This early return used to fire first and
+        # discard both counts, so three damaged rows read as a clean empty log
+        # and a windowed read of a log full of older events claimed nothing was
+        # ever recorded — which is simply false.
+        if out_of_window:
+            print(f"no telemetry events in the last {args.since} — "
+                  f"{out_of_window} row(s) recorded outside the window.")
+        else:
+            print("no telemetry events recorded.")
+        if skipped:
+            print(f"skipped {skipped} unparseable rows")
         return 0
 
     threshold_ms = int(args.idle_threshold * 1000)
@@ -641,7 +651,13 @@ def _cmd_bleed(args: argparse.Namespace) -> int:
 
     print(f"turns: {total} · spans: {with_spans} of {total} "
           f"({(with_spans / total * 100) if total else 0:.1f}%) · "
-          f"idle threshold: {args.idle_threshold:.0f}s")
+          f"idle threshold: {args.idle_threshold:.0f}s"
+          + (f" · window: {args.since}" if args.since else ""))
+    if out_of_window:
+        # An exclusion the user asked for is still an exclusion, and the row
+        # count it removed is the difference between "I use this rarely" and
+        # "I set the window too tight".
+        print(f"outside the {args.since} window: {out_of_window} row(s) (not counted)")
     if spans_absent and total:
         print("no span data yet — ranking by turn time; "
               "per-tool cost and idle time need spans, which accrue from install")
@@ -660,19 +676,27 @@ def _cmd_bleed(args: argparse.Namespace) -> int:
     return 0
 
 
-def _load_events_counting_failures(cutoff) -> tuple[list[dict], int]:
+def _load_events_counting_failures(cutoff) -> tuple[list[dict], int, int]:
     """Load events, counting rows that failed to parse.
+
+    Returns (events, skipped, out_of_window).
 
     `telemetry.iter_events` swallows bad lines, so the count has to happen
     here. Parse directly rather than subtracting `len(iter_events())` from a
     line count: under a `--since` window an in-range row legitimately dropped
     by the cutoff is indistinguishable from a parse failure, and a number that
     is silently wrong under one flag is worse than no number.
+
+    `out_of_window` is what lets an empty result say WHICH kind of empty it is.
+    "No events recorded" and "no events in this window" are different claims,
+    and printing the first when the second is true is a false statement about
+    the user's own data.
     """
     from . import bleed as bleed_mod
 
     events: list[dict] = []
     skipped = 0
+    out_of_window = 0
     with open(paths.events_file(), encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
@@ -693,9 +717,10 @@ def _load_events_counting_failures(cutoff) -> tuple[list[dict], int]:
                 # counts it as malformed — one source of truth for that count
                 # rather than a second one here that could drift.
                 if ts is not None and ts < cutoff:
+                    out_of_window += 1
                     continue
             events.append(row)
-    return events, skipped
+    return events, skipped, out_of_window
 
 
 def _print_bleed_skills(skills, below, args, spans_absent: bool = False) -> None:

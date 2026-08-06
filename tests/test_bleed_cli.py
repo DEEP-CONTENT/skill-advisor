@@ -28,6 +28,15 @@ def _write_events(rows):
             fh.write(json.dumps(row) + "\n")
 
 
+def _recent(minutes_ago: int) -> str:
+    """A timestamp comfortably inside a `--since 7d` window."""
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
 def _pair(ts_a, ts_b, skills, spans=None, session="s"):
     stop = {
         "kind": "stop",
@@ -158,6 +167,55 @@ def test_bleed_reports_malformed_rows_separately_from_unpaired(isolated_paths, c
 def test_bleed_with_no_events_exits_zero_with_an_explanation(isolated_paths, capsys):
     assert cli._cmd_bleed(_ns()) == 0
     assert "no telemetry events" in capsys.readouterr().out
+
+
+def test_bleed_discloses_skipped_rows_even_when_nothing_survives(
+    isolated_paths, capsys
+):
+    """Fourth recurrence of the silent-drop class, same function: the
+    empty-events early return fired BEFORE any disclosure, so three damaged
+    rows reported as a clean empty log."""
+    paths.ensure_dirs()
+    with open(paths.events_file(), "w", encoding="utf-8") as fh:
+        fh.write("{not json\n[]\nnot json at all\n")
+
+    assert cli._cmd_bleed(_ns()) == 0
+    out = capsys.readouterr().out
+    assert "skipped 3 unparseable rows" in out
+
+
+def test_bleed_says_the_window_is_empty_not_that_the_log_is(isolated_paths, capsys):
+    """`no telemetry events recorded.` under `--since` is a false statement when
+    events ARE recorded and merely fall outside the window."""
+    paths.ensure_dirs()
+    with open(paths.events_file(), "w", encoding="utf-8") as fh:
+        for row in _pair(
+            "2020-01-01T10:00:00Z", "2020-01-01T10:05:00Z", ["s"], [("Read", 10)]
+        ):
+            fh.write(json.dumps(row) + "\n")
+        fh.write("{not json\n")
+
+    assert cli._cmd_bleed(_ns(since="7d")) == 0
+    out = capsys.readouterr().out
+    assert "no telemetry events recorded." not in out
+    assert "7d" in out
+    assert "2 row(s)" in out  # the out-of-window rows are counted, not hidden
+    assert "skipped 1 unparseable rows" in out
+
+
+def test_bleed_names_the_window_and_what_it_excluded(isolated_paths, capsys):
+    """A non-empty windowed report must still say how much it left out — the
+    difference between 'I use this rarely' and 'my window is too tight'."""
+    _write_events(
+        _pair("2020-01-01T10:00:00Z", "2020-01-01T10:05:00Z", ["ancient-skill"],
+              [("Read", 10)], session="a")
+        + _pair(_recent(60), _recent(30), ["fresh-skill"], [("Read", 10)], session="b")
+    )
+    assert cli._cmd_bleed(_ns(min_n=1, since="7d")) == 0
+    out = capsys.readouterr().out
+    assert "window: 7d" in out
+    assert "outside the 7d window: 2 row(s)" in out
+    assert "fresh-skill" in out and "ancient-skill" not in out
 
 
 def test_bleed_counts_a_malformed_timestamp_under_a_since_window(
