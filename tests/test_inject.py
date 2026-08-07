@@ -10,6 +10,31 @@ def _pick(name: str, kind: str = "skill", reason: str = "") -> ResolvedPick:
     )
 
 
+def test_format_emits_invoke_name_not_frontmatter_name():
+    """F1: the emitted recommendation must be the string the Skill tool
+    actually accepts. `entry.name` is the frontmatter `name:`, which for a
+    plugin skill is always bare (e.g. "brainstorming") while `invoke_name`
+    carries the required `<plugin>:<dir>` namespace prefix Claude Code's
+    Skill tool resolves to a DIFFERENT skill for the bare form (verified
+    live: docs/superpowers/notes/2026-07-30-skilloverrides-verification.md,
+    case D)."""
+    entry = CatalogEntry(
+        kind="skill",
+        name="brainstorming",
+        namespace="plugin:superpowers",
+        description="...",
+        invoke_name="superpowers:brainstorming",
+    )
+    result = PickResult(
+        picks=[ResolvedPick(entry=entry, reason="vague idea")], state=None
+    )
+    output = inject.format(result)
+    assert "superpowers:brainstorming (skill)" in output
+    # The bare frontmatter name must not appear as the recommended string —
+    # only as a substring of the correctly-namespaced form.
+    assert "1. brainstorming (skill)" not in output
+
+
 def test_format_renders_numbered_list_without_lifecycle():
     result = PickResult(
         picks=[

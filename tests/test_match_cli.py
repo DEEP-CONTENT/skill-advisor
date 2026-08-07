@@ -213,6 +213,47 @@ def test_match_no_judge_flag_overrides_config(isolated_paths, capsys, monkeypatc
     mock_rank.assert_not_called()
 
 
+def test_match_prints_invoke_name_not_frontmatter_name(isolated_paths, capsys):
+    """F1: `match` is the command a user runs to check what will be
+    recommended — it must print the string the Skill tool actually accepts,
+    not the frontmatter `name:`, which diverges for plugin skills (always)
+    and any skill whose directory name differs from its declared `name:`
+    (the xlsx/xlsx-official fixture pattern used elsewhere in this suite)."""
+    entries = [
+        CatalogEntry(
+            kind="skill",
+            name="xlsx-official",
+            namespace="user",
+            description="diverging dir/name skill",
+            path="/skills/xlsx/SKILL.md",
+            invoke_name="xlsx",
+        ),
+    ]
+    embeddings = np.array([[1.0, 0.0, 0.0]], dtype=np.float32)
+    catalog_mod.save(entries)
+    index_mod.save(entries, embeddings, "hash")
+
+    class _FixedEmbed:
+        def embed(self, texts):
+            q = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+            for _ in texts:
+                yield q
+
+    with patch.object(index_mod, "_embed_model", return_value=_FixedEmbed()):
+        rc = cli._cmd_match(_ns(prompt="p", top_k=1, candidates=1, threshold=0.0))
+        text_out = capsys.readouterr().out
+        rc_json = cli._cmd_match(
+            _ns(prompt="p", top_k=1, candidates=1, threshold=0.0, json=True)
+        )
+        json_out = capsys.readouterr().out
+
+    assert rc == 0 and rc_json == 0
+    assert "xlsx" in text_out
+    assert "xlsx-official" not in text_out
+    payload = json.loads(json_out)
+    assert payload["picks"][0]["name"] == "xlsx"
+
+
 def test_match_verbose_prints_description_and_path(isolated_paths, capsys):
     entries = [
         CatalogEntry(

@@ -42,14 +42,33 @@ def skill_roots() -> list[Path]:
     `skills/` is empty — the default `~/.claude` skills are also included so the
     catalog isn't empty. Catalog dedupes by (kind, name); the primary root wins on
     collision.
+
+    Dedupes by resolved path to handle cases where primary subdirectories are
+    symlinks to the default home's subdirectories.
     """
     primary = claude_home()
     default = _home() / ".claude"
-    roots = [primary / "skills", primary / "plugins" / "marketplaces"]
+    candidates = [
+        primary / "skills",
+        primary / "plugins" / "marketplaces",
+        primary / "plugins" / "cache",
+    ]
     if primary.resolve() != default.resolve():
-        for extra in (default / "skills", default / "plugins" / "marketplaces"):
-            if extra not in roots:
-                roots.append(extra)
+        for extra in (
+            default / "skills",
+            default / "plugins" / "marketplaces",
+            default / "plugins" / "cache",
+        ):
+            candidates.append(extra)
+
+    # Dedupe by resolved path, keeping first occurrence of each unique target.
+    seen: set[Path] = set()
+    roots: list[Path] = []
+    for root in candidates:
+        resolved = root.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            roots.append(root)
     return roots
 
 
@@ -128,6 +147,20 @@ def config_file() -> Path:
 
 
 def settings_file() -> Path:
+    """Claude Code `--settings` file this tool reads and writes.
+
+    Precedence:
+      1. `SKILL_ADVISOR_SETTINGS_FILE` — full path override (not just a filename).
+         Set this when your `claude --settings ...` invocation already points at a
+         file that isn't named `claudeskill-settings.json` (e.g. a pre-existing
+         settings file with your own hooks/statusLine in it). Without this, the
+         installer and the effort write-back would create/target a SECOND file
+         your actual `claude` invocation never reads — silently inert.
+      2. `config_dir() / "claudeskill-settings.json"` — default.
+    """
+    override = os.environ.get("SKILL_ADVISOR_SETTINGS_FILE")
+    if override:
+        return Path(override)
     return config_dir() / "claudeskill-settings.json"
 
 
@@ -155,6 +188,36 @@ def telemetry_salt_file() -> Path:
     return cache_dir() / "telemetry.salt"
 
 
+def effort_file() -> Path:
+    """Latest effort recommendation, written by the UserPromptSubmit hook."""
+    return cache_dir() / "effort.json"
+
+
+def observed_effort_file() -> Path:
+    """Live effort level as last seen by the status line (the sensor)."""
+    return cache_dir() / "observed-effort.json"
+
+
+def baseline_file() -> Path:
+    """Rolling window + write-back provenance."""
+    return cache_dir() / "baseline.json"
+
+
+def centroids_file() -> Path:
+    """Fixed-size online sketch of prompt embeddings (8 x 384 float32, ~12 KB).
+
+    Holds no prompt text and no per-prompt vectors — it is a lossy aggregate of
+    thousands of prompts, not a record of any one of them. Written only when
+    telemetry.events_enabled is already true; removed by `uninstall`.
+    """
+    return cache_dir() / "centroids.npz"
+
+
+def statusline_script() -> Path:
+    """Generated POSIX-sh status line, registered in claudeskill-settings.json."""
+    return config_dir() / "statusline.sh"
+
+
 def sessions_dir() -> Path:
     return cache_dir() / "sessions"
 
@@ -177,3 +240,10 @@ def ensure_dirs() -> None:
     config_dir().mkdir(parents=True, exist_ok=True)
     cache_dir().mkdir(parents=True, exist_ok=True)
     sessions_dir().mkdir(parents=True, exist_ok=True)
+    # settings_file()'s parent is config_dir() by default (already covered above),
+    # but SKILL_ADVISOR_SETTINGS_FILE may point anywhere. Both writers
+    # (install.render_settings, baseline._write_settings_effort) call
+    # ensure_dirs() before writing and neither is allowed to raise, so this must
+    # create the override's parent too — same trust model this module already
+    # applies to SKILL_ADVISOR_CONFIG_HOME / SKILL_ADVISOR_CACHE_HOME above.
+    settings_file().parent.mkdir(parents=True, exist_ok=True)

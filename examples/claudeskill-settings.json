@@ -12,5 +12,9 @@
         ]
       }
     ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "/home/you/.config/skill-advisor/statusline.sh"
   }
 }

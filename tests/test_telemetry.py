@@ -77,7 +77,8 @@ def test_event_schema_has_expected_fields(isolated_paths):
     [event] = _read_events(isolated_paths)
     for key in (
         "schema", "ts", "session_sha256", "prompt_sha256", "prompt_words",
-        "triage_skipped", "duration_ms", "phase", "phase_source", "judge_used", "picks",
+        "triage_skipped", "duration_ms", "phase", "phase_source", "judge_used",
+        "judge_failure", "picks",
     ):
         assert key in event, f"missing field: {key}"
     assert event["phase"] == "review"
@@ -85,6 +86,30 @@ def test_event_schema_has_expected_fields(isolated_paths):
     assert event["judge_used"] is True
     assert event["triage_skipped"] is True
     assert event["picks"][0]["score"] == 0.5
+
+
+def test_judge_failure_recorded_when_given(isolated_paths):
+    telemetry.record(
+        prompt="p",
+        session_id="s",
+        picks=[_pick("a")],
+        judge_used=False,
+        judge_failure="timeout",
+        config=_on_config(prompt_hash_salt="fixed"),
+    )
+    [event] = _read_events(isolated_paths)
+    assert event["judge_failure"] == "timeout"
+
+
+def test_judge_failure_defaults_to_none_when_omitted(isolated_paths):
+    telemetry.record(
+        prompt="p",
+        session_id="s",
+        picks=[_pick("a")],
+        config=_on_config(prompt_hash_salt="fixed"),
+    )
+    [event] = _read_events(isolated_paths)
+    assert event["judge_failure"] is None
 
 
 def test_prompt_hash_stable_same_salt(isolated_paths):
@@ -290,3 +315,74 @@ def test_record_stop_session_id_hashed_not_raw(isolated_paths):
     )
     contents = (isolated_paths["cache_home"] / "advisor.events.jsonl").read_text()
     assert "raw-sess-id-DO-NOT-LOG" not in contents
+
+
+def test_stop_event_records_invoked_skills(isolated_paths):
+    import json as _json
+
+    from skill_advisor import paths, telemetry
+    from skill_advisor.config import TelemetryConfig
+
+    telemetry.record_stop(
+        session_id="s1", tools=["Skill"], subagents=[],
+        skills=["superpowers:writing-plans"],
+        config=TelemetryConfig(events_enabled=True),
+    )
+    events = [
+        _json.loads(line)
+        for line in paths.events_file().read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert events[-1]["skills"] == ["superpowers:writing-plans"]
+
+
+def test_record_stop_writes_tool_spans(isolated_paths):
+    import json
+    from skill_advisor import paths, telemetry
+    from skill_advisor.config import TelemetryConfig
+
+    telemetry.record_stop(
+        session_id="s1",
+        tools=["Read", "Bash"],
+        subagents=[],
+        skills=["ai-code-review"],
+        tool_spans=[("Read", 412), ("Bash", 138204)],
+        config=TelemetryConfig(events_enabled=True),
+    )
+
+    row = json.loads(paths.events_file().read_text(encoding="utf-8").splitlines()[-1])
+    assert row["tool_spans"] == [["Read", 412], ["Bash", 138204]]
+    assert row["span_anchor"] == "previous_tool"
+
+
+def test_record_stop_omits_spans_when_there_are_none(isolated_paths):
+    """A turn from before the feature must not gain a misleading empty key."""
+    import json
+    from skill_advisor import paths, telemetry
+    from skill_advisor.config import TelemetryConfig
+
+    telemetry.record_stop(
+        session_id="s2", tools=["Read"], subagents=[], skills=[],
+        config=TelemetryConfig(events_enabled=True),
+    )
+
+    row = json.loads(paths.events_file().read_text(encoding="utf-8").splitlines()[-1])
+    assert "tool_spans" not in row
+    assert "span_anchor" not in row
+
+
+def test_record_stop_never_writes_tool_input(isolated_paths):
+    """Privacy: names only. No paths, no commands, no arguments."""
+    from skill_advisor import paths, telemetry
+    from skill_advisor.config import TelemetryConfig
+
+    telemetry.record_stop(
+        session_id="s3",
+        tools=["Bash"], subagents=[], skills=[],
+        tool_spans=[("Bash", 900)],
+        config=TelemetryConfig(events_enabled=True),
+    )
+
+    raw = paths.events_file().read_text(encoding="utf-8")
+    assert "tool_input" not in raw
+    assert "/home/" not in raw

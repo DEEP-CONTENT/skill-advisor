@@ -7,11 +7,11 @@
 [![CI](https://github.com/deep-content/skill-advisor/actions/workflows/ci.yml/badge.svg)](https://github.com/deep-content/skill-advisor/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
-[![Tests](https://img.shields.io/badge/tests-261%20passing-brightgreen.svg)](#development)
+[![Tests](https://img.shields.io/badge/tests-542%20passing-brightgreen.svg)](#development)
 [![Hook latency](https://img.shields.io/badge/latency-~0.3s%20warm-success.svg)](#latency-and-the-two-matcher-modes)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing)
 
-[**Quickstart**](#quickstart) • [**How it works**](#how-the-advisor-works) • [**Configuration**](#configuration-reference) • [**Architecture**](#architecture-deep-dive) • [**Lifecycle mode**](#lifecycle-mode) • [**Telemetry**](#telemetry-and-usage-reports)
+[**Quickstart**](#quickstart) • [**How it works**](#how-the-advisor-works) • [**Configuration**](#configuration-reference) • [**Architecture**](#architecture-deep-dive) • [**Lifecycle mode**](#lifecycle-mode) • [**Effort signalling**](#effort-signalling) • [**Telemetry**](#telemetry-and-usage-reports)
 
 </div>
 
@@ -31,9 +31,16 @@ No API keys are ever introduced. All LLM calls route through `claude -p` subproc
 - **Zero API keys, fully local** — embeddings via `fastembed` (BGE-small ONNX, ~15 MB); optional LLM judge piggy-backs on your existing `claude -p`.
 - **Bring your own library** — scans `~/.claude/skills/` plus plugin marketplaces and any extra roots you configure. No skills bundled.
 - **Lifecycle aware** — drives a `planning → implementation → review → correction → complete` state machine for substantive tasks.
+- **Effort aware** — recommends a reasoning-effort level per prompt, shows it in a status line,
+  nudges when it disagrees with your live setting, and slowly tunes your launch default behind
+  a user veto. Adds no new subprocess.
 - **Hallucination-guarded** — LLM-judge picks are intersected with the candidate shortlist; unknown names are dropped.
 - **Fail-safe by design** — any error or budget overrun exits silent so your prompt always reaches the model.
 - **Opt-in telemetry** — local JSONL with hashed prompts; `skill-advisor report` surfaces dead-skill detection, latency, and ingestion rate.
+- **Only recommends what Claude Code can invoke** — the catalog resolves each skill's
+  `skillOverrides` state before it's ever matched, and `skill-advisor rotate` can
+  maintain the active set itself against usage and semantic fit. See
+  `migrate-excludes` and `rotate` in the [CLI reference](#cli-reference).
 
 ---
 
@@ -50,14 +57,15 @@ No API keys are ever introduced. All LLM calls route through `claude -p` subproc
 9. [Latency and the two matcher modes](#latency-and-the-two-matcher-modes)
 10. [Architecture deep dive](#architecture-deep-dive)
 11. [Lifecycle mode](#lifecycle-mode)
-12. [Telemetry and usage reports](#telemetry-and-usage-reports)
-13. [Troubleshooting](#troubleshooting)
-14. [Maintainer workflow](#maintainer-workflow)
-15. [Contributing](#contributing)
-16. [Development](#development)
-17. [File layout](#file-layout)
-18. [Uninstalling](#uninstalling)
-19. [Licensing notes](#licensing-notes)
+12. [Effort signalling](#effort-signalling)
+13. [Telemetry and usage reports](#telemetry-and-usage-reports)
+14. [Troubleshooting](#troubleshooting)
+15. [Maintainer workflow](#maintainer-workflow)
+16. [Contributing](#contributing)
+17. [Development](#development)
+18. [File layout](#file-layout)
+19. [Uninstalling](#uninstalling)
+20. [Licensing notes](#licensing-notes)
 
 ---
 
@@ -66,7 +74,7 @@ No API keys are ever introduced. All LLM calls route through `claude -p` subproc
 ```
 skill-advisor/
 ├── src/skill_advisor/     Python package — the advisor runtime & CLI
-├── tests/                 pytest suite (261 tests, all pass, zero real-home leaks)
+├── tests/                 pytest suite (542 tests, all pass, zero real-home leaks)
 ├── examples/
 │   ├── config.toml        Commented default user config
 │   ├── claudeskill-settings.json  Reference UserPromptSubmit hook settings
@@ -367,6 +375,9 @@ skill-advisor replay examples/prompts.jsonl   # benchmark the pipeline on a prom
 skill-advisor hook < event.json      # manually invoke the hook with a synthetic event
 skill-advisor match "some prompt"    # evaluate the matcher against a single prompt
 skill-advisor report                 # pick frequency, dead-skill list, latency (telemetry must be on)
+skill-advisor migrate-excludes       # one-time: move catalog.exclude_names into skillOverrides
+skill-advisor rotate                 # dry run: propose active-skill-set swaps
+skill-advisor rotate --apply         # write the proposed swaps
 skill-advisor install                # re-run the shell/rc install (idempotent)
 skill-advisor uninstall              # remove alias, settings, cache; keep config.toml
 skill-advisor uninstall --purge-config
@@ -393,7 +404,10 @@ make report         # pick frequency / dead-skill report (telemetry must be on)
 
 Renders `claudeskill-settings.json`, writes a default `config.toml` (if absent), builds
 the catalog, and prints the exact `--settings` flag to add to your claude launcher.
-Does **not** edit your shell rc file unless `--write-alias` is passed. Idempotent.
+Does **not** edit your shell rc file unless `--write-alias` is passed. Idempotent. When
+`[effort] enabled = true` and `[effort] statusline = true`, also writes
+`~/.config/skill-advisor/statusline.sh` and registers it as `statusLine` — see
+[Effort signalling](#effort-signalling).
 
 ### `skill-advisor uninstall [--purge-config]`
 
@@ -488,21 +502,301 @@ Flags:
 - `--purge-older-than DURATION` — rewrite the log, keeping only events newer
   than `DURATION`, and exit. Manual retention tool; the hook itself never prunes.
 
+### `skill-advisor bleed [options]`
+
+Rank skills and tools by the time they actually cost, with idle time flagged
+separately rather than folded into the total. Reads the same opt-in event log
+as `report` (`~/.cache/skill-advisor/advisor.events.jsonl`), pairing each
+`kind=prompt` row with the next `kind=stop` row in the same session and, where
+present, charging the `stop` row's `tool_spans` — the raw per-tool-call
+timestamp deltas the PostToolUse/Stop hooks write — to whichever skill(s) and
+tool(s) were active that turn.
+
+A span measures **the interval since the previous tool call finished**, so the
+first tool of a turn carries no span: there is no predecessor to measure from,
+and the prompt→first-tool interval belongs to no tool. A turn that used exactly
+one tool therefore records no spans at all and counts as *not span-carrying* in
+the `spans: N of M` line — deliberately, because a fabricated `0 ms` for that
+tool would be counted as coverage the report does not have.
+
+Because of that, the TOOL table prints `calls` and `spans` as two separate
+columns rather than one. `calls` is the real invocation count (from every
+recorded tool call, regardless of whether it left a span); `spans` is how many
+of those calls actually got measured. The two diverge most for a tool that is
+usually a turn's first call — `Skill` above all, being the one this whole
+feature exists to reason about — since the leading call in every turn is
+exactly the one with no predecessor to measure from. `p50` and `attributed`
+are computed over the `spans` population only, never `calls`.
+
+```bash
+skill-advisor bleed
+# turns: 3942 · spans: 0 of 3942 (0.0%) · idle threshold: 120s
+# no span data yet — ranking by turn time; per-tool cost and idle time need spans, which accrue from install
+# unpaired prompts: 1387 (turns that used no tools write no stop event)
+#
+# SKILL                                         n  p50 turn
+# superpowers:finishing-a-development-branch    8     2110s
+# superpowers:subagent-driven-development      12     1633s
+# ai-code-review                               13     1153s
+# ...
+#   20 skill(s) below n=5 (not ranked)
+#
+# TOOL — no span data yet. Spans accrue from install; re-run after some turns.
+```
+
+`tool_spans` did not exist before this feature shipped, so events recorded
+earlier carry none — the `spans: 0 of N (0.0%)` line above is the real output
+on a log that predates it, not a bug. Until spans accrue, `bleed` ranks skills
+by turn time (`p50 turn`) instead of cost and prints that fallback explicitly
+rather than silently sorting a column of zeros.
+
+Flags:
+
+- `--since DURATION` — time window (e.g. `7d`, `24h`; default: all history).
+- `--min-n N` — minimum turns before a skill is ranked (default: 5). Skills
+  under the floor are still counted (`N skill(s) below n=5 (not ranked)`),
+  never silently dropped from the total.
+- `--idle-threshold SECONDS` — seconds above which a span is treated as idle
+  (default: 120).
+- `--by {skill,tool,both}` — which tables to print (default: both).
+- `--limit N` — rows per table; overflow past the limit is reported as
+  `+N more`, never truncated without saying so (default: 20). Applies to the
+  **human tables only** — see `--json` below.
+- `--json` — emit machine-readable JSON instead of tables (default: off).
+
+In `--json` mode the `skills` and `tools` arrays are **complete**: `--limit` is
+not applied, and the payload says so with `"limit_applied": false`. Truncating
+there would be a silent drop with no `+N more` line to notice it by. The
+payload also carries `"ranked_by"`, naming the field the arrays are sorted on —
+`"attributed_ms"` normally, but `"p50_turn_s"` on the no-spans path, where a
+consumer reading array order as a cost ranking would otherwise be reading a
+turn-time ranking without knowing it. Names longer than the column are elided
+in the *middle* in the human tables (`mcp__plugin…rowser_click`) so that tools
+sharing a long prefix stay distinguishable; `--json` always carries the full
+name.
+
+**The idle threshold is applied at read time, not baked into what's
+recorded.** Every `stop` event stores the raw per-tool-call deltas; `bleed`
+decides at read time which spans exceed `--idle-threshold` and caps them
+there (the excess is charged to idle, never to the tool — "cap-and-spill",
+not all-or-nothing). That means the entire history can be re-read at a
+different `--idle-threshold` after the fact — nothing needs to be
+re-recorded, and lowering the threshold retroactively reclassifies old long
+spans as idle.
+
+**A turn that used no tools writes no stop event at all**, because the Stop
+hook returns early when there was nothing to record — a purely conversational
+turn leaves a `prompt` row with no matching `stop`. `bleed` counts these as
+`unpaired prompts` rather than silently shrinking the turn count, but there is
+no span to attribute time to: that turn cannot be measured, not "measured as
+zero".
+
+**A long span cannot tell an absent user apart from a genuinely slow tool,
+and `bleed` does not pretend otherwise.** PostToolUse reports only when a
+call *finished*, never when it started relative to the user's attention, so
+nothing in the data can distinguish "the user stepped away for ten minutes"
+from "that test suite genuinely took ten minutes." Every span over
+`--idle-threshold` is capped and the excess goes to `idle`, never to the
+tool's attributed cost. A skill whose time is mostly idle therefore reads as
+**unmeasured, not as fast or slow** — that is what the `idle` and
+`idle turns` columns are for: so a large `p50 turn` isn't misread as "this
+skill is slow" when it may just mean the user walked away mid-turn.
+
+**Subagent time is not part of what `bleed` reports.** Each turn's state
+tracks which subagents ran (`subagents_invoked`, echoed into the `stop`
+event's `subagents` field), but `bleed`'s skill and tool tables don't consume
+that field today — there is no subagent column in either `--by` table or in
+`--json`. Separately, that capture was also dead across the entire measured
+history up to this change: the code only recognized the tool name `"Task"`,
+but the tool that actually launches a subagent is named `"Agent"` (confirmed
+directly against this log — thousands of real `stop` events carry `"Agent"`,
+zero carry `"Task"`), so `subagents_invoked` was silently empty on every real
+turn regardless of how much subagent use actually happened. That name
+mismatch is fixed as of this change, so turns recorded from here on capture
+it correctly — but every `subagents_invoked` from before the fix is a false
+negative, not evidence subagents went unused, and `bleed` still won't surface
+it either way until a future change reads the field.
+
+This fix has a side effect outside `bleed` entirely, worth knowing about even
+though it's invisible in `bleed`'s own output: `subagents_invoked` also feeds
+the [`on_plan_subagent_done` auto-advance rule](#auto-advance)
+(`PLANNING → IMPLEMENTATION` when a `Plan` subagent completed). That rule was
+just as silently inert as the telemetry field, for the same reason — it
+checked the same always-empty list. If you have
+`lifecycle.auto_advance.enabled = true`, this fix makes that rule fire for
+the first time on the next `Plan`/`writing-plans` subagent call in a
+`PLANNING`-phase turn, where it previously never did. This is the config's
+documented intent finally working, not a new behavior being introduced — but
+it is a real, observable change in when your session auto-advances, not just
+a reporting change.
+
 ### `skill-advisor doctor`
 
 End-to-end diagnosis. Checks: `claude` on PATH, settings file present, catalog
-present & parseable, catalog freshness vs source mtimes, log file. Exits non-zero
-if a required piece is missing.
+present & parseable, catalog freshness vs source mtimes, log file. Then reports
+catalog *health*: how much of the disk the scanner can actually see (`pool_health()`
+in `catalog.py`) — how many `SKILL.md` files exist versus how many parse, how many
+catalog entries that yields, and how many of those are pickable (not `off` in
+`skillOverrides`). Exits non-zero if a required piece from the first block is
+missing. When `[effort] enabled = true`, also checks for `jq` (required by the
+status line), whether the status line script has been written, and whether an
+effort recommendation has been recorded yet — these three lines are silent (not
+printed at all) when the effort feature is off.
 
-Example output:
+Example output (effort feature enabled):
 
 ```
-claude on PATH : /home/you/.local/bin/claude
-settings file  : /home/you/.config/skill-advisor/claudeskill-settings.json
-catalog        : 938 entries
-freshness      : up-to-date
-log            : /home/you/.cache/skill-advisor/advisor.log (3412 bytes)
+claude on PATH   : /home/you/.local/bin/claude
+settings file    : /home/you/.config/skill-advisor/claudeskill-settings.json
+catalog (cached) : 938 entries
+freshness        : up-to-date
+log              : /home/you/.cache/skill-advisor/advisor.log (3412 bytes)
+skill files    : 1067 on disk, 851 parseable
+catalog (live) : 383 in pool, 112 pickable
+WARN: 216 SKILL.md files are unparseable (no YAML frontmatter) and invisible to the advisor. Examples: ai-engineer, analytics-tracking, angular, api-documenter, arm-cortex-expert, +211 more
+NOTE: 22 names are configured as excluded in catalog.exclude_names but remain enabled in Claude Code. To reconcile: edit config.toml and remove them from catalog.exclude_names.
+jq             : /usr/bin/jq
+statusline     : /home/you/.config/skill-advisor/statusline.sh
+effort state   : present
 ```
+
+(The first five lines' column width is computed dynamically from their longest
+label — `catalog (cached)` — so they don't line up with everything below, which
+uses its own fixed spacing; that's an artifact of the real output, not a typo
+here.)
+
+`jq` prints `MISSING (status line will render nothing)` when absent; `statusline`
+prints `not written (run install)` until you `skill-advisor install` after
+enabling the feature; `effort state` prints `none yet` until the hook has fired
+at least once with a recommendation to record.
+
+`catalog (cached)` is what `skill-advisor build` last wrote to disk; `catalog
+(live)` is a fresh scan run by `doctor` itself, so the two can disagree right
+after you add or remove a `SKILL.md` and before the next `build`. The `WARN`
+line is silent when there are zero unparseable files. The `NOTE` line fires
+when a name in `catalog.exclude_names` is still enabled in Claude Code — muted
+in the advisor but invocable; `skill-advisor migrate-excludes` reconciles the
+subset of these it can (see below), the doctor message itself only points at
+editing `config.toml` by hand.
+
+### `skill-advisor migrate-excludes [--revert] [--create-settings]`
+
+One-time, reversible move of `[catalog] exclude_names` (a `config.toml` list that
+only ever affected what the advisor *recommends*) into Claude Code's own
+`skillOverrides` (which controls what Claude Code actually *exposes*). Run this
+once before your first `rotate` — until you do, the two lists stay independent
+and the advisor keeps recommending skills Claude Code cannot invoke.
+
+**Partial by design, not a bug.** `skillOverrides` can only address a *user
+skill* (keyed by its directory name). It has no key for a built-in subagent, a
+slash command, or a plugin-namespaced skill — `catalog.exclude_names`, by
+contrast, mutes by bare name regardless of kind. `migrate-excludes` classifies
+every excluded name and moves only what `skillOverrides` can actually govern:
+
+- **Migrated** — the name resolves to exactly one user-skill catalog entry;
+  written as `"off"` into `skillOverrides`.
+- **Retained** — everything `skillOverrides` cannot address: a name matching no
+  catalog entry on disk, a built-in subagent, a slash command, or a
+  plugin-namespaced skill. Left behind in `catalog.exclude_names` (the array is
+  rewritten to contain only the retained names, with a comment explaining why)
+  so the mute isn't silently dropped.
+
+The command prints exactly which names moved and which stayed, and why each
+retained name couldn't move.
+
+**Deliberate, accepted consequence:** every name that migrates becomes
+rotation-eligible. Some were excluded for irrelevance, not quality, and the
+first `rotate` dry run afterward may propose bringing one back — read it before
+`--apply`ing rather than assuming it's safe.
+
+Safety:
+
+- **Backs up both files first.** `config.toml.pre-migrate.bak`, and either
+  `<settings>.pre-migrate.bak` (if the settings file already existed) or a
+  `<settings>.pre-migrate.absent` marker recording exactly which keys this run
+  added (if it didn't). `--revert` restores the backup byte-for-byte, or — for
+  a freshly-created settings file — removes exactly the keys this migration
+  added, deleting the file itself only if nothing else has written to it since.
+- **`--create-settings`** is required the first time the resolved settings file
+  (`paths.settings_file()`, honouring `SKILL_ADVISOR_SETTINGS_FILE`) doesn't
+  exist yet. This guard exists because writing `skillOverrides` into a file
+  your `claude --settings ...` invocation never actually reads is silently
+  inert — no error, nothing changes, and you'd have no way to tell. See the
+  `SKILL_ADVISOR_SETTINGS_FILE` row in the [environment variable
+  table](#configuration-reference) and `paths.settings_file()`'s own docstring,
+  which documents this exact trap.
+- Every write is atomic (temp file, JSON/TOML round-trip validated before the
+  real path is touched, `Path.replace()`) and never touches
+  `~/.claude/settings.json`.
+
+```bash
+skill-advisor migrate-excludes                    # one-time move
+skill-advisor migrate-excludes --create-settings   # first run, settings file absent yet
+skill-advisor migrate-excludes --revert            # undo, exactly
+```
+
+### `skill-advisor rotate [--apply] [--target N] [--limit N]`
+
+Scores the **rotation pool** — every catalog entry `skillOverrides` can actually
+govern, which today means user skills only — against usage and semantic fit,
+and proposes swapping low-scoring active skills for higher-scoring inactive
+ones. Subagents, slash commands, and plugin-namespaced skills are permanently
+enabled in Claude Code and outside `skillOverrides`'s reach; `extra_roots`
+skills are excluded for a different reason but the same effect — they're
+scanned in place from a directory Claude Code's own skill discovery never
+looks at, so `skillOverrides` can't address them either. All four are
+excluded from the pool entirely; the summary line reports how many and why.
+
+**A dry run writes nothing.** Without `--apply`, `rotate` only prints the
+proposal — every settings write happens strictly after the printed output, and
+every early-return path (cold start, an empty pool, a proposal that would breach
+`rotation.min_active`) sits above that write.
+
+```bash
+skill-advisor rotate                 # dry run
+skill-advisor rotate --apply         # write the proposal
+skill-advisor rotate --target 60     # override rotation.target_active for this run
+skill-advisor rotate --limit 0       # print every PROMOTE/DEMOTE line, not just the default 20
+```
+
+The summary line always prints first, before scoring is even attempted, so a
+refusal below it is self-explanatory without a second run — illustrative
+example:
+
+```
+catalog 383 entries · excluded 271 unrotatable (plugin skills, slash commands, subagents — not addressable via skillOverrides) · pool 112 · active 47 · target 75 · sketch 214 prompts
+```
+
+Then, if scoring succeeds and something changed:
+
+```
+proposal: 4 promotion(s), 2 demotion(s) → 49 active
+  PROMOTE some-skill                                  semantic_fit=0.812 total=0.812 (free slot)
+  PROMOTE another-skill                                exploration slot: semantic_fit=0.734, no usage history
+  DEMOTE  stale-skill                                  total=0.104, outside the top 75; last invoked 62d ago
+
+(dry run — nothing written; rerun with --apply)
+```
+
+- **Reasons** name the signals behind each line: a promotion into a free slot
+  cites its `semantic_fit` and `total`; one that displaced an incumbent also
+  cites `pick_rate` and the displaced score it had to clear (plus the
+  `hysteresis` margin); one that filled an exploration slot instead says so —
+  a fixed fraction of slots reserved for high-`semantic_fit`, zero-usage
+  skills that bypass the merit contest entirely. A demotion cites its own
+  score and whether it was displaced on merit or by an exploration slot, plus
+  how long ago it was last invoked (or "never invoked").
+- **A skill invoked within `rotation.recency_days` is never demoted**, whatever
+  it scores — the recency shield.
+- **Truncation.** Each direction (`PROMOTE`/`DEMOTE`) prints up to `--limit`
+  lines (default 20) and then an explicit `… +N more promotions/demotions` —
+  never a silent cut. `--limit 0` shows every line.
+- When telemetry is off, the tool says so and scores on `semantic_fit` alone —
+  `pick_rate` and `invocation_rate` both need the event log.
+
+`--apply` writes only the entries that changed, merged into `skillOverrides` in
+the advisor's own settings file — never `~/.claude/settings.json` — using the
+same atomic write as `migrate-excludes`.
 
 ### `skill-advisor hook`
 
@@ -522,7 +816,9 @@ You don't call them manually under normal use. Behavior is a no-op unless you
 opt into [auto-advance](#auto-advance).
 
 - `posttooluse` — reads a PostToolUse event from stdin, records the `tool_name`
-  (and the `subagent_type` when the tool was `Task`) into
+  (and the `subagent_type` when the tool is the subagent launcher — `Agent` in
+  current Claude Code builds; `Task` is also recognized as a defensive fallback,
+  see [`skill-advisor bleed`](#skill-advisor-bleed-options)) into
   `~/.cache/skill-advisor/sessions/<session_id>.turn.json`.
 - `stop` — reads a Stop event from stdin, inspects the per-session turn state,
   and applies the auto-advance rules if enabled. Always clears the turn file.
@@ -568,11 +864,19 @@ max_candidates = 15
 # Max picks surfaced in additionalContext.
 max_picks = 3
 
-# Total hook budget in seconds. Hook exits silent if exceeded — your prompt always
-# goes through, even when the advisor can't answer in time.
-# Bump to ~15.0 if you enable use_judge = true, or ~25.0 if you enable
-# [parallelization] (judge_timeout_seconds 20 + ~3 s margin + subprocess startup).
-budget_seconds = 4.0
+# Whole-hook budget in seconds — signal.alarm() arms around the entire matcher
+# call (not just the judge). If the alarm itself fires, the hook exits silent
+# (no picks) so your prompt always goes through unaffected, though it still
+# records an event row marked judge_failure = "budget_exceeded" so the kill is
+# countable rather than invisible. In practice that's a rare last resort: the
+# judge's own subprocess timeout is set to budget_seconds - 0.5, so it always
+# loses that race. A judge that times out now falls back to the embedding
+# ranking already computed ("embedding fallback (0.NN)") instead of going
+# silent.
+# Must be at least parallelization.judge_timeout_seconds + 3 if you enable
+# [parallelization]; `doctor` warns when it isn't.
+# Bump to ~15.0 if you enable use_judge = true.
+budget_seconds = 8.0
 
 # Minimum cosine score to surface a pick in embedding-only mode. Range 0-1;
 # 0.35 filters out weak matches on unrelated prompts.
@@ -623,6 +927,70 @@ extra_disable_patterns = []
 # [lifecycle.phase_additions]
 # implementation = ["skill:team-implementation-checklist"]
 # review = ["subagent:feature-dev:code-reviewer", "skill:team-review-checklist"]
+
+[effort]
+# Master toggle. When false, nothing in this feature runs: no classification, no
+# status line registration, no nudge, no write-back. Off by default so existing
+# installs are untouched until you opt in. See "Effort signalling" below.
+enabled = false
+
+# Register a `statusLine` command in claudeskill-settings.json (needs `jq`).
+statusline = true
+
+# Emit a systemMessage when the recommendation disagrees with observed effort.
+nudge = true
+
+# Allow occasional writes of `effortLevel` into claudeskill-settings.json.
+write_back = true
+
+# Consecutive qualifying sessions of disagreement before a write happens.
+write_back_after_sessions = 5
+
+# Sessions to suppress write-back for after the user manually overrides.
+veto_cooldown_sessions = 10
+
+# Recommend `ultracode` when the parallelization detector says yes.
+# Never persisted — Claude Code treats ultracode as session-only by design.
+ultracode_nudge = true
+
+[rotation]
+# There is no automatic-rotation mode ("rotate every N sessions") and no
+# master toggle for one — `skill-advisor rotate` is a CLI verb you run
+# yourself, dry-run by default, and every write still needs --apply. That is
+# the safety rail: the scoring is unvalidated, and a wrong rotation silently
+# removes a skill you rely on, so the human stays in the loop by construction
+# rather than by a config flag that could be flipped once and forgotten.
+
+# How many user skills `rotate` tries to keep active. Within the 50-100 band
+# the design settled on. Override per-run with `rotate --target N`.
+target_active = 75
+
+# Hard floor. A proposal that would leave fewer than this many skills active
+# is refused before anything is written.
+min_active = 25
+
+# Score margin a candidate must clear over the incumbent it would displace,
+# so near-tied skills don't swap back and forth on every run.
+hysteresis = 0.05
+
+# Fraction of target_active reserved for high-semantic_fit, zero-usage
+# skills — skills the usage data alone could never recommend. These bypass
+# the hysteresis check entirely; that's the point of the reservation.
+exploration_fraction = 0.10
+
+# A skill invoked within this many days is never demoted, whatever it scores.
+recency_days = 30
+
+# Cold-start floor for the centroid sketch (see "The centroid sketch" under
+# Telemetry and usage reports). Below this many observed prompts, `rotate`
+# refuses to run rather than score against an unformed sketch.
+min_observed_prompts = 200
+
+# How many centroids the sketch keeps (see "The centroid sketch" below).
+# Only takes effect on a cold start — once centroids.npz exists on disk, its
+# shape is fixed until it's deleted (e.g. `skill-advisor uninstall`) and
+# re-created, same as any other cold-start-only setting here.
+centroid_count = 8
 ```
 
 Environment variables override path-derived defaults (useful for tests / multi-user
@@ -634,6 +1002,7 @@ setups):
 | `CLAUDE_CONFIG_DIR` | — | Claude Code's official env var. When set, `paths.claude_home()` resolves to it (e.g. `~/.claude-work` for work credentials). The catalog scans that dir's `skills/` first and falls back to `$HOME/.claude/skills` when the primary has nothing. |
 | `SKILL_ADVISOR_CONFIG_HOME` | `$XDG_CONFIG_HOME/skill-advisor` → `$HOME/.config/skill-advisor` | |
 | `SKILL_ADVISOR_CACHE_HOME` | `$XDG_CACHE_HOME/skill-advisor` → `$HOME/.cache/skill-advisor` | |
+| `SKILL_ADVISOR_SETTINGS_FILE` | `config_dir()/claudeskill-settings.json` | Full path (not just a filename) to the Claude Code settings file the installer renders and the effort feature writes back to. Set this if the file you actually pass to `claude --settings` is named something other than `claudeskill-settings.json` — without it, `install` and effort write-back target the default-named file while your `claude` invocation reads a different one, and the feature silently does nothing (no error, no warning). |
 | `SKILL_ADVISOR_BUNDLE` | — | Used by `sync-skills` as a fallback source directory when `--from` is not passed. |
 
 ### Work / private credential splits
@@ -709,15 +1078,31 @@ Prompts that match the triage skip rules bypass the pipeline in ~0 ms:
 4. `triage.should_skip()` short-circuits on cheap prompts.
 5. `matcher.pick()` loads the catalog + embeddings, runs `index.top_k()`, and either
    returns the cosine ranking directly or delegates to `judge.rank()` for LLM re-ranking.
-6. `inject.format()` renders picks into a `<skill-advisor>` block.
-7. The hook prints
-   `{"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "..."}}`
-   to stdout.
-8. Claude Code injects that string into the model's context.
-9. The model sees a terse, authoritative "invoke the top match via the Skill tool"
-   nudge and typically follows it.
-10. Optional: if `telemetry.events_enabled = true`, one JSON event is appended to
+   When `[effort] enabled = true`, it also calls `effort.classify()` with the phase, judge
+   verdict, and parallelization result it already computed, and attaches the resulting
+   recommendation (or `None`) to the result — no extra subprocess.
+6. If a recommendation was produced, the hook writes it to
+   `~/.cache/skill-advisor/effort.json` (atomic temp+rename) and compares it against
+   `~/.cache/skill-advisor/observed-effort.json` — the live level the status line last
+   saw — to decide whether a nudge is due. Independently of that comparison, the hook
+   also checks for a write-back announcement queued by a previous session's `Stop`
+   handler and, if one is pending, attaches it to the same `systemMessage`.
+7. `inject.format()` renders picks into a `<skill-advisor>` block.
+8. The hook prints
+   `{"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "..."}, "systemMessage": "..."}`
+   to stdout — `systemMessage` present only when a nudge or announcement is pending.
+9. Claude Code injects `additionalContext` into the model's context and shows any
+   `systemMessage` to you directly.
+10. The model sees a terse, authoritative "invoke the top match via the Skill tool"
+    nudge and typically follows it.
+11. Optional: if `telemetry.events_enabled = true`, one JSON event is appended to
     `~/.cache/skill-advisor/advisor.events.jsonl` with hashed prompt + session.
+12. Independently, on every status-line render, `statusline.sh` reads Claude Code's live
+    `effort.level` from stdin, records it to `observed-effort.json` (step 6's sensor
+    input for the *next* prompt), and prints `observed [→ recommended] · model · ctx%`.
+13. At the end of the turn, `skill-advisor stop` finalizes the session's modal
+    recommendation into the rolling write-back window and may atomically rewrite
+    `effortLevel` in `claudeskill-settings.json` — see [Effort signalling](#effort-signalling).
 
 ### Sibling hooks (PostToolUse + Stop)
 
@@ -725,7 +1110,9 @@ When [auto-advance](#auto-advance) is enabled, `skill-advisor install` also wire
 two sibling handlers into your settings file:
 
 - **`skill-advisor posttooluse`** fires after every tool call. It appends the
-  `tool_name` (and, for `Task` calls, the `subagent_type`) into
+  `tool_name` (and, for subagent-launcher calls, the `subagent_type` —
+  `Agent` in current Claude Code builds; `Task` also recognized defensively,
+  see [`skill-advisor bleed`](#skill-advisor-bleed-options)) into
   `~/.cache/skill-advisor/sessions/<session_id>.turn.json`.
 - **`skill-advisor stop`** fires at the end of each assistant turn. It reads
   the turn file, clears it, then consults the active lifecycle state and the
@@ -738,9 +1125,14 @@ hook failure.
 
 ### Safety rails
 
-- **`threading.Thread(daemon=True)` + `join(timeout=budget)`** — cross-platform hard
-  wall-clock budget (works on Windows; `signal.SIGALRM` is POSIX-only). On overrun the
-  daemon worker is left running and `hook.run()` exits 0 silent.
+- **`threading.Thread(daemon=True)` + `join(timeout=hook.alarm_seconds(cfg))`**, i.e.
+  `max(int(budget_seconds + 0.5), 1)` — hard wall-clock budget, rounded to a whole
+  second. Enforced by a thread join rather than `signal.alarm()` because
+  `signal.SIGALRM` is POSIX-only and this tool also runs on Windows; the formula and
+  its ordering invariant against the judge's own subprocess timeout are unchanged.
+  On overrun the daemon worker is left running and `hook.run()` exits 0 silent.
+  The budget covers the centroid sketch update too, but overrunning *there* is not
+  reported as a budget failure — the picks are already in hand and get emitted.
 - **Broad try/except in `hook.run()`** — any unexpected error exits 0 silent and logs
   to `advisor.log`.
 - **Hallucination guard in `judge._parse_judge_reply()`** — LLM-returned names are
@@ -776,6 +1168,19 @@ hook failure.
 
 `skill-advisor build` rebuilds the first three atomically. It's a no-op when the source
 hash is unchanged, unless `--force` is passed.
+
+When `[effort] enabled = true`, three more files live alongside these (not touched by
+`build` — see [Effort signalling](#effort-signalling)):
+
+```
+~/.cache/skill-advisor/
+├── effort.json             Latest recommendation, written by the UserPromptSubmit hook
+├── observed-effort.json    Live effort level last seen by the status line (the sensor)
+└── baseline.json           Rolling window, write-back history, veto/cooldown state
+
+~/.config/skill-advisor/
+└── statusline.sh            Generated POSIX-sh status line, registered as `statusLine`
+```
 
 ### Embeddings
 
@@ -888,7 +1293,7 @@ review = ["subagent:feature-dev:code-reviewer", "skill:security-audit"]
 # be bumped to >= judge_timeout_seconds + 3.
 enabled = false
 min_tasks = 3
-judge_timeout_seconds = 20.0
+judge_timeout_seconds = 5.0
 
 [lifecycle.auto_advance]
 # Opt-in Stop/PostToolUse hooks that push phases forward without a user prompt.
@@ -997,9 +1402,15 @@ else changes for sessions that don't trigger a lifecycle.
 Two transitions auto-advance:
 
 - **`PLANNING → IMPLEMENTATION`** when the last turn invoked a `Plan` subagent
-  (via Claude Code's `Task` tool with `subagent_type="Plan"`). Use this when you
+  (`subagent_type="Plan"`, via Claude Code's subagent-launcher tool — `Agent`
+  in current builds, `Task` also recognized defensively). Use this when you
   want the advisor to hand off to the implementer immediately after planning
-  completes, without typing "go".
+  completes, without typing "go". **This rule was silently inert until a
+  recent fix** — it checked a tool name (`Task`) that never occurs in real
+  traffic, so it never fired against actual `Agent` calls. If you already
+  have `auto_advance.enabled = true`, it will fire for the first time now;
+  see [`skill-advisor bleed`](#skill-advisor-bleed-options) for the measured
+  evidence.
 - **`IMPLEMENTATION → REVIEW`** when the last turn ended with any mutating tool
   (`Edit`, `Write`, `NotebookEdit`, `MultiEdit`, `Bash`). If the model only read
   files this turn (`Read`, `Grep`, `Glob`, `LS`), the state stays at
@@ -1093,10 +1504,19 @@ doctor` will warn if `budget_seconds < judge_timeout_seconds + 3`.
 
 #### Why it's opt-in
 
-The detector uses `claude -p`, which carries Claude Code's ~15 s session-startup
-cost. That's why `budget_seconds` must be bumped well above the default 4.0 —
-the `doctor` check enforces `>= judge_timeout_seconds + 3` so the subprocess
-has room to actually return a verdict.
+The detector makes its own `claude -p` call (`parallelization.detect()`, the same
+subprocess mechanism as the main judge), carrying the same session-startup cost —
+elsewhere in this doc measured at roughly 7-12 s for the main judge. `doctor` enforces
+`matcher.budget_seconds >= parallelization.judge_timeout_seconds + 3` whenever
+`[parallelization]` is enabled, and the shipped defaults (`budget_seconds = 8.0`,
+`judge_timeout_seconds = 5.0`) already satisfy that relationship exactly, so a fresh
+install won't trigger the warning. But 5 s is tight against a ~7-12 s subprocess: at the
+shipped defaults the detector will often time out and return `None` before it gets an
+answer. That's an accepted trade, not a bug — a timeout here degrades gracefully (no
+parallelization picks; the lifecycle still advances to `implementation` normally) rather
+than blocking anything. It's why the example above bumps both `budget_seconds` and
+`judge_timeout_seconds` well past the shipped defaults — giving the detector real room to
+answer is something you opt into deliberately, not what you get out of the box.
 
 #### Turning it off
 
@@ -1126,9 +1546,236 @@ to the user — never auto-resolved.
   false positives/negatives.
 - **Lifecycle is per-session.** Restarting Claude Code creates a new session
   id, so long-running work spanning sessions isn't stitched together.
-- **No `SubagentStop` handling yet.** PostToolUse fires for the parent `Task`
-  invocation, which is enough for the Plan-subagent rule; deep subagent event
-  plumbing is a future enhancement.
+- **No `SubagentStop` handling yet.** PostToolUse fires for the parent
+  `Agent` invocation (Claude Code's current subagent-launcher tool name;
+  `Task` is also recognized), which is enough for the Plan-subagent rule;
+  deep subagent event plumbing is a future enhancement.
+
+---
+
+## Effort signalling
+
+Claude Code exposes a reasoning-effort dial (`low`/`medium`/`high`/`xhigh`/`ultracode`)
+that most people set once and forget. skill-advisor already inspects every prompt, so it
+reuses that work to recommend an effort level, show it to you in a status line, and nudge
+you when your live setting and its recommendation disagree — and, over enough sessions of
+sustained disagreement, it will quietly rewrite your launch-time default, subject to a
+veto you trigger just by using `/effort` yourself. **It is off by default** —
+`[effort] enabled = false` — so a fresh install behaves exactly as it did before this
+feature existed.
+
+Two things it *cannot* do, because Claude Code doesn't let a hook do them: it cannot set
+effort for the current turn, and it cannot read live effort from the `UserPromptSubmit`
+event payload. Both facts shape everything below.
+
+### Why the advisor can only recommend, never set
+
+Effort and the `ultracode` flag live in Claude Code's own `AppState`, mutated only by
+slash commands, the `--settings` launch flag, or an SDK control message — never by a hook.
+A `UserPromptSubmit` hook can return `additionalContext`, `systemMessage`,
+`suppressOutput`, and `decision`; there is no field that changes what the model runs with
+this turn. So the advisor's only lever is a **launch-time default**, written to the
+`--settings` file the `claudeskill` alias already passes to `claude`
+(`~/.config/skill-advisor/claudeskill-settings.json`). At the next launch, the precedence
+chain is:
+
+```
+CLAUDE_CODE_EFFORT_LEVEL=…      highest — blocks everything
+  "Not applied: CLAUDE_CODE_EFFORT_LEVEL=x overrides effort this session"
+--effort <level> launch flag     creates a "launch-effort pin"
+  "Not applied: the launch-effort pin holds effort at x this session.
+   Run /effort <level> in an interactive terminal to release the pin."
+--settings effortLevel           ← where skill-advisor writes
+~/.claude/settings.json          ← the user's own saved default
+```
+
+The load-bearing fact is line three: **`--settings` outranks your own
+`~/.claude/settings.json`.** That's what makes write-back possible at all — and it's also
+what makes the veto below necessary, not optional. (These are 2026-07 findings from
+reading the compiled Claude Code 2.1.220 binary — accurate for that build, not a stable
+contract. If a future Claude Code build changes this, the status line degrades gracefully
+[see Limits](#limits-of-this-feature); classification and write-back only ever touch the
+documented `effortLevel` settings key, so they keep working regardless.)
+
+### Two vocabularies, not one
+
+The level Claude Code shows you and the level the classifier recommends are drawn from
+**different enums** — this is deliberate, not a bug:
+
+| | Values |
+|---|---|
+| Observed (from the harness's status-line payload) | `low` `medium` `high` `xhigh` `max` |
+| Recommended (by the classifier) | `low` `medium` `high` `xhigh` `ultracode` |
+
+`max` is never recommended — the classifier has no basis for distinguishing it from
+`xhigh`. `ultracode` is never observed — Claude Code's status-line payload surfaces it as
+plain `xhigh` (it resolves to `xhigh` effort plus a standing dynamic-workflow flag), so the
+status line cannot tell live `ultracode` apart from live `xhigh` and does not try. Ordering
+for comparison is `low < medium < high < xhigh ≤ ultracode`, with `xhigh < max`. **When
+your observed level is `max`, the feature goes quiet** — no arrow, no nudge, no write-back
+contribution for that session — because you've deliberately gone above anything the
+advisor knows how to recommend.
+
+### The status line
+
+`skill-advisor install` renders a POSIX-sh script to `~/.config/skill-advisor/statusline.sh`
+and registers it as `statusLine` in `claudeskill-settings.json`, but only when both
+`effort.enabled` and `effort.statusline` are true, and only if you don't already have a
+foreign `statusLine` command registered (anything whose command isn't exactly this script's
+path is left alone). It renders:
+
+```
+xhigh · opus · ctx 34%              agreement — no arrow
+xhigh → medium · opus · ctx 34%     disagreement — arrow, coloured by the target level
+```
+
+It needs **`jq`** — the script is deliberately shell, not Python, because Claude Code
+re-renders the status line continuously and a Python cold start in that loop would be
+felt on every keystroke. Without `jq` on `PATH` it prints nothing and exits 0; `doctor`
+flags this (see below).
+
+It also does a second job you don't see: on every render it writes the live effort level
+it was just handed to `~/.cache/skill-advisor/observed-effort.json`. This is the **only**
+surface that can see live effort at all — the `UserPromptSubmit` hook's own event payload
+doesn't carry it — so the hook reads this file back to know whether its recommendation
+agrees with reality. On the very first prompt of a session no observation has landed yet;
+the nudge stays silent rather than guessing.
+
+### The nudge
+
+When the recommendation disagrees with the last-observed level, the hook adds a
+`systemMessage` alongside its normal `additionalContext`:
+
+```
+skill-advisor: this looks like xhigh work (judge assessment) — you're at medium.  /effort xhigh
+```
+
+Because `ultracode` is indistinguishable from `xhigh` in what the status line can observe,
+an `ultracode` recommendation nudges as a keyword suggestion instead of a `/effort`
+argument — typing `ultracode` trips Claude Code's own built-in badge, which
+skill-advisor cannot render itself (Claude Code's keyword-badge table is a hardcoded
+five-entry registry with no plugin or hook extension point):
+
+```
+skill-advisor: this decomposes into parallel work (tasks decompose into parallel sub-agents) — consider the `ultracode` keyword. You're at medium.
+```
+
+Rate-limited to once per `(session, observed→recommended)` pair, so a long session doesn't
+nag on every prompt — but a *different* disagreement (e.g. you move to `high` and the
+recommendation is now `xhigh`) gets its own single nudge.
+
+### Write-back and the veto
+
+**This is the part people get wrong, so read it even if you skim the rest.**
+
+Every `UserPromptSubmit` firing appends its recommendation to that session's tally. Once a
+session has at least 3 recommendations, the `Stop` hook computes that session's **modal**
+(most common) level and upserts it — one entry per session, however many turns it ran —
+into a rolling window in `~/.cache/skill-advisor/baseline.json` (capped at the most recent
+30 qualifying sessions).
+
+The comparison point is the session's **first observed effort level** — the value the
+status line's sensor saw on that session's first render, which reflects whatever level the
+session actually launched at (including any `effortLevel` skill-advisor had already
+written, since that's what determines the launch — unless `CLAUDE_CODE_EFFORT_LEVEL` or an
+`--effort` launch pin overrides it; see the precedence chain above). When the most recent
+`write_back_after_sessions` (default **5**) sessions in the window all agree on one level,
+and that level differs from that first-observed value, skill-advisor writes it into
+`claudeskill-settings.json` — atomically
+(temp file → JSON round-trip validation → rename) — and queues a one-shot announcement
+for the next session's first hook firing:
+
+```
+skill-advisor moved your effort baseline xhigh → high (5 sessions of consistent work). Run /effort xhigh to keep it there.
+```
+
+**Now the veto.** Suppose you don't like the new baseline and, mid-session, type
+`/effort xhigh` to go back. That save lands in `~/.claude/settings.json` — your own file —
+which, per the precedence chain above, `--settings` **outranks**. At your *next* launch,
+`claudeskill-settings.json`'s `effortLevel` wins again, silently, and your `/effort` command
+appears to have done nothing. **`/effort` alone does not undo a write-back.**
+
+What actually protects you: the status line's sensor is watching live effort on every
+render. If a later observation in a session differs from that session's *first*
+observation — i.e. you reached for `/effort` or a keyword mid-session — skill-advisor
+treats that as an explicit veto, regardless of whether it had written anything yet. A veto:
+
+- resets the rolling window (so post-override evidence starts fresh), and
+- suppresses further write-back for `veto_cooldown_sessions` (default **10**) sessions.
+
+That pauses *future* writes. It does **not** retroactively revert a baseline already
+written to `claudeskill-settings.json` — there is currently no code path that does that.
+If skill-advisor has already moved your baseline and you want it back immediately, edit or
+delete `effortLevel` in `~/.config/skill-advisor/claudeskill-settings.json` by hand.
+
+### `ultracode` is never persisted
+
+Claude Code itself treats a `/effort ultracode` save as *"(this session only)"* — it never
+writes `ultracode` to settings, unlike every other level. skill-advisor honours that:
+`effort.to_persistable("ultracode")` degrades to the `xhigh` it resolves to, so a session
+whose modal recommendation is `ultracode` contributes `xhigh` — never the literal string
+`"ultracode"` — to the write-back window. No code path in this feature ever writes
+`ultracode` into `claudeskill-settings.json`. Persisting it would invert Claude Code's own
+upstream default and start every future session in the expensive mode.
+
+### Limits of this feature
+
+- **No recommendation, no nudge, no arrow — sometimes, by design.** Classification is
+  attached to the matcher's result, not computed independently. On the normal stateless
+  path, when your prompt matches no catalog entry above `min_embedding_score` (or triage
+  skips it), `matcher.pick()` returns nothing to attach a recommendation to, so
+  `effort.classify()` does not run. (Narrow lifecycle exception: a completion signal
+  during an active `review`/`correction` phase can still return a non-`None` result with
+  an *empty* picks list, and `classify()` does run on that path.) When it doesn't run, the
+  status line still renders your **live** effort level — it just has no `effort.json` to
+  compare against, so it shows no arrow and the hook has nothing to nudge about.
+- **Write-back is not lock-protected.** Writing `effortLevel` is a read-modify-write on
+  the same `claudeskill-settings.json` that `skill-advisor install` also rewrites (to merge
+  hook entries, the `statusLine` key, etc.). If the two run at literally the same moment,
+  the later writer silently discards the earlier writer's key. No lock is taken — the code
+  judges this an acceptable exposure for a single-user local tool, since it requires
+  running `install` at the exact instant a `Stop` hook fires.
+- **The harness findings are not a stable contract.** The precedence chain, the
+  status-line payload shape, and the keyword-badge table were established by reading the
+  compiled `claude` 2.1.220 binary, not from public documentation. If a later Claude Code
+  build changes them, only the status line's live-effort sensor is fragile — it degrades
+  to "no arrow, live effort only." Classification and write-back rest entirely on the
+  documented `statusLine`, `systemMessage`, and `effortLevel` surfaces and keep working.
+
+### Configuring
+
+```toml
+[effort]
+enabled = true          # turn the whole feature on
+statusline = true        # register the generated status line (needs jq)
+nudge = true              # systemMessage when observed and recommended disagree
+write_back = true         # allow the advisor to tune your launch default over time
+write_back_after_sessions = 5
+veto_cooldown_sessions = 10
+ultracode_nudge = true    # recommend `ultracode`; it is never written to settings
+```
+
+See [Configuration reference](#configuration-reference) for the full field list with
+comments, and re-run `skill-advisor install` after flipping `enabled` so the status line
+gets registered.
+
+### Troubleshooting: the status line shows nothing
+
+Check, in order:
+
+1. **Is `jq` installed?** `command -v jq`. Without it the script exits 0 with empty
+   output by design. `skill-advisor doctor` reports this when `[effort] enabled = true`.
+2. **Did you run `skill-advisor install` after enabling the feature?** The `statusLine`
+   key is only registered when `effort.enabled` (and `effort.statusline`) were true *at
+   install time*. Flipping the config afterward doesn't retroactively register it.
+3. **Is `[effort] enabled = true`?** With the feature off, no script is generated or
+   registered, and `doctor` prints nothing effort-related at all — that's expected, not a
+   bug.
+4. **Do you already have a `statusLine` command from something else?** skill-advisor
+   never overwrites a `statusLine` whose command isn't exactly its own script's path.
+
+`skill-advisor doctor` is the fastest way to check all of the above in one shot — see
+[`skill-advisor doctor`](#skill-advisor-doctor).
 
 ---
 
@@ -1143,6 +1790,24 @@ and latency stats. Off by default.
 - Prompts are stored as `sha256(salt + prompt)[:16]` — never plaintext.
 - Session ids are hashed the same way — raw Claude Code session ids never land
   on disk.
+- **Tool calls contribute identifiers, never free-form `tool_input`, to the
+  event log.** No file paths, no shell commands, no arguments in
+  `events.jsonl`. Exactly two `tool_input` *values* reach the log, both
+  deliberately: `tool_input.skill` on a `Skill` call (the basis of per-skill
+  attribution, landing in the `stop` event's `skills`) and
+  `tool_input.subagent_type` on an `Agent`/`Task` call (landing in
+  `subagents`). Both are free text from the model's tool call rather than a
+  validated enum, so both are length-capped at 64 characters when recorded —
+  a bound, not a truncation anyone meets (the longest real skill name is 42).
+  Nothing else from `tool_input` reaches the event log.
+- **The local turn-state file is a separate, narrower-scoped disk surface,
+  and this guarantee does not extend to it.** While a turn is in progress,
+  `TodoWrite`/`TaskCreate` task titles (`tool_input.todos[].content` /
+  `tool_input.subject`) are also written there — up to 50 items, with no
+  per-item length cap — to drive the parallelization-check nudge. That file
+  is deleted when the turn ends and is never passed to the event-log writer,
+  so none of it reaches `events.jsonl`; the claim above is scoped to the
+  event log, not to everything `tool_input` touches on disk.
 - The salt auto-generates once at `~/.cache/skill-advisor/telemetry.salt`
   (mode `0600`) unless you pin one in `config.toml`. Wiping the salt file
   anonymises historical events.
@@ -1221,6 +1886,7 @@ Each line is one JSON object with this schema:
   "phase": "planning",
   "phase_source": "user",
   "judge_used": false,
+  "judge_failure": null,
   "picks": [
     {"rank": 1, "name": "Plan", "kind": "subagent", "score": null},
     {"rank": 2, "name": "writing-plans", "kind": "skill", "score": null}
@@ -1231,6 +1897,46 @@ Each line is one JSON object with this schema:
 `score` is `null` for lifecycle-phase picks (which come from a preference list,
 not embeddings) and the LLM judge mode (where scores aren't returned).
 `phase_source` is `"auto"` when the previous Stop handler advanced the phase.
+
+`judge_used` means the judge subprocess actually ran and returned a verdict this
+turn (declining with zero picks still counts). Before the latency fast-fail change
+it echoed `matcher.use_judge` instead — whether the judge was *configured*, not
+whether it ran — so a triage-skipped or judge-disabled turn could still claim
+`judge_used: true`. `judge_failure` names why the turn emitted no picks: one of
+`judge.py`'s `FAILURE_*` values (`no_candidates`, `cli_missing`, `timeout`,
+`subprocess_error`, `exit_nonzero`, `unparseable`, `hook_contaminated`), or
+`budget_exceeded` when the hook's own SIGALRM killed the turn. It is `null`
+whenever picks were produced normally, including when the judge deliberately
+declined.
+
+`hook_contaminated` deserves a note, because it looks like a parser problem and
+is not one. The judge runs as a nested `claude -p`, which **inherits the calling
+session's hooks**. When one fires — a `Stop` hook, say — it forces extra turns and
+the envelope's `result` becomes the nested session's reply to *that hook* instead
+of the judge's verdict. The reply is valid JSON, so parsing succeeds and the old
+code recorded `unparseable` — sending anyone reading `events.jsonl` off after a
+malformed reply or a parser gap, neither of which exists. The envelope's `num_turns` is
+the discriminator, checked before `result` is interpreted at all: every clean
+verdict measured had `num_turns == 1`, every contaminated one `> 1`, with zero
+overlap across a 250-row corpus. It was **6.4% of prompts** when measured, each
+burning the full judge round-trip for nothing. Behaviour is unchanged — still a
+judge failure, still falls back to embedding picks — only the diagnosis is honest.
+There is deliberately no retry in the hook path: a second attempt costs another
+full round-trip and `budget_seconds` would fire first, turning a fast degraded
+answer into a silent timeout. `tools/build_calibration_corpus.py` retries offline,
+where the budget does not apply.
+
+The two fields answer different questions — `judge_used` is *did the subprocess
+run and return a verdict*, `judge_failure` is *why did this turn emit nothing* —
+so they are not mutually exclusive. `judge_used: true` with
+`judge_failure: "budget_exceeded"` is a real and useful combination: the judge
+answered, then the alarm fired during the post-judge work and its verdict was
+discarded. Counting those rows is the way to tell that `budget_seconds` sits too
+close to the judge's own timeout (`budget_seconds - 0.5`); every other
+`judge_failure` value implies `judge_used: false`. Rows written before this change have no
+`judge_failure` key at all — `"judge_failure" in row` is an exact discriminator
+between the two eras, and a more reliable one than filtering by timestamp, which
+is fragile against clock skew and replayed logs.
 
 ### Disabling and wiping
 
@@ -1244,6 +1950,41 @@ rm ~/.cache/skill-advisor/advisor.events.jsonl ~/.cache/skill-advisor/telemetry.
 ```
 
 `skill-advisor uninstall` also removes both files.
+
+### The centroid sketch (`centroids.npz`)
+
+`skill-advisor rotate` needs to score a skill that has never been used — usage
+data alone can never recommend it — by measuring how well it fits the kind of
+work you actually do. Since prompts are hashed and unrecoverable everywhere
+else in this project, the advisor keeps a small **online sketch** of the
+prompt embeddings themselves at `~/.cache/skill-advisor/centroids.npz`
+instead: 8 running centroids in the same 384-dim embedding space the matcher
+already uses. Each prompt nudges its nearest centroid (or claims a free one,
+up to 8) rather than being stored.
+
+Privacy properties, each verifiable directly against the code:
+
+- **Fixed size.** 8 × 384 float32 vectors plus small bookkeeping —
+  independent of how many prompts have been observed. Measured on disk:
+  roughly 12-13 KB, and it never grows past that.
+- **No prompt text, ever.** Only the already-computed embedding vector is
+  folded in (`centroids.observe()`); the prompt string itself never reaches
+  this code path.
+- **No per-prompt vectors either.** A prompt is *merged* into its nearest
+  centroid's running average, not appended anywhere — the file holds 8
+  aggregates, never a growing list. It is a lossy summary of thousands of
+  prompts, not a record of any individual one.
+- **Gated on the same flag as the rest of telemetry.** Written only when
+  `[telemetry] events_enabled` is already `true` — a single check in the
+  `UserPromptSubmit` hook, deliberately the *only* thing that decides whether
+  this runs, so there's no second, independently-maintained flag that could
+  drift out of sync with the rest of the opt-in telemetry story.
+- **Removed by `skill-advisor uninstall`**, alongside the rest of the cache.
+
+Below `rotation.min_observed_prompts` (default 200) observed prompts, `rotate`
+refuses to run rather than score against a sketch that hasn't seen enough of
+your work to mean anything yet — see the `[rotation]` block in [Configuration
+reference](#configuration-reference).
 
 ---
 
@@ -1371,7 +2112,7 @@ Code itself uses.
 
 PRs and issues are welcome. Before opening a PR:
 
-- Run `make test` — all 261 tests should pass on Linux and macOS, Python 3.11 / 3.12.
+- Run `make test` — all 542 tests should pass on Linux and macOS, Python 3.11 / 3.12.
 - Keep changes focused. Match the existing [Conventional Commits](https://www.conventionalcommits.org/) style (`feat:`, `fix:`, `docs:`, `chore:`, …).
 - For larger features or behavioral changes, open an issue first so we can align on scope before you invest time.
 
@@ -1392,7 +2133,7 @@ uv sync --extra dev
 ### Running tests
 
 ```bash
-uv run pytest                        # 261 tests
+uv run pytest                        # 542 tests
 uv run pytest tests/test_hook.py -v  # single file
 uv run pytest --cov=skill_advisor    # with coverage
 ```
@@ -1432,28 +2173,44 @@ skill-advisor/
 │   ├── paths.py               XDG-aware path resolution (single source of truth)
 │   ├── config.py              TOML config + dataclass schema + defaults
 │   ├── builtins.py            Hardcoded subagents + slash commands
-│   ├── catalog.py             Scan SKILL.md + builtins, save/load catalog.json
+│   ├── catalog.py             Scan SKILL.md + builtins, save/load catalog.json,
+│   │                            resolve enabled/invoke_name, pool_health()
+│   ├── overrides.py           Sole owner of skillOverrides: directory-name join key,
+│   │                            merged read, atomic write, migrate/revert support
+│   ├── centroids.py           Fixed-size online sketch of prompt embeddings (rotation's
+│   │                            semantic_fit signal); knows nothing about skills
+│   ├── rotate.py              Score the rotation pool and propose promote/demote swaps;
+│   │                            pure functions, no I/O
 │   ├── index.py               fastembed embeddings + cosine top-K + hash check
 │   ├── triage.py              Cheap-prompt detector
 │   ├── judge.py               `claude -p` subprocess wrapper, JSON schema, hallucination guard
 │   ├── parallelization.py     `claude -p` detector for TodoWrite parallelizability (hallucination-guarded)
 │   ├── lifecycle.py           Phase state machine + TurnState for auto-advance
+│   ├── effort.py              Effort-level vocabulary, ordering, and classify() — the
+│   │                            resolution ladder that turns phase/judge/parallelization
+│   │                            signals into an EffortRecommendation, no new subprocess
 │   ├── matcher.py             Orchestrator: triage → lifecycle | index → (optionally) judge;
-│   │                            exposes pick_stateless() shared with `skill-advisor match`
+│   │                            exposes pick_stateless() shared with `skill-advisor match`;
+│   │                            attaches effort.classify()'s result when effort is enabled
 │   ├── telemetry.py           Opt-in event log: record/iter_events/purge_older_than
 │   ├── inject.py              Format picks + lifecycle banner into the additionalContext block
+│   ├── baseline.py            Effort nudge ledger + rolling per-session write-back window;
+│   │                            veto/cooldown state; atomic effortLevel write-back + announce
 │   ├── hook.py                Three handlers: run (UserPromptSubmit),
 │   │                            run_posttooluse, run_stop — all silent-on-error
 │   ├── install.py             Shell detection, rc editing, settings-file *merge* renderer
+│   ├── statusline.py          Generates the POSIX-sh status-line script (renderer + the
+│   │                            only sensor that can observe live effort)
 │   ├── sync.py                Bundled-skills → ~/.claude/skills copy logic
 │   └── cli.py                 argparse dispatcher: install / uninstall / build / replay /
 │                                doctor / sync-skills / lifecycle / hook /
-│                                match / report / posttooluse / stop
+│                                match / report / posttooluse / stop /
+│                                migrate-excludes / rotate
 │
 ├── tests/
 │   ├── conftest.py            Auto-use isolated_paths fixture (per-test tempdirs)
 │   ├── fixtures/              fake_claude_home/, prompts.jsonl
-│   └── test_*.py              261 tests across all modules
+│   └── test_*.py              542 tests across all modules
 │
 ├── examples/
 │   ├── config.toml            Default user config (commented)
@@ -1473,7 +2230,8 @@ Per-user state (created by the installer, not tracked in git):
 ```
 ~/.config/skill-advisor/
 ├── config.toml                 User config (edit to tune)
-└── claudeskill-settings.json       --settings file that the `claudeskill` alias passes to claude
+├── claudeskill-settings.json       --settings file that the `claudeskill` alias passes to claude
+└── statusline.sh               Generated status line (only when [effort] enabled+statusline)
 
 ~/.cache/skill-advisor/
 ├── catalog.json                Current built catalog
@@ -1482,6 +2240,12 @@ Per-user state (created by the installer, not tracked in git):
 ├── advisor.log                 Human-readable hook log
 ├── advisor.events.jsonl        Opt-in structured event log (see telemetry section)
 ├── telemetry.salt              Auto-generated SHA-256 salt (mode 0600)
+├── effort.json                 Latest recommendation (only when [effort] enabled)
+├── observed-effort.json        Live effort last seen by the status line (the sensor)
+├── baseline.json                Write-back window, history, veto/cooldown state
+├── centroids.npz                Fixed-size prompt-embedding sketch for `rotate`
+│                                  (only when [telemetry] events_enabled; see
+│                                  "The centroid sketch" under Telemetry and usage reports)
 └── sessions/
     ├── <session_id>.json       Per-session lifecycle state
     └── <session_id>.turn.json  Per-turn ephemeral tool/subagent record (auto-advance)
@@ -1502,6 +2266,15 @@ uv tool uninstall skill-advisor      # removes the CLI
 Skills copied into `~/.claude/skills/` via `sync-skills` are **not** removed by
 `uninstall` (they are indistinguishable from skills you installed by hand).
 Remove them by name if you want to.
+
+`uninstall` deletes `claudeskill-settings.json` (dropping any `effortLevel` baseline
+*and* any `skillOverrides` that `migrate-excludes` or `rotate --apply` had written
+there), plus the catalog, embeddings, log, and telemetry files. It also removes the
+effort feature's own state — `~/.cache/skill-advisor/effort.json`,
+`observed-effort.json`, `baseline.json` — and `centroids.npz`, the rotation sketch,
+and `~/.config/skill-advisor/statusline.sh`. `config.toml` — including any names
+`migrate-excludes` left behind in `exclude_names` — is kept unless `--purge-config`
+is given.
 
 ---
 

@@ -179,7 +179,7 @@ def test_pick_stateless_returns_top_k_in_score_order(isolated_paths):
 
     stub = _prime_stateless_index([0.9, 0.7, 0.5])
     with patch.object(index_mod, "_embed_model", return_value=stub):
-        picks = matcher.pick_stateless("q", Config(), top_k=3, candidates=3, threshold=0.0)
+        picks = matcher.pick_stateless("q", Config(), top_k=3, candidates=3, threshold=0.0).picks
 
     assert [p.entry.name for p in picks] == ["alpha", "beta", "gamma"]
     # Reason contains the score for embedding picks.
@@ -191,7 +191,7 @@ def test_pick_stateless_threshold_filters(isolated_paths):
 
     stub = _prime_stateless_index([0.9, 0.5, 0.2])
     with patch.object(index_mod, "_embed_model", return_value=stub):
-        picks = matcher.pick_stateless("q", Config(), top_k=3, candidates=3, threshold=0.6)
+        picks = matcher.pick_stateless("q", Config(), top_k=3, candidates=3, threshold=0.6).picks
 
     assert [p.entry.name for p in picks] == ["alpha"]
 
@@ -201,24 +201,28 @@ def test_pick_stateless_top_k_cannot_exceed_candidates(isolated_paths):
 
     stub = _prime_stateless_index([0.9, 0.7, 0.5])
     with patch.object(index_mod, "_embed_model", return_value=stub):
-        picks = matcher.pick_stateless("q", Config(), top_k=100, candidates=2, threshold=0.0)
+        picks = matcher.pick_stateless("q", Config(), top_k=100, candidates=2, threshold=0.0).picks
 
     assert len(picks) == 2
 
 
 def test_pick_stateless_force_judge_true_calls_judge(isolated_paths):
     from skill_advisor.config import Config
+    from skill_advisor.judge import JudgeResult
     from skill_advisor.judge import Pick as JudgePick
 
     stub = _prime_stateless_index([0.9, 0.7, 0.5])
     with patch.object(index_mod, "_embed_model", return_value=stub), \
          patch("skill_advisor.matcher.judge.rank") as mock_rank:
-        mock_rank.return_value = [JudgePick(name="beta", reason="because reasons")]
-        picks = matcher.pick_stateless(
+        mock_rank.return_value = JudgeResult(
+            picks=[JudgePick(name="beta", reason="because reasons")]
+        )
+        result = matcher.pick_stateless(
             "q", Config(), force_judge=True, top_k=3, candidates=3, threshold=0.0,
         )
 
     mock_rank.assert_called_once()
+    picks = result.picks
     assert [p.entry.name for p in picks] == ["beta"]
     assert picks[0].reason == "because reasons"
 
@@ -232,18 +236,109 @@ def test_pick_stateless_force_judge_false_overrides_config(isolated_paths):
          patch("skill_advisor.matcher.judge.rank") as mock_rank:
         picks = matcher.pick_stateless(
             "q", cfg_with_judge, force_judge=False, top_k=3, candidates=3, threshold=0.0,
-        )
+        ).picks
 
     mock_rank.assert_not_called()
     assert [p.entry.name for p in picks] == ["alpha", "beta", "gamma"]
+
+
+def test_pick_stateless_falls_back_to_embedding_on_hook_contamination(isolated_paths):
+    """End-to-end: a nested `claude -p` hijacked by an inherited hook must
+    still surface embedding picks, not go silent. Exercises the real
+    judge.rank() -> matcher.pick_stateless() path (subprocess.run mocked at
+    the judge module boundary), not a mocked judge.rank."""
+    import json
+
+    from skill_advisor.config import Config
+    from skill_advisor import judge
+
+    stub = _prime_stateless_index([0.9, 0.7, 0.5])
+    stdout = json.dumps(
+        {"num_turns": 5, "result": "Sure — here's a code review of your last change: ..."}
+    )
+    completed = type("R", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
+    with (
+        patch.object(index_mod, "_embed_model", return_value=stub),
+        patch("skill_advisor.judge.shutil.which", return_value="/usr/bin/claude"),
+        patch("skill_advisor.judge.subprocess.run", return_value=completed),
+    ):
+        result = matcher.pick_stateless(
+            "q", Config(), force_judge=True, top_k=3, candidates=3, threshold=0.0
+        )
+
+    assert result.judge_ran is False
+    assert result.judge_failure == judge.FAILURE_HOOK_CONTAMINATED
+    assert [p.entry.name for p in result.picks] == ["alpha", "beta", "gamma"]
+    assert all(p.reason.startswith("embedding fallback") for p in result.picks)
+
+
+def test_pick_stateless_falls_back_to_embedding_on_genuine_unparseable_reply(
+    isolated_paths,
+):
+    """Counterpart: a clean single-turn session with a malformed reply must
+    still fall back the same way, under the pre-existing failure mode."""
+    import json
+
+    from skill_advisor.config import Config
+    from skill_advisor import judge
+
+    stub = _prime_stateless_index([0.9, 0.7, 0.5])
+    stdout = json.dumps({"num_turns": 1, "result": "not json at all"})
+    completed = type("R", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
+    with (
+        patch.object(index_mod, "_embed_model", return_value=stub),
+        patch("skill_advisor.judge.shutil.which", return_value="/usr/bin/claude"),
+        patch("skill_advisor.judge.subprocess.run", return_value=completed),
+    ):
+        result = matcher.pick_stateless(
+            "q", Config(), force_judge=True, top_k=3, candidates=3, threshold=0.0
+        )
+
+    assert result.judge_ran is False
+    assert result.judge_failure == judge.FAILURE_UNPARSEABLE
+    assert [p.entry.name for p in result.picks] == ["alpha", "beta", "gamma"]
 
 
 def test_pick_stateless_no_index_returns_empty(isolated_paths):
     from skill_advisor.config import Config
 
     # No catalog.json / embeddings.npz written.
-    picks = matcher.pick_stateless("q", Config(), top_k=3, candidates=3, threshold=0.0)
-    assert picks == []
+    result = matcher.pick_stateless("q", Config(), top_k=3, candidates=3, threshold=0.0)
+    assert result.picks == []
+
+
+def test_pick_stateless_populates_trace_query_embedding(isolated_paths):
+    """Task 11 (deferred): the query vector pick_stateless already builds to
+    rank candidates must be exposed to the caller via `trace`, not just
+    discarded — so hook.py can fold it into the centroid sketch instead of
+    embedding the same prompt a second time. `PickResult`/`StatelessResult`
+    can't carry it because many `_pick_inner` branches return None or a
+    PickResult without ever calling pick_stateless."""
+    from skill_advisor.config import Config
+
+    stub = _prime_stateless_index([0.9, 0.7, 0.5])
+    trace = matcher.JudgeTrace()
+    with patch.object(index_mod, "_embed_model", return_value=stub):
+        matcher.pick_stateless("q", Config(), top_k=3, candidates=3, threshold=0.0, trace=trace)
+
+    assert trace.query_embedding is not None
+    assert trace.query_embedding.shape == (3,)
+    # The fixed stub always embeds to [1, 0, 0].
+    assert trace.query_embedding[0] == 1.0
+
+
+def test_pick_stateless_leaves_trace_query_embedding_none_when_there_is_no_index(
+    isolated_paths,
+):
+    """No catalog.json/embeddings.npz on disk -> pick_stateless returns before
+    ever computing an embedding. trace must stay at its None default, not
+    some stale/default vector."""
+    from skill_advisor.config import Config
+
+    trace = matcher.JudgeTrace()
+    matcher.pick_stateless("q", Config(), top_k=3, candidates=3, threshold=0.0, trace=trace)
+
+    assert trace.query_embedding is None
 
 
 def test_pick_stateless_parity_with_pick_on_nonlifecycle(isolated_paths):
@@ -257,7 +352,7 @@ def test_pick_stateless_parity_with_pick_on_nonlifecycle(isolated_paths):
     # the lifecycle path is never taken even though "refactor" is a trigger verb.
     prompt = "review the authentication middleware for subtle security bugs"
     with patch.object(index_mod, "_embed_model", return_value=stub):
-        stateless = matcher.pick_stateless(prompt, cfg, threshold=0.0)
+        stateless = matcher.pick_stateless(prompt, cfg, threshold=0.0).picks
         full = matcher.pick(prompt, cfg, session_id=None)
 
     assert full is not None
@@ -365,3 +460,111 @@ def test_matcher_detector_returns_none_silently_advances(monkeypatch):
     reloaded = lifecycle.load("sess-m3")
     assert reloaded is not None
     assert reloaded.phase == lifecycle.IMPLEMENTATION
+
+
+def test_judge_verdict_returned_explicitly_not_via_module_state():
+    assert not hasattr(matcher, "_LAST_JUDGE_EFFORT")
+    assert "judge_effort" in matcher.StatelessResult.__dataclass_fields__
+    assert "judge_effort" in matcher.PickResult.__dataclass_fields__
+
+
+def test_judge_timeout_falls_back_to_embedding_picks(isolated_paths):
+    """The 432-empty-timeouts bug. Must fail against today's code."""
+    from skill_advisor.config import Config
+    from skill_advisor.judge import FAILURE_TIMEOUT, JudgeResult
+
+    stub = _prime_stateless_index([0.9, 0.7, 0.5])
+    with patch.object(index_mod, "_embed_model", return_value=stub), \
+         patch("skill_advisor.matcher.judge.rank") as mock_rank:
+        mock_rank.return_value = JudgeResult(picks=[], failure=FAILURE_TIMEOUT)
+        result = matcher.pick_stateless(
+            "q", Config(), force_judge=True, top_k=3, candidates=3, threshold=0.0,
+        )
+
+    assert [p.entry.name for p in result.picks] == ["alpha", "beta", "gamma"]
+    assert result.judge_failure == FAILURE_TIMEOUT
+    assert result.judge_ran is False
+    assert "fallback" in result.picks[0].reason
+
+
+def test_judge_decline_still_returns_nothing(isolated_paths):
+    """The judge's 1,251 real declines are its value. Do not convert them to picks."""
+    from skill_advisor.config import Config
+    from skill_advisor.judge import JudgeResult
+
+    stub = _prime_stateless_index([0.9, 0.7, 0.5])
+    with patch.object(index_mod, "_embed_model", return_value=stub), \
+         patch("skill_advisor.matcher.judge.rank") as mock_rank:
+        mock_rank.return_value = JudgeResult(picks=[], failure=None)
+        result = matcher.pick_stateless(
+            "q", Config(), force_judge=True, top_k=3, candidates=3, threshold=0.0,
+        )
+
+    assert result.picks == []
+    assert result.judge_ran is True
+    assert result.judge_failure is None
+
+
+def test_fallback_respects_min_embedding_score(isolated_paths):
+    """A fallback must not surface junk the confident path would have suppressed."""
+    from skill_advisor.config import Config
+    from skill_advisor.judge import FAILURE_TIMEOUT, JudgeResult
+
+    stub = _prime_stateless_index([0.9, 0.1, 0.05])
+    with patch.object(index_mod, "_embed_model", return_value=stub), \
+         patch("skill_advisor.matcher.judge.rank") as mock_rank:
+        mock_rank.return_value = JudgeResult(picks=[], failure=FAILURE_TIMEOUT)
+        result = matcher.pick_stateless(
+            "q", Config(), force_judge=True, top_k=3, candidates=3, threshold=0.35,
+        )
+
+    assert [p.entry.name for p in result.picks] == ["alpha"]
+
+
+def test_judge_success_marks_judge_ran(isolated_paths):
+    from skill_advisor.config import Config
+    from skill_advisor.judge import JudgeResult
+    from skill_advisor.judge import Pick as JudgePick
+
+    stub = _prime_stateless_index([0.9, 0.7, 0.5])
+    with patch.object(index_mod, "_embed_model", return_value=stub), \
+         patch("skill_advisor.matcher.judge.rank") as mock_rank:
+        mock_rank.return_value = JudgeResult(picks=[JudgePick(name="beta", reason="fits")])
+        result = matcher.pick_stateless(
+            "q", Config(), force_judge=True, top_k=3, candidates=3, threshold=0.0,
+        )
+
+    assert result.judge_ran is True
+    assert result.judge_failure is None
+    assert [p.entry.name for p in result.picks] == ["beta"]
+
+
+def test_matcher_never_picks_a_disabled_skill(isolated_paths):
+    """58.6% of live picks named a skill Claude Code cannot invoke. Zero now."""
+    import numpy as np
+
+    from skill_advisor import catalog as catalog_mod
+    from skill_advisor.catalog import CatalogEntry
+    from skill_advisor.config import Config
+
+    entries = [
+        CatalogEntry(kind="skill", name="disabled-but-relevant", namespace="user",
+                     description="d", path="/s/disabled-but-relevant/SKILL.md", enabled=False),
+        CatalogEntry(kind="skill", name="enabled-alternative", namespace="user",
+                     description="d", path="/s/enabled-alternative/SKILL.md", enabled=True),
+    ]
+    emb = np.array([[1.0, 0.0], [0.7, 0.714]], dtype=np.float32)
+    catalog_mod.save(entries)
+    index_mod.save(entries, emb, "h")
+
+    class _Fixed:
+        def embed(self, texts):
+            for _ in texts:
+                yield np.array([1.0, 0.0], dtype=np.float32)
+
+    with patch.object(index_mod, "_embed_model", return_value=_Fixed()):
+        result = matcher.pick_stateless("q", Config(), top_k=2, candidates=2, threshold=0.0)
+
+    names = [p.entry.name for p in result.picks]
+    assert "disabled-but-relevant" not in names
+    assert names == ["enabled-alternative"]

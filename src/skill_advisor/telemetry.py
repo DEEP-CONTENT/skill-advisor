@@ -143,6 +143,7 @@ def record(
     phase: str = "none",
     phase_source: str = "user",
     judge_used: bool = False,
+    judge_failure: str | None = None,
     triage_skipped: bool = False,
     duration_ms: int = 0,
     config: TelemetryConfig,
@@ -183,6 +184,7 @@ def record(
         "phase": phase or "none",
         "phase_source": phase_source,
         "judge_used": bool(judge_used),
+        "judge_failure": str(judge_failure) if judge_failure else None,
         "picks": pick_records,
     }
 
@@ -194,6 +196,9 @@ def record_stop(
     session_id: str | None,
     tools: Iterable[str],
     subagents: Iterable[str],
+    skills: Iterable[str] = (),
+    tool_spans: Iterable[tuple[str, int]] = (),
+    span_anchor: str = "previous_tool",
     config: TelemetryConfig,
 ) -> None:
     """Append a `kind=stop` event with the turn's tool sequence.
@@ -215,7 +220,19 @@ def record_stop(
         "session_sha256": _hash(session_id, salt) if session_id else None,
         "tools": [str(t) for t in tools],
         "subagents": [str(s) for s in subagents],
+        "skills": [str(s) for s in skills],
     }
+
+    spans = [[str(name), int(ms)] for name, ms in tool_spans]
+    if spans:
+        event["tool_spans"] = spans
+        # "previous_tool": each span measures the interval since the PREVIOUS
+        # tool call finished, so the turn's first tool carries no span and a
+        # one-tool turn writes no `tool_spans` key at all. Constant today, but
+        # written anyway so a later anchor change (e.g. to prompt submission)
+        # is distinguishable in historical rows instead of silently redefining
+        # what a span means.
+        event["span_anchor"] = span_anchor
 
     _append_line(json.dumps(event, ensure_ascii=False) + "\n")
 

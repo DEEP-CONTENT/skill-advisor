@@ -12,8 +12,30 @@ import threading
 import time
 from typing import Any
 
-from . import inject, lifecycle, matcher, paths, telemetry, triage
-from .config import load as load_config
+from . import baseline, centroids, effort, inject, judge, lifecycle, matcher, paths, telemetry, triage
+from . import index as index_mod
+from .config import Config, load as load_config
+
+
+class _BudgetExceeded(Exception):
+    pass
+
+
+def alarm_seconds(cfg: Config) -> int:
+    """Whole-hook wall-clock budget, in whole seconds.
+
+    Must stay strictly greater than judge.rank()'s own subprocess timeout
+    (`max(cfg.matcher.budget_seconds - 0.5, 0.5)`, judge.py:106-110) — otherwise
+    the budget kills the hook before matcher.py's embedding fallback ever runs.
+    A named function (rather than an inline expression) so tests can pin the
+    ordering against the real formula instead of a restated copy of it.
+
+    Named for the SIGALRM it originally armed. The enforcement mechanism is now
+    a `Thread.join(timeout=...)` because `signal.SIGALRM` is POSIX-only and this
+    tool has to run on Windows; the FORMULA and the ordering invariant it
+    encodes are unchanged, which is the part every caller and test depends on.
+    """
+    return max(int(cfg.matcher.budget_seconds + 0.5), 1)
 
 
 def _setup_logging() -> None:
@@ -36,14 +58,61 @@ def _read_input() -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _emit(text: str) -> None:
-    envelope = {
+def _emit(text: str, system_message: str | None = None) -> None:
+    envelope: dict[str, Any] = {
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": text,
         }
     }
+    if system_message:
+        envelope["systemMessage"] = system_message
     sys.stdout.write(json.dumps(envelope))
+
+
+def _nudge_message(observed: str | None, rec) -> str | None:
+    """One-line systemMessage, or None when we must stay quiet."""
+    if rec is None or not effort.should_nudge(observed, rec.level):
+        return None
+    if rec.level == effort.ULTRACODE:
+        # ultracode is a keyword, not a /effort argument — typing it trips the
+        # harness's own built-in badge.
+        return (
+            f"skill-advisor: this decomposes into parallel work ({rec.reason}) — "
+            f"consider the `ultracode` keyword. You're at {observed}."
+        )
+    return (
+        f"skill-advisor: this looks like {rec.level} work ({rec.reason}) — "
+        f"you're at {observed}.  /effort {rec.level}"
+    )
+
+
+def _emit_nudged(
+    text: str,
+    *,
+    nudge: str | None,
+    session_id: str | None,
+    observed: str | None,
+    level: str | None,
+) -> None:
+    """Emit the envelope, then consume the nudge rate-limit slot only once the
+    emit actually happened.
+
+    Consumption is tied to this single emission point rather than to any one
+    caller's branch, so a future emission site that also carries a pending
+    nudge (e.g. a no-picks-but-announcement path) stays correct by calling
+    this same helper instead of re-deriving "did this reach the user" logic.
+    If `_emit` raises, the caller's own exception handling takes over and the
+    slot is never touched — the message never reached the user.
+    """
+    _emit(text, system_message=nudge)
+    if nudge:
+        try:
+            baseline.mark_nudged(session_id, observed, level)
+        except Exception as exc:  # pragma: no cover - defensive
+            logging.getLogger("skill_advisor.hook").debug(
+                "nudge mark failed: %s", exc, exc_info=True
+            )
 
 
 def _extract_todo_titles(tool_input: dict) -> list[str]:
@@ -75,26 +144,132 @@ def run() -> int:
         return 0
 
     cfg = load_config()
-    # Cross-platform wall-clock budget: run matcher.pick in a daemon thread and
-    # join with a timeout. Works on Windows too (signal.SIGALRM is POSIX-only).
-    # The daemon thread is never joined on overrun, so the process exits promptly
+    # Cross-platform wall-clock budget: run the whole pick-and-sketch pass in a
+    # daemon thread and join with a timeout. `signal.SIGALRM` (what upstream
+    # arms here) is POSIX-only and raises AttributeError on Windows. The daemon
+    # thread is never joined on overrun, so the process still exits promptly
     # even if the matcher keeps computing in the background.
-    budget = max(cfg.matcher.budget_seconds, 0.5)
+    budget = alarm_seconds(cfg)
+    # Created before the worker starts: it costs nothing, and it must already
+    # exist before anything below can raise so any handler that wants to read
+    # or annotate it — like the budget-exceeded branch below — finds a live
+    # object, not a NameError.
+    trace = matcher.JudgeTrace()
 
     container: dict[str, Any] = {}
 
     def _worker(out: dict[str, Any]) -> None:
         try:
-            out["result"] = matcher.pick(prompt, cfg, session_id=session_id)
-        except Exception as exc:  # pragma: no cover - defensive (re-raised path below)
+            # `result` lands in the container BEFORE the sketch update below.
+            # That ordering is what lets the timeout branch distinguish "the
+            # matcher never answered" from "the matcher answered and only the
+            # sketch update is still running" — the same distinction upstream
+            # draws with its inner/outer `except _BudgetExceeded` split.
+            out["result"] = matcher.pick(
+                prompt, cfg, session_id=session_id, trace=trace
+            )
+
+            # Fold this prompt into the centroid sketch (Task 10) so rotation can
+            # score skills that have never been used. Must run INSIDE the budget
+            # window — embed_one() builds a fastembed model with no bound on
+            # construction/inference time, so an unguarded call after the window
+            # can hang the hook well past budget_seconds. Running it here, in the
+            # same worker, is the thread-based equivalent of upstream keeping it
+            # before the `finally` that disarms the alarm.
+            # An overrun DURING this update is not "budget exceeded": pick()
+            # already succeeded, so the branch below emits the picks and simply
+            # abandons the sketch write, matching upstream's inner-except.
+            # Two gates: cfg.telemetry.events_enabled (the privacy claim — no
+            # prompt text, no per-prompt vectors ever stored — holds by
+            # construction, since this is the only check that decides whether
+            # anything is embedded), AND triage.should_skip(). matcher.pick()
+            # already returns early for a triage-skipped prompt outside an
+            # active lifecycle ("ok"/"yes"/"go", slash commands, ...) without
+            # ever touching the index — but until this second gate was added,
+            # the sketch update below ran anyway, unconditionally, for that same
+            # class of prompt. Two harms: a latency regression on the path that
+            # exists specifically to be near-free (README promises ~0 ms for
+            # triage-skipped prompts), and sketch pollution — with only 8
+            # centroid slots (SEED_SIMILARITY=0.9), a trivial acknowledgement is
+            # dissimilar enough from real work to claim one of them outright and
+            # then accumulate count, making it sticky. The one signal able to
+            # score a never-used skill was losing capacity to chit-chat.
+            if cfg.telemetry.events_enabled and not triage.should_skip(prompt, cfg):
+                try:
+                    sketch = centroids.load(k=cfg.rotation.centroid_count)
+                    # Task 11 (deferred): reuse the query embedding matcher.pick()
+                    # already computed for scoring — threaded out via
+                    # JudgeTrace.query_embedding since _pick_inner has many
+                    # branches that return without ever building a PickResult
+                    # carrying it. Only branches that actually ran the stateless
+                    # matcher (pick_stateless -> index_mod.embed_and_rank) set it;
+                    # every other branch (phase picks, parallelization, a
+                    # lifecycle signal handled without falling back to the
+                    # matcher, ...) leaves it None, so this falls back to the
+                    # original unconditional embed_one() call exactly as before.
+                    vec = (
+                        trace.query_embedding
+                        if trace.query_embedding is not None
+                        else index_mod.embed_one(prompt)
+                    )
+                    centroids.observe(sketch, vec)
+                    centroids.save(sketch)
+                except Exception as exc:  # pragma: no cover - defensive; hooks never raise
+                    log.debug("centroid update failed: %s", exc, exc_info=True)
+        except Exception as exc:  # pragma: no cover - defensive (handled below)
             out["error"] = exc
 
     worker = threading.Thread(target=_worker, args=(container,), daemon=True)
     worker.start()
     worker.join(timeout=budget)
 
-    if worker.is_alive():
-        log.info("budget exceeded after %.2fs; falling back silent", time.monotonic() - started)
+    # Two ways the budget can be exceeded, and both must land here:
+    #   * the worker is STILL RUNNING and has produced no result — the join
+    #     timed out on a matcher that overran;
+    #   * the worker raised `_BudgetExceeded` — the matcher (or anything it
+    #     calls) signalled the overrun itself rather than by wall-clock.
+    # Only the second survives the port off SIGALRM as an exception, and it
+    # must NOT fall through to the generic "hook exception" branch below:
+    # that branch writes no telemetry, which is precisely the invisibility
+    # this row exists to prevent.
+    # A worker still running WITH a result in hand is the third case: only
+    # the sketch update is outstanding, so fall through and emit the picks,
+    # abandoning the daemon thread.
+    overran = worker.is_alive() and "result" not in container
+    overran = overran or isinstance(container.get("error"), _BudgetExceeded)
+    if overran:
+        duration = time.monotonic() - started
+        log.info("budget exceeded after %.2fs; falling back silent", duration)
+        # The kill is otherwise invisible in events.jsonl — no row at all,
+        # indistinguishable from a hook that never fired. Record one, marked
+        # distinctly, so it's countable. Must not itself raise: this is a hook
+        # path and hook paths are silent on error.
+        if cfg.telemetry.events_enabled:
+            try:
+                # Only `failure` is stamped — `trace.ran` is left as the matcher
+                # set it. The budget can expire AFTER the judge answered (during
+                # post-judge work in matcher.pick()), and `judge_used: true`
+                # alongside `judge_failure: "budget_exceeded"` is the intended
+                # record of exactly that: a completed verdict thrown away.
+                # Forcing `ran` false here would tidy the row at the cost of the
+                # only signal that budget_seconds sits too close to the judge's
+                # own timeout. See test_budget_exceeded_after_a_completed_judge_
+                # keeps_both_facts.
+                trace.failure = judge.FAILURE_BUDGET_EXCEEDED
+                telemetry.record(
+                    prompt=prompt,
+                    session_id=session_id,
+                    picks=[],
+                    phase="none",
+                    phase_source="user",
+                    judge_used=trace.ran,
+                    judge_failure=trace.failure,
+                    triage_skipped=triage.should_skip(prompt, cfg),
+                    duration_ms=int(duration * 1000),
+                    config=cfg.telemetry,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                log.debug("budget-exceeded telemetry record failed: %s", exc, exc_info=True)
         return 0
 
     if "error" in container:  # pragma: no cover - defensive
@@ -107,11 +282,78 @@ def run() -> int:
     phase = result.state.phase if (result and result.state) else "none"
     picks = result.picks if result else []
 
+    rec = result.effort if result else None
+    nudge = None
+    observed = None
+    if cfg.effort.enabled and rec is not None:
+        try:
+            effort.write_recommendation(rec, session_id=session_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("effort write failed: %s", exc, exc_info=True)
+        try:
+            obs_session, observed = effort.read_observed()
+            if cfg.effort.nudge and obs_session == session_id:
+                candidate = _nudge_message(observed, rec)
+                # Check only — do NOT consume the slot here. It must not
+                # be spent until we know the message actually reached the
+                # user (see `_emit_nudged`); otherwise a turn that never
+                # emits (empty picks) or fails mid-emit silently burns the
+                # one shot this session gets for this (observed, level)
+                # pair, and the user is never told.
+                if candidate and not baseline.was_nudged(session_id, observed, rec.level):
+                    nudge = candidate
+            if observed and obs_session == session_id:
+                try:
+                    baseline.note_observation(session_id, observed, cfg)
+                except Exception as exc:  # pragma: no cover - defensive
+                    log.debug("baseline observation failed: %s", exc, exc_info=True)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("nudge computation failed: %s", exc, exc_info=True)
+            nudge = None
+            observed = None
+        try:
+            baseline.record(session_id or "", rec.level)
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("baseline record failed: %s", exc, exc_info=True)
+
+    # A baseline write on a previous session's Stop leaves a one-shot
+    # announcement pending. Consume it here, on the first prompt after the
+    # write, and prepend it to any pending nudge so a single systemMessage
+    # carries both. `announcement` (not the merged `nudge`) is what gates the
+    # no-picks branch below — an ordinary effort nudge with no picks must
+    # stay silent (there's nothing to attach it to), but an announcement is
+    # its own message and must get through regardless of picks.
+    announcement = None
+    if cfg.effort.enabled:
+        try:
+            announcement = baseline.take_announcement()
+        except Exception:  # pragma: no cover - defensive
+            announcement = None
+        if announcement:
+            nudge = f"{announcement}\n{nudge}" if nudge else announcement
+
     if result is None or not result.picks:
+        if announcement:
+            try:
+                _emit_nudged(
+                    "",
+                    nudge=nudge,
+                    session_id=session_id,
+                    observed=observed,
+                    level=rec.level if rec else None,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                log.warning("emit failed: %s", exc, exc_info=True)
         log.debug("no picks for prompt (%.2fs)", duration)
     else:
         try:
-            _emit(inject.format(result))
+            _emit_nudged(
+                inject.format(result),
+                nudge=nudge,
+                session_id=session_id,
+                observed=observed,
+                level=rec.level if rec else None,
+            )
         except Exception as exc:  # pragma: no cover - defensive
             log.warning("emit failed: %s", exc, exc_info=True)
             return 0
@@ -131,7 +373,8 @@ def run() -> int:
                 picks=picks,
                 phase=phase,
                 phase_source="user",
-                judge_used=cfg.matcher.use_judge,
+                judge_used=trace.ran,
+                judge_failure=trace.failure,
                 triage_skipped=triage.should_skip(prompt, cfg),
                 duration_ms=int(duration * 1000),
                 config=cfg.telemetry,
@@ -168,14 +411,18 @@ def run_posttooluse() -> int:
         return 0
 
     subagent_type = None
+    skill_name = None
     tool_input = event.get("tool_input") or {}
     if isinstance(tool_input, dict):
         raw_subagent = tool_input.get("subagent_type")
         if raw_subagent is not None:
             subagent_type = str(raw_subagent).strip() or None
+        raw_skill = tool_input.get("skill")
+        if raw_skill is not None:
+            skill_name = str(raw_skill).strip() or None
 
     try:
-        lifecycle.record_tool(session_id, tool_name, subagent_type=subagent_type)
+        lifecycle.record_tool(session_id, tool_name, subagent_type=subagent_type, skill_name=skill_name)
     except Exception as exc:  # pragma: no cover - defensive
         log.debug("posttooluse record failed: %s", exc, exc_info=True)
 
@@ -224,24 +471,63 @@ def run_stop() -> int:
         log.debug("stop turn cleanup failed: %s", exc, exc_info=True)
         return 0
 
-    if turn is None:
-        return 0
-
     try:
         cfg = load_config()
     except Exception as exc:  # pragma: no cover - defensive
         log.debug("stop config load failed: %s", exc, exc_info=True)
         return 0
 
+    # Effort baseline finalisation: tallies/window/write-back are session-level
+    # bookkeeping, independent of lifecycle turn-tracking. A turn that used no
+    # tools at all (turn is None — e.g. a plain conversational reply) still
+    # deserves this pass, so it runs before the turn-is-None short-circuit
+    # below. Wrapped defensively: run_stop must always return 0.
+    if cfg.effort.enabled:
+        try:
+            baseline.finalise_session(session_id)
+            baseline.decrement_cooldown(session_id)
+            baseline.maybe_write(cfg, launch_level=baseline.first_observation(session_id))
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("baseline finalise failed: %s", exc, exc_info=True)
+
+    if turn is None:
+        return 0
+
     # Stop-event telemetry runs regardless of lifecycle config — it's how the
     # report correlates picks with downstream Skill invocations to compute
     # ingestion rate. Lifecycle auto-advance is a separate concern below.
     if cfg.telemetry.events_enabled:
+        # Its OWN try, nested inside the telemetry block: a span computation
+        # that raises (a torn turn file can hold `Infinity`, and json.loads
+        # accepts it) must cost only the spans, never the whole stop event.
+        spans: list[tuple[str, int]] = []
+        try:
+            # Marks are index-parallel to tool_names. A desync means a torn write —
+            # emit no spans rather than guessing an alignment.
+            if len(turn.tool_marks) == len(turn.tool_names):
+                # A span is "time since the PREVIOUS tool call finished", so it
+                # starts at index 1: the first tool of a turn has no predecessor
+                # and gets no span at all. Anchoring it on `turn.turn_started_at`
+                # instead charged it a structural 0 ms on every real turn —
+                # `record_tool` sets `turn_started_at` and appends
+                # `tool_marks[0]` two statements apart, so they are the same
+                # instant. A one-tool turn therefore emits nothing and honestly
+                # drops out of span coverage.
+                for i in range(1, len(turn.tool_names)):
+                    delta = turn.tool_marks[i] - turn.tool_marks[i - 1]
+                    # Clamp: a clock adjustment mid-turn must never yield a negative.
+                    spans.append((turn.tool_names[i], max(0, int(delta * 1000))))
+        except Exception as exc:  # pragma: no cover - defensive
+            log.debug("stop span computation failed: %s", exc, exc_info=True)
+            spans = []
+
         try:
             telemetry.record_stop(
                 session_id=session_id,
                 tools=turn.tool_names,
                 subagents=turn.subagents_invoked,
+                skills=turn.skills_invoked,
+                tool_spans=spans,
                 config=cfg.telemetry,
             )
         except Exception as exc:

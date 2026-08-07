@@ -114,7 +114,69 @@ to complete, `"cancel"` to stop. See the
 [Lifecycle mode](README.md#lifecycle-mode) section of the README for the full
 flow, phase preferences, and inspection commands (`skill-advisor lifecycle status`).
 
-## 6. Keeping the catalog fresh
+## 6. Optional: effort signalling
+
+Off by default. When enabled, the advisor recommends a reasoning-effort level per
+prompt, shows it (plus your live setting) in the Claude Code status line, and can
+nudge or gently write back your launch-time default when the two keep disagreeing.
+It cannot set effort directly — Claude Code keeps that in AppState, which hooks
+can't write — so this is recommend/display/tune, not control.
+
+> **If your `--settings` file isn't named `claudeskill-settings.json`:** set
+> `SKILL_ADVISOR_SETTINGS_FILE` to its full path first. The status line
+> registration and the write-back below both target `paths.settings_file()`
+> (default: `~/.config/skill-advisor/claudeskill-settings.json`) — if that's
+> not the file you actually pass to `claude --settings`, both features run,
+> report success, and write into a file Claude Code never reads. No error,
+> no warning; it just silently does nothing. See the environment-variables
+> table in the [Configuration reference](README.md#configuration-reference)
+> section of the README for details.
+
+1. **Install `jq`.** The generated status line script shells out to it; without it
+   the script exits 0 with empty output (silent, not broken).
+
+   ```bash
+   which jq || sudo apt install jq   # or: brew install jq
+   ```
+
+2. **Turn it on** in `~/.config/skill-advisor/config.toml`:
+
+   ```toml
+   [effort]
+   enabled = true
+   ```
+
+3. **Re-run the installer — this step is required:**
+
+   ```bash
+   skill-advisor install
+   ```
+
+   Flipping `enabled = true` in `config.toml` alone does **not** register the
+   status line. The `statusLine` key in `claudeskill-settings.json` is only
+   written when `install` runs with `[effort] enabled = true` (and
+   `statusline = true`, the default) already in effect. Skip this step and
+   you'll enable the feature, see nothing change, and reasonably conclude it's
+   broken — it isn't, the settings file just hasn't been touched yet. See
+   `examples/claudeskill-settings.json` for what the rendered `statusLine` entry
+   looks like (the path shown there is an illustrative placeholder — `install`
+   writes your actual absolute path to `~/.config/skill-advisor/statusline.sh`).
+
+4. **Restart `claudeskill`** (exit and relaunch, or open a new shell) so the
+   updated settings file is picked up.
+
+5. **Verify:**
+
+   ```bash
+   skill-advisor doctor
+   ```
+
+   With the feature on, `doctor` prints extra lines for `jq`, `statusline`, and
+   `effort state`. See [Effort signalling](README.md#effort-signalling) in the
+   README for the full mechanism, the status-line format, and troubleshooting
+   beyond "nothing shows up."
+
+## 7. Keeping the catalog fresh
 
 After installing or removing skills:
 
@@ -124,7 +186,7 @@ skill-advisor build
 
 The rebuild is a no-op if the source-file mtimes haven't changed.
 
-## 7. Uninstall
+## 8. Uninstall
 
 ```bash
 skill-advisor uninstall          # keeps config.toml

@@ -1,10 +1,11 @@
 """Catalog of skills, subagents, and slash commands available to the advisor."""
+
 from __future__ import annotations
 
 import hashlib
 import json
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Iterable
 
@@ -12,6 +13,7 @@ import yaml
 
 from . import builtins as builtin_entries
 from . import manifest as manifest_loader
+from . import overrides
 from . import paths
 from .config import Config, load as load_config
 
@@ -40,18 +42,30 @@ _REVIEWERS_SUBDIR = "reviewers"
 
 @dataclass(frozen=True)
 class CatalogEntry:
-    kind: str         # "skill" | "subagent" | "command"
+    kind: str  # "skill" | "subagent" | "command"
     name: str
-    namespace: str    # "user" | "plugin:<name>" | "builtin"
+    namespace: str  # "user" | "plugin:<name>" | "builtin"
     description: str
-    path: str = ""    # SKILL.md path for skills; "" for builtins
+    path: str = ""  # SKILL.md path for skills; "" for builtins
+    enabled: bool = True  # resolved from skillOverrides at scan time
+    invoke_name: str = ""  # what the Skill tool accepts; "" ⟹ same as `name`
 
     def to_json(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_json(cls, data: dict) -> "CatalogEntry":
-        return cls(**data)
+        """Construct from a saved catalog.json entry, tolerating schema drift.
+
+        A newer binary can write fields an older installed CatalogEntry
+        doesn't know about (e.g. `enabled`, `invoke_name` were added after
+        the first release). Filter to this dataclass's own field names so a
+        forward-compatible cache never bricks an older binary with a
+        TypeError — but still raise if a field with no default (genuine
+        corruption) is missing.
+        """
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
 
     def embed_text(self) -> str:
         return f"{self.name}: {self.description}"
@@ -74,7 +88,9 @@ def parse_frontmatter(path: Path) -> dict | None:
     return data
 
 
-def _entries_from_skill_file(skill_md: Path, namespace: str) -> CatalogEntry | None:
+def _entries_from_skill_file(
+    skill_md: Path, namespace: str, table: dict[str, str]
+) -> CatalogEntry | None:
     fm = parse_frontmatter(skill_md)
     if not fm:
         return None
@@ -82,12 +98,25 @@ def _entries_from_skill_file(skill_md: Path, namespace: str) -> CatalogEntry | N
     description = fm.get("description")
     if not name or not description:
         return None
+    name = str(name).strip()
+    path = str(skill_md)
+    # Computed once and handed to both calls below — override_key() and
+    # invoke_name() each independently derive Path(path).parent.name, and
+    # this is the one call site that needs both for the same path.
+    dir_name = overrides.dir_name_for(path)
+    key = overrides.override_key(
+        kind="skill", namespace=namespace, path=path, name=name, dir_name=dir_name
+    )
     return CatalogEntry(
         kind="skill",
-        name=str(name).strip(),
+        name=name,
         namespace=namespace,
         description=str(description).strip(),
-        path=str(skill_md),
+        path=path,
+        enabled=overrides.is_enabled(key, table),
+        invoke_name=overrides.invoke_name(
+            kind="skill", namespace=namespace, path=path, name=name, dir_name=dir_name
+        ),
     )
 
 
@@ -184,17 +213,19 @@ def _scan_md_commands(root: Path) -> Iterable[CatalogEntry]:
             yield entry
 
 
-def _scan_user_skills(root: Path) -> Iterable[CatalogEntry]:
+def _scan_user_skills(root: Path, table: dict[str, str]) -> Iterable[CatalogEntry]:
     if not root.is_dir():
         return
     for skill_md in sorted(root.glob("*/SKILL.md")):
-        entry = _entries_from_skill_file(skill_md, namespace="user")
+        entry = _entries_from_skill_file(skill_md, namespace="user", table=table)
         if entry:
             yield entry
 
 
 def _scan_plugin_skills(
-    root: Path, plugin_whitelist: tuple[str, ...] | None = None
+    root: Path,
+    table: dict[str, str],
+    plugin_whitelist: tuple[str, ...] | None = None,
 ) -> Iterable[CatalogEntry]:
     """Scan a plugin marketplaces root for SKILL.md files.
 
@@ -212,17 +243,91 @@ def _scan_plugin_skills(
             plugin_name = "unknown"
         if plugin_whitelist is not None and plugin_name not in plugin_whitelist:
             continue
-        entry = _entries_from_skill_file(skill_md, namespace=f"plugin:{plugin_name}")
+        entry = _entries_from_skill_file(
+            skill_md, namespace=f"plugin:{plugin_name}", table=table
+        )
         if entry:
             yield entry
 
 
-def _scan_extra_root(root: Path) -> Iterable[CatalogEntry]:
+def _version_sort_key(version: str) -> tuple:
+    """Comparable key for a dotted version string, e.g. "10.2.0" > "9.0.0".
+
+    `sorted()`/`max()` on the raw path strings compares lexicographically,
+    which ranks "10.0.0" below "9.0.0" (and, more subtly, before "6.2.0")
+    because it compares character-by-character rather than component-by-
+    component. Each dot-separated segment is wrapped as `(0, int)` when
+    numeric or `(1, str)` otherwise, so every key is uniformly comparable
+    (numeric segments always sort before non-numeric ones at the same
+    position) without raising on an unexpected pre-release-style segment
+    like "6.2.0-beta".
+    """
+    key: list[tuple[int, int | str]] = []
+    for part in version.split("."):
+        key.append((0, int(part)) if part.isdigit() else (1, part))
+    return tuple(key)
+
+
+def _scan_plugin_cache_skills(
+    root: Path,
+    table: dict[str, str],
+    plugin_whitelist: tuple[str, ...] | None = None,
+) -> Iterable[CatalogEntry]:
+    """Installed-plugin layout: <marketplace>/<plugin>/<version>/skills/<skill>/SKILL.md.
+
+    Distinct from `plugins/marketplaces/`, which is the *catalogue* of available
+    plugins. The cache is what is actually installed and invocable, and it
+    interposes a version segment — so the marketplaces glob misses it entirely.
+
+    `plugin_whitelist` is the same Tri-State gate `_scan_plugin_skills` applies
+    (see `manifest.ManifestFilter`): ``None`` scans every plugin, a tuple gates
+    to those plugin names, and an empty tuple therefore yields nothing. Applied
+    BEFORE the version tournament so a gated-out plugin never competes.
+
+    When multiple versions of the same plugin skill are installed side by
+    side, the highest version wins. This is decided HERE, by tracking the
+    best `(plugin_name, skill_dir_name)` seen so far, rather than relying on
+    `catalog.scan()`'s `_accept()` dedup (which keeps whichever entry it saw
+    *first* — previously whatever `sorted()` on the raw glob happened to
+    yield first, i.e. the LOWEST version string).
+    """
+    if not root.is_dir():
+        return
+    best: dict[tuple[str, str], tuple[tuple, Path]] = {}
+    for skill_md in root.glob("*/*/*/skills/*/SKILL.md"):
+        try:
+            plugin_name = skill_md.parents[3].name
+            version = skill_md.parents[2].name
+        except IndexError:
+            plugin_name = "unknown"
+            version = ""
+        if plugin_whitelist is not None and plugin_name not in plugin_whitelist:
+            continue
+        key = (plugin_name, skill_md.parent.name)
+        vkey = _version_sort_key(version)
+        current = best.get(key)
+        if current is None or vkey > current[0]:
+            best[key] = (vkey, skill_md)
+
+    # Sorted by path for a deterministic scan order (matches every other
+    # scanner here) — the version comparison above already picked the
+    # winner per (plugin, skill dir); this only orders the winners.
+    for _vkey, skill_md in sorted(best.values(), key=lambda item: str(item[1])):
+        try:
+            plugin_name = skill_md.parents[3].name
+        except IndexError:
+            plugin_name = "unknown"
+        entry = _entries_from_skill_file(skill_md, f"plugin:{plugin_name}", table)
+        if entry:
+            yield entry
+
+
+def _scan_extra_root(root: Path, table: dict[str, str]) -> Iterable[CatalogEntry]:
     if not root.is_dir():
         return
     # Accept either a flat skills/<name>/SKILL.md layout or a single SKILL.md file.
     for skill_md in sorted(root.rglob("SKILL.md")):
-        entry = _entries_from_skill_file(skill_md, namespace="extra")
+        entry = _entries_from_skill_file(skill_md, namespace="extra", table=table)
         if entry:
             yield entry
 
@@ -244,8 +349,13 @@ def _builtin_entries() -> Iterable[CatalogEntry]:
         )
 
 
-def scan(config: Config | None = None) -> list[CatalogEntry]:
+def scan(
+    config: Config | None = None,
+    *,
+    overrides_table: dict[str, str] | None = None,
+) -> list[CatalogEntry]:
     cfg = config or load_config()
+    table = overrides_table if overrides_table is not None else overrides.read()
 
     # The manifest (when configured) is the structural SSoT for exclusions and
     # plugin gating; it loads fail-soft to a neutral filter, so an unset/broken
@@ -266,9 +376,14 @@ def scan(config: Config | None = None) -> list[CatalogEntry]:
     out: list[CatalogEntry] = []
 
     def _accept(entry: CatalogEntry) -> None:
-        if _norm_name(entry.name) in exclude:
+        # Exclusion and dedup both key on the INVOCABLE name (what the Skill
+        # tool accepts), not the frontmatter name — they differ whenever a
+        # skill's directory disagrees with its `name:`. Normalised on top so a
+        # bare `loop` and a slash-prefixed `/loop` still exclude each other.
+        invocable = entry.invoke_name or entry.name
+        if _norm_name(invocable) in exclude:
             return
-        key = (entry.kind, entry.name)
+        key = (entry.kind, invocable)
         if key in seen:
             return
         seen.add(key)
@@ -276,13 +391,22 @@ def scan(config: Config | None = None) -> list[CatalogEntry]:
 
     # skill_roots() returns an ordered list of candidate roots — primary
     # Claude home first, then ~/.claude fallback if primary differs. Each root
-    # is either a skills/ dir or a plugins/marketplaces dir; detect by name.
+    # is either a skills/ dir, a plugins/marketplaces dir, or a plugins/cache dir;
+    # detect by name.
     for root in paths.skill_roots():
         if root.name == "skills":
-            for entry in _scan_user_skills(root):
+            for entry in _scan_user_skills(root, table):
                 _accept(entry)
         elif root.name == "marketplaces":
-            for entry in _scan_plugin_skills(root, plugin_whitelist):
+            for entry in _scan_plugin_skills(root, table, plugin_whitelist):
+                _accept(entry)
+        elif root.name == "cache":
+            # The whitelist gates this root too. The installed-plugin cache is a
+            # SECOND channel for the same plugin skills the marketplaces root
+            # already gates; leaving it ungated would let every installed plugin
+            # in through the back door and silently void the manifest's
+            # `plugin_whitelist` the moment upstream added this scanner.
+            for entry in _scan_plugin_cache_skills(root, table, plugin_whitelist):
                 _accept(entry)
 
     for root in paths.agent_roots():
@@ -294,7 +418,7 @@ def scan(config: Config | None = None) -> list[CatalogEntry]:
             _accept(entry)
 
     for extra in cfg.catalog.extra_roots:
-        for entry in _scan_extra_root(Path(extra).expanduser()):
+        for entry in _scan_extra_root(Path(extra).expanduser(), table):
             _accept(entry)
 
     for entry in _builtin_entries():
@@ -313,6 +437,8 @@ def compute_hash(entries: list[CatalogEntry]) -> str:
         h.update(e.kind.encode())
         h.update(b"\x00")
         h.update(e.name.encode())
+        h.update(b"\x00")
+        h.update(b"1" if e.enabled else b"0")
         h.update(b"\x00")
         if e.path:
             try:
@@ -342,3 +468,40 @@ def load(source: Path | None = None) -> list[CatalogEntry]:
         raise FileNotFoundError(f"catalog not built yet; expected {src}")
     data = json.loads(src.read_text(encoding="utf-8"))
     return [CatalogEntry.from_json(item) for item in data]
+
+
+def pool_health(
+    config: Config | None = None,
+    *,
+    overrides_table: dict[str, str] | None = None,
+) -> dict:
+    """Counts for `doctor`: how much of the disk the scanner can actually see.
+
+    About ~20% of SKILL.md files carry no parseable YAML frontmatter and are
+    silently invisible. Reporting that is deliberate — the files belong to
+    third-party skill libraries and fixing them is out of scope, but a rotation
+    pool that silently excludes a fifth of the disk should say so.
+    """
+    cfg = config or load_config()
+    table = overrides_table if overrides_table is not None else overrides.read()
+    files = 0
+    unparseable_dirs: list[str] = []
+    for root in paths.skill_roots():
+        for skill_md in root.rglob("SKILL.md"):
+            files += 1
+            fm = parse_frontmatter(skill_md)
+            if not fm or not fm.get("name") or not fm.get("description"):
+                unparseable_dirs.append(skill_md.parent.name)
+    unparseable_count = len(unparseable_dirs)
+    entries = scan(cfg, overrides_table=table)
+    off_keys = {k for k, v in table.items() if v.strip().lower() == overrides.OFF}
+    excluded = set(cfg.catalog.exclude_names)
+    return {
+        "skill_md_files": files,
+        "parseable": files - unparseable_count,
+        "unparseable_count": unparseable_count,
+        "unparseable_dirs": sorted(set(unparseable_dirs)),
+        "pool": len(entries),
+        "pickable": sum(1 for e in entries if e.enabled),
+        "excluded_but_enabled": sorted(excluded - off_keys),
+    }

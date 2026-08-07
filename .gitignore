@@ -27,3 +27,7 @@ htmlcov/
 
 # Per-project Claude Code local settings (machine-specific permissions, etc.).
 .claude/settings.local.json
+
+# Judge-escalation calibration corpus. Hashes prompts only, but is a local
+# scratch artifact by design — never intended to be committed.
+/tmp-calibration/

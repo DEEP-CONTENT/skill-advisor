@@ -398,19 +398,60 @@ def pick_candidates_for_phase(
     catalog: Iterable[CatalogEntry],
     limit: int = 3,
     config: LifecycleConfig | None = None,
+    *,
+    pickable_only: bool = True,
 ) -> list[CatalogEntry]:
-    """Pick preferred catalog entries for a phase, honoring config overrides."""
+    """Pick preferred catalog entries for a phase, honoring config overrides.
+
+    Disabled skills are skipped rather than consuming a slot, so the ordered
+    preference list falls through to the next enabled alternative — which is
+    what the list was always for. Measured 2026-07-29: without this filter the
+    PLANNING list stopped at `plan-writing` (disabled) and never reached
+    `brainstorming`, producing 490 un-invocable recommendations.
+
+    Looked up by invocable identity (`invoke_name or name`), matching how
+    `PHASE_CANDIDATES` itself spells plugin entries (namespaced,
+    `<plugin>:<dir>`, e.g. "superpowers:brainstorming") and matching
+    `catalog._accept()`'s own dedup key. Keying on `entry.name` — the
+    frontmatter `name:` — instead broke both directions: a namespaced
+    preference could never match, because no catalog entry's frontmatter
+    `name:` is ever namespaced; and a *bare* preference (e.g.
+    "brainstorming") collided across namespaces whenever a user skill and a
+    plugin skill share a frontmatter name, since plugin-cache roots are
+    scanned after skills/ — the dict comprehension's last-wins semantics
+    silently resolved the bare preference to the plugin entry, whose
+    `enabled` is always True regardless of what the user actually muted.
+    `seen` is tracked by the same invocable identity, not `entry.name`, for
+    the same reason: two DIFFERENT entries (a user skill and a plugin skill)
+    can share a frontmatter name while being distinct, independently
+    pickable catalog entries.
+
+    Deliberately NOT cross-matching a bare preference to a namespaced entry
+    or vice versa — `PHASE_CANDIDATES` already lists both spellings as
+    separate, explicitly-ordered preferences wherever that fallback matters
+    (see PLANNING's "brainstorming" / "superpowers:brainstorming" pair), so
+    implicit cross-matching would just reintroduce the same collision this
+    fixes.
+    """
     prefs = _resolve_phase_prefs(phase, config)
-    by_name: dict[str, CatalogEntry] = {e.name: e for e in catalog}
+    by_invocable: dict[str, CatalogEntry] = {
+        (e.invoke_name or e.name): e for e in catalog
+    }
     picks: list[CatalogEntry] = []
     seen: set[str] = set()
     for kind, name in prefs:
-        entry = by_name.get(name)
-        if entry and entry.kind == kind and entry.name not in seen:
-            picks.append(entry)
-            seen.add(entry.name)
-            if len(picks) >= limit:
-                break
+        entry = by_invocable.get(name)
+        if entry is None or entry.kind != kind:
+            continue
+        invocable = entry.invoke_name or entry.name
+        if invocable in seen:
+            continue
+        if pickable_only and not entry.enabled:
+            continue
+        picks.append(entry)
+        seen.add(invocable)
+        if len(picks) >= limit:
+            break
     return picks
 
 
@@ -430,7 +471,13 @@ class TurnState:
     session_id: str
     turn_started_at: float = field(default_factory=time.time)
     tool_names: list[str] = field(default_factory=list)
+    # One epoch-second mark per tool call, index-parallel to `tool_names`.
+    # Written here rather than derived later because PostToolUse is the only
+    # place that knows when a call finished. Raw on purpose: the idle threshold
+    # is applied at read time by bleed.py, so it stays retroactively tunable.
+    tool_marks: list[float] = field(default_factory=list)
     subagents_invoked: list[str] = field(default_factory=list)
+    skills_invoked: list[str] = field(default_factory=list)
     todo_write: dict | None = None  # {"count": int, "titles": list[str]} or None
 
     def to_json(self) -> dict:
@@ -442,7 +489,9 @@ class TurnState:
             session_id=str(data.get("session_id") or ""),
             turn_started_at=float(data.get("turn_started_at") or time.time()),
             tool_names=list(data.get("tool_names") or []),
+            tool_marks=[float(m) for m in (data.get("tool_marks") or [])],
             subagents_invoked=list(data.get("subagents_invoked") or []),
+            skills_invoked=list(data.get("skills_invoked") or []),
             todo_write=data.get("todo_write") if isinstance(data.get("todo_write"), dict) else None,
         )
 
@@ -475,18 +524,54 @@ def delete_turn(session_id: str) -> bool:
     return False
 
 
+# The subagent-launcher tool is named "Agent" as of this measurement —
+# confirmed against the real event log: 3,267 `stop` events carry "Agent",
+# zero carry "Task". "Task" is kept in the set as the name the original
+# (buggy) code assumed; we have no positive evidence it was ever the real
+# name here, only that watching it costs nothing and dropping it risks
+# repeating the exact silent-zero this fix exists to correct. Watch both so
+# a future rename doesn't silently zero out subagent capture again, the same
+# pattern already used above for TodoWrite/TaskCreate.
+SUBAGENT_LAUNCHER_TOOLS = frozenset({"Task", "Agent"})
+
+# `subagent_type` and `skill` are the only `tool_input` VALUES that reach
+# `events.jsonl`. They are NOT the only `tool_input` values that reach the
+# turn FILE on disk: `record_todo_write`/`append_todo_title` below store
+# TodoWrite's `todos[].content` and TaskCreate's `subject` there too — up to
+# 50 items, with no per-item length cap. That data is scoped to the turn
+# file: `run_stop` deletes the file before telemetry is written and never
+# passes `todo_write` to `telemetry.record_stop`, so it never reaches the
+# event log — but "only tool_input value on disk" would be a false claim,
+# so this comment does not make it.
+#
+# `subagent_type` and `skill` ARE free text from the model's tool call, not a
+# validated enum, so they are length-capped at the storage boundary — an
+# event log documented as carrying identifiers must not be able to
+# accumulate an arbitrarily long string because one caller passed one. 64 is
+# far above every real name (the longest skill observed on the live log is
+# 42 chars, the longest agent type well under that), so the cap describes a
+# bound, not a truncation anyone will meet.
+_TURN_NAME_CAP = 64
+
+
 def record_tool(
     session_id: str,
     tool_name: str,
     *,
     subagent_type: str | None = None,
+    skill_name: str | None = None,
 ) -> TurnState:
     """Accumulate tool usage into the current turn's state file."""
     turn = load_turn(session_id) or TurnState(session_id=session_id)
     turn.tool_names.append(tool_name)
-    # Claude Code's `Task` tool exposes the chosen subagent via tool_input.subagent_type.
-    if tool_name == "Task" and subagent_type:
-        turn.subagents_invoked.append(subagent_type)
+    turn.tool_marks.append(time.time())
+    # The subagent-launcher tool exposes the chosen subagent via
+    # tool_input.subagent_type, extracted by hook.py's run_posttooluse.
+    if tool_name in SUBAGENT_LAUNCHER_TOOLS and subagent_type:
+        turn.subagents_invoked.append(subagent_type[:_TURN_NAME_CAP])
+    # Claude Code's `Skill` tool exposes the invoked skill via tool_input.skill.
+    if tool_name == "Skill" and skill_name:
+        turn.skills_invoked.append(skill_name[:_TURN_NAME_CAP])
     save_turn(turn)
     return turn
 
