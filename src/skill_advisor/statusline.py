@@ -81,7 +81,14 @@ if [ -n "$observed" ]; then
 fi
 
 [ -n "$model" ] && { [ -n "$out" ] && out="$out \033[2m·\033[0m $model" || out="$model"; }
-[ -n "$ctx" ] && out="$out \033[2m·\033[0m ctx $(printf '%.0f' "$ctx")%"
+# LC_ALL=C is load-bearing, not decoration: jq always emits a dot-decimal
+# number, but `printf '%.0f'` parses it in the caller's LC_NUMERIC. Under a
+# comma-decimal locale (de_DE, fr_FR, ...) bash's builtin rejects "34.2" with
+# `printf: 34.2: invalid number` on stderr and returns 1 — measured, not
+# assumed. The status line still rendered, but every refresh leaked a warning,
+# which is exactly what the "no stderr" tests in test_statusline.py forbid.
+# Scoped to this one command so nothing else in the script changes locale.
+[ -n "$ctx" ] && out="$out \033[2m·\033[0m ctx $(LC_ALL=C printf '%.0f' "$ctx")%"
 
 [ -n "$out" ] && printf '%b\n' "$out"
 exit 0
