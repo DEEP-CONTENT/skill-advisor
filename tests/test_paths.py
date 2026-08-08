@@ -1,6 +1,25 @@
+import shutil
 from pathlib import Path
 
+import pytest
+
 from skill_advisor import paths
+
+
+@pytest.fixture
+def symlink_capable(tmp_path_factory):
+    probe_dir = tmp_path_factory.mktemp("symlink-capability")
+    try:
+        target = probe_dir / "target"
+        target.mkdir()
+        (probe_dir / "link").symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(
+            "missing symlink privilege "
+            f"(SeCreateSymbolicLinkPrivilege or Developer Mode): {exc}"
+        )
+    finally:
+        shutil.rmtree(probe_dir, ignore_errors=True)
 
 
 def test_overrides_via_env(isolated_paths):
@@ -207,6 +226,7 @@ def test_ensure_dirs_creates_override_settings_parent(monkeypatch, tmp_path):
     assert override.parent.is_dir()
 
 
+@pytest.mark.usefixtures("symlink_capable")
 def test_skill_roots_dedupes_symlinked_subdirectories(monkeypatch, tmp_path):
     """When primary home's subdirs are symlinks to default home's subdirs,
     skill_roots() should return resolved paths only once."""
@@ -221,8 +241,12 @@ def test_skill_roots_dedupes_symlinked_subdirectories(monkeypatch, tmp_path):
 
     work_claude = home / ".claude-work"
     work_claude.mkdir()
-    (work_claude / "skills").symlink_to(default_claude / "skills")
-    (work_claude / "plugins").symlink_to(default_claude / "plugins")
+    (work_claude / "skills").symlink_to(
+        default_claude / "skills", target_is_directory=True
+    )
+    (work_claude / "plugins").symlink_to(
+        default_claude / "plugins", target_is_directory=True
+    )
 
     monkeypatch.delenv("CLAUDE_HOME", raising=False)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(work_claude))
