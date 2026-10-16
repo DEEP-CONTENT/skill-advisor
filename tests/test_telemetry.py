@@ -160,8 +160,9 @@ def test_salt_auto_generated_when_config_empty(isolated_paths):
     )
     salt_file = isolated_paths["cache_home"] / "telemetry.salt"
     assert salt_file.is_file()
-    # Linux chmod() should be honored; some filesystems may not enforce, so check what we can.
-    if hasattr(os, "stat"):
+    # POSIX honors chmod(0o600); Windows cannot express owner-only mode
+    # bits via chmod (the salt is non-cryptographic, ACL hardening out of scope).
+    if os.name == "posix" and hasattr(os, "stat"):
         mode = salt_file.stat().st_mode & 0o777
         # 0o600 on POSIX-y filesystems; be tolerant of umask interaction on others.
         assert mode in (0o600, 0o644), f"unexpected mode: {oct(mode)}"

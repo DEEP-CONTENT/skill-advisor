@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import json
 import logging
-import signal
 import sys
+import threading
 import time
 from typing import Any
 
@@ -21,18 +21,19 @@ class _BudgetExceeded(Exception):
     pass
 
 
-def _alarm_handler(signum, frame):  # pragma: no cover - signal path
-    raise _BudgetExceeded()
-
-
 def alarm_seconds(cfg: Config) -> int:
-    """Whole-hook SIGALRM budget, in whole seconds.
+    """Whole-hook wall-clock budget, in whole seconds.
 
     Must stay strictly greater than judge.rank()'s own subprocess timeout
     (`max(cfg.matcher.budget_seconds - 0.5, 0.5)`, judge.py:106-110) — otherwise
-    the alarm kills the hook before matcher.py's embedding fallback ever runs.
+    the budget kills the hook before matcher.py's embedding fallback ever runs.
     A named function (rather than an inline expression) so tests can pin the
     ordering against the real formula instead of a restated copy of it.
+
+    Named for the SIGALRM it originally armed. The enforcement mechanism is now
+    a `Thread.join(timeout=...)` because `signal.SIGALRM` is POSIX-only and this
+    tool has to run on Windows; the FORMULA and the ordering invariant it
+    encodes are unchanged, which is the part every caller and test depends on.
     """
     return max(int(cfg.matcher.budget_seconds + 0.5), 1)
 
@@ -143,86 +144,117 @@ def run() -> int:
         return 0
 
     cfg = load_config()
+    # Cross-platform wall-clock budget: run the whole pick-and-sketch pass in a
+    # daemon thread and join with a timeout. `signal.SIGALRM` (what upstream
+    # arms here) is POSIX-only and raises AttributeError on Windows. The daemon
+    # thread is never joined on overrun, so the process still exits promptly
+    # even if the matcher keeps computing in the background.
     budget = alarm_seconds(cfg)
-    # Created before the alarm is armed: it costs nothing, and it must already
-    # exist before anything below can raise (matcher.pick(), or the alarm
-    # itself) so any handler that wants to read or annotate it — like the
-    # budget-exceeded branch below — finds a live object, not a NameError.
+    # Created before the worker starts: it costs nothing, and it must already
+    # exist before anything below can raise so any handler that wants to read
+    # or annotate it — like the budget-exceeded branch below — finds a live
+    # object, not a NameError.
     trace = matcher.JudgeTrace()
-    signal.signal(signal.SIGALRM, _alarm_handler)
-    signal.alarm(budget)
 
-    try:
-        result = matcher.pick(prompt, cfg, session_id=session_id, trace=trace)
+    container: dict[str, Any] = {}
 
-        # Fold this prompt into the centroid sketch (Task 10) so rotation can
-        # score skills that have never been used. Must run here, before the
-        # `finally` below disarms the alarm — NOT after the alarm is already
-        # off, where it previously lived. embed_one() builds a fastembed
-        # model with no bound on construction/inference time, so an unguarded
-        # call downstream of the alarm can hang the hook well past
-        # budget_seconds (proven by test_sketch_update_is_bounded_by_the_
-        # hook_alarm, which pins this with a real sleep + real SIGALRM rather
-        # than a raising mock — a mock can't prove an alarm exists).
-        # A _BudgetExceeded raised by the alarm firing mid-embed is caught by
-        # the inner except below, not the outer one: matcher.pick() already
-        # succeeded, so this is an interrupted sketch update, not a failed
-        # pick, and must not be reported as "budget exceeded" telemetry.
-        # Two gates: cfg.telemetry.events_enabled (the privacy claim — no
-        # prompt text, no per-prompt vectors ever stored — holds by
-        # construction, since this is the only check that decides whether
-        # anything is embedded), AND triage.should_skip(). matcher.pick()
-        # already returns early for a triage-skipped prompt outside an
-        # active lifecycle ("ok"/"yes"/"go", slash commands, ...) without
-        # ever touching the index — but until this second gate was added,
-        # the sketch update below ran anyway, unconditionally, for that same
-        # class of prompt. Two harms: a latency regression on the path that
-        # exists specifically to be near-free (README promises ~0 ms for
-        # triage-skipped prompts), and sketch pollution — with only 8
-        # centroid slots (SEED_SIMILARITY=0.9), a trivial acknowledgement is
-        # dissimilar enough from real work to claim one of them outright and
-        # then accumulate count, making it sticky. The one signal able to
-        # score a never-used skill was losing capacity to chit-chat.
-        if cfg.telemetry.events_enabled and not triage.should_skip(prompt, cfg):
-            try:
-                sketch = centroids.load(k=cfg.rotation.centroid_count)
-                # Task 11 (deferred): reuse the query embedding matcher.pick()
-                # already computed for scoring — threaded out via
-                # JudgeTrace.query_embedding since _pick_inner has many
-                # branches that return without ever building a PickResult
-                # carrying it. Only branches that actually ran the stateless
-                # matcher (pick_stateless -> index_mod.embed_and_rank) set it;
-                # every other branch (phase picks, parallelization, a
-                # lifecycle signal handled without falling back to the
-                # matcher, ...) leaves it None, so this falls back to the
-                # original unconditional embed_one() call exactly as before.
-                vec = (
-                    trace.query_embedding
-                    if trace.query_embedding is not None
-                    else index_mod.embed_one(prompt)
-                )
-                centroids.observe(sketch, vec)
-                centroids.save(sketch)
-            except Exception as exc:  # pragma: no cover - defensive; hooks never raise
-                log.debug("centroid update failed: %s", exc, exc_info=True)
-    except _BudgetExceeded:
+    def _worker(out: dict[str, Any]) -> None:
+        try:
+            # `result` lands in the container BEFORE the sketch update below.
+            # That ordering is what lets the timeout branch distinguish "the
+            # matcher never answered" from "the matcher answered and only the
+            # sketch update is still running" — the same distinction upstream
+            # draws with its inner/outer `except _BudgetExceeded` split.
+            out["result"] = matcher.pick(
+                prompt, cfg, session_id=session_id, trace=trace
+            )
+
+            # Fold this prompt into the centroid sketch (Task 10) so rotation can
+            # score skills that have never been used. Must run INSIDE the budget
+            # window — embed_one() builds a fastembed model with no bound on
+            # construction/inference time, so an unguarded call after the window
+            # can hang the hook well past budget_seconds. Running it here, in the
+            # same worker, is the thread-based equivalent of upstream keeping it
+            # before the `finally` that disarms the alarm.
+            # An overrun DURING this update is not "budget exceeded": pick()
+            # already succeeded, so the branch below emits the picks and simply
+            # abandons the sketch write, matching upstream's inner-except.
+            # Two gates: cfg.telemetry.events_enabled (the privacy claim — no
+            # prompt text, no per-prompt vectors ever stored — holds by
+            # construction, since this is the only check that decides whether
+            # anything is embedded), AND triage.should_skip(). matcher.pick()
+            # already returns early for a triage-skipped prompt outside an
+            # active lifecycle ("ok"/"yes"/"go", slash commands, ...) without
+            # ever touching the index — but until this second gate was added,
+            # the sketch update below ran anyway, unconditionally, for that same
+            # class of prompt. Two harms: a latency regression on the path that
+            # exists specifically to be near-free (README promises ~0 ms for
+            # triage-skipped prompts), and sketch pollution — with only 8
+            # centroid slots (SEED_SIMILARITY=0.9), a trivial acknowledgement is
+            # dissimilar enough from real work to claim one of them outright and
+            # then accumulate count, making it sticky. The one signal able to
+            # score a never-used skill was losing capacity to chit-chat.
+            if cfg.telemetry.events_enabled and not triage.should_skip(prompt, cfg):
+                try:
+                    sketch = centroids.load(k=cfg.rotation.centroid_count)
+                    # Task 11 (deferred): reuse the query embedding matcher.pick()
+                    # already computed for scoring — threaded out via
+                    # JudgeTrace.query_embedding since _pick_inner has many
+                    # branches that return without ever building a PickResult
+                    # carrying it. Only branches that actually ran the stateless
+                    # matcher (pick_stateless -> index_mod.embed_and_rank) set it;
+                    # every other branch (phase picks, parallelization, a
+                    # lifecycle signal handled without falling back to the
+                    # matcher, ...) leaves it None, so this falls back to the
+                    # original unconditional embed_one() call exactly as before.
+                    vec = (
+                        trace.query_embedding
+                        if trace.query_embedding is not None
+                        else index_mod.embed_one(prompt)
+                    )
+                    centroids.observe(sketch, vec)
+                    centroids.save(sketch)
+                except Exception as exc:  # pragma: no cover - defensive; hooks never raise
+                    log.debug("centroid update failed: %s", exc, exc_info=True)
+        except Exception as exc:  # pragma: no cover - defensive (handled below)
+            out["error"] = exc
+
+    worker = threading.Thread(target=_worker, args=(container,), daemon=True)
+    worker.start()
+    worker.join(timeout=budget)
+
+    # Two ways the budget can be exceeded, and both must land here:
+    #   * the worker is STILL RUNNING and has produced no result — the join
+    #     timed out on a matcher that overran;
+    #   * the worker raised `_BudgetExceeded` — the matcher (or anything it
+    #     calls) signalled the overrun itself rather than by wall-clock.
+    # Only the second survives the port off SIGALRM as an exception, and it
+    # must NOT fall through to the generic "hook exception" branch below:
+    # that branch writes no telemetry, which is precisely the invisibility
+    # this row exists to prevent.
+    # A worker still running WITH a result in hand is the third case: only
+    # the sketch update is outstanding, so fall through and emit the picks,
+    # abandoning the daemon thread.
+    overran = worker.is_alive() and "result" not in container
+    overran = overran or isinstance(container.get("error"), _BudgetExceeded)
+    if overran:
         duration = time.monotonic() - started
         log.info("budget exceeded after %.2fs; falling back silent", duration)
-        # The alarm kill is otherwise invisible in events.jsonl — no row at
-        # all, indistinguishable from a hook that never fired. Record one,
-        # marked distinctly, so it's countable. Must not itself raise: this is
-        # a hook path and hook paths are silent on error.
+        # The kill is otherwise invisible in events.jsonl — no row at all,
+        # indistinguishable from a hook that never fired. Record one, marked
+        # distinctly, so it's countable. Must not itself raise: this is a hook
+        # path and hook paths are silent on error.
         if cfg.telemetry.events_enabled:
             try:
                 # Only `failure` is stamped — `trace.ran` is left as the matcher
-                # set it. The alarm can fire AFTER the judge answered (during
+                # set it. The budget can expire AFTER the judge answered (during
                 # post-judge work in matcher.pick()), and `judge_used: true`
                 # alongside `judge_failure: "budget_exceeded"` is the intended
-                # record of exactly that: a completed verdict the alarm threw
-                # away. Forcing `ran` false here would tidy the row at the cost
-                # of the only signal that budget_seconds sits too close to the
-                # judge's own timeout. See test_budget_exceeded_after_a_
-                # completed_judge_keeps_both_facts.
+                # record of exactly that: a completed verdict thrown away.
+                # Forcing `ran` false here would tidy the row at the cost of the
+                # only signal that budget_seconds sits too close to the judge's
+                # own timeout. See test_budget_exceeded_after_a_completed_judge_
+                # keeps_both_facts.
                 trace.failure = judge.FAILURE_BUDGET_EXCEEDED
                 telemetry.record(
                     prompt=prompt,
@@ -239,11 +271,12 @@ def run() -> int:
             except Exception as exc:  # pragma: no cover - defensive
                 log.debug("budget-exceeded telemetry record failed: %s", exc, exc_info=True)
         return 0
-    except Exception as exc:  # pragma: no cover - defensive
-        log.warning("hook exception: %s", exc, exc_info=True)
+
+    if "error" in container:  # pragma: no cover - defensive
+        log.warning("hook exception: %s", container["error"], exc_info=container["error"])
         return 0
-    finally:
-        signal.alarm(0)
+
+    result = container.get("result")
 
     duration = time.monotonic() - started
     phase = result.state.phase if (result and result.state) else "none"

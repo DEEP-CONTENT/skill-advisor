@@ -48,6 +48,28 @@ def test_hook_silent_on_matcher_exception():
     assert out == ""
 
 
+def test_hook_silent_on_budget_timeout(isolated_paths):
+    """matcher.pick exceeding the budget -> silent exit 0, no additionalContext."""
+    import time as _time
+
+    cfg = isolated_paths["config_home"] / "config.toml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text("[matcher]\nbudget_seconds = 0.3\n")
+
+    entry = CatalogEntry(kind="skill", name="brainstorming", namespace="user", description="...")
+    result = PickResult(picks=[ResolvedPick(entry=entry, reason="too late")], state=None)
+
+    def _slow_pick(*args, **kwargs):
+        _time.sleep(1.0)  # well past the 0.3s budget
+        return result
+
+    with patch("skill_advisor.hook.matcher.pick", side_effect=_slow_pick):
+        out = _run_with_stdin({"prompt": "let's design a new feature for session replay"})
+
+    # Timeout path returns 0 without emitting any context.
+    assert out == ""
+
+
 def test_hook_passes_session_id_to_matcher():
     with patch("skill_advisor.hook.matcher.pick", return_value=None) as mock_pick:
         _run_with_stdin({"prompt": "build a rate limiter", "session_id": "sess-123"})
