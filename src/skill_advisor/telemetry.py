@@ -7,8 +7,9 @@ Design invariants:
 - Opt-in via `config.telemetry.events_enabled`. When False, no file is created.
 - Prompts are never stored in plaintext — only `sha256(salt + prompt)[:16]`.
 - Session ids are always hashed with the same salt. No raw session ids on disk.
-- Single-line atomic append: one `write()` of a JSON blob + `\n`, relying on
-  `O_APPEND` semantics. Safe up to PIPE_BUF (4 KB) on Linux/macOS.
+- Single-line atomic append: one `write()` of a JSON blob + `\n`, serialised
+  across threads and processes via an advisory file lock (`fcntl.flock` on
+  POSIX, `msvcrt.locking` on Windows) so concurrent writers never interleave.
 - Telemetry failures are the caller's problem — this module raises on broken
   state; the hook wraps it in try/except so a telemetry hiccup never fails the
   user's prompt.
@@ -21,6 +22,8 @@ import logging
 import os
 import re
 import secrets
+import sys
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -32,6 +35,70 @@ from .config import TelemetryConfig
 log = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
+
+
+# ---------------------------------------------------------------------------
+# Atomic append
+# ---------------------------------------------------------------------------
+# POSIX guarantees that a single write() under O_APPEND is atomic up to
+# PIPE_BUF, so concurrent appenders never interleave. Windows text-append mode
+# offers no such guarantee — the CRT seeks-then-writes, so concurrent threads
+# and processes lose lines. Each hook firing is its own process, so we need
+# both an in-process lock and a cross-process advisory file lock.
+
+_append_lock = threading.Lock()
+
+if sys.platform == "win32":
+    import msvcrt
+
+    def _lock_region(fh) -> bool:
+        # Lock a fixed 1-byte region at offset 0 so every writer contends on the
+        # same range, independent of the file's current length.
+        try:
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+            return True
+        except OSError:
+            return False
+
+    def _unlock_region(fh) -> None:
+        try:
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+else:
+    import fcntl
+
+    def _lock_region(fh) -> bool:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            return True
+        except OSError:
+            return False
+
+    def _unlock_region(fh) -> None:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+
+
+def _append_line(line: str) -> None:
+    """Append a single line atomically across threads and processes."""
+    paths.ensure_dirs()
+    data = line.encode("utf-8")
+    target = paths.events_file()
+    with _append_lock:
+        with open(target, "ab") as fh:
+            locked = _lock_region(fh)
+            try:
+                fh.seek(0, os.SEEK_END)
+                fh.write(data)
+                fh.flush()
+            finally:
+                if locked:
+                    _unlock_region(fh)
 
 
 @dataclass(frozen=True)
@@ -121,11 +188,7 @@ def record(
         "picks": pick_records,
     }
 
-    paths.ensure_dirs()
-    line = json.dumps(event, ensure_ascii=False) + "\n"
-    # Single write under O_APPEND; atomic up to PIPE_BUF on POSIX.
-    with open(paths.events_file(), "a", encoding="utf-8") as fh:
-        fh.write(line)
+    _append_line(json.dumps(event, ensure_ascii=False) + "\n")
 
 
 def record_stop(
@@ -171,10 +234,7 @@ def record_stop(
         # what a span means.
         event["span_anchor"] = span_anchor
 
-    paths.ensure_dirs()
-    line = json.dumps(event, ensure_ascii=False) + "\n"
-    with open(paths.events_file(), "a", encoding="utf-8") as fh:
-        fh.write(line)
+    _append_line(json.dumps(event, ensure_ascii=False) + "\n")
 
 
 # ---------------------------------------------------------------------------

@@ -348,3 +348,168 @@ def test_render_settings_preserves_foreign_statusline_with_embedded_suffix(isola
     )
     install_mod.render_settings()
     assert _settings()["statusLine"]["command"] == "/opt/other/notstatusline.sh"
+
+
+# --- INST-001: Windows / PowerShell target + path quoting (SEC-MIT-001) ---
+
+
+def test_detect_shell_powershell_on_windows(isolated_paths, monkeypatch):
+    monkeypatch.setattr(install_mod, "_is_windows", lambda: True)
+    monkeypatch.delenv("SHELL", raising=False)
+    monkeypatch.setenv("USERPROFILE", str(isolated_paths["home"]))
+    shell = install_mod.detect_shell()
+    assert shell is not None
+    assert shell.name == "powershell"
+    assert shell.rc_file.name == "Microsoft.PowerShell_profile.ps1"
+    assert shell.rc_file.parent.name == "PowerShell"
+    assert "function claudeskill" in shell.snippet
+    assert "@args" in shell.snippet
+    assert "--settings" in shell.snippet
+    assert str(paths.settings_file()) in shell.snippet
+
+
+def test_detect_shell_windows_with_unix_shell_returns_none(monkeypatch):
+    # A Unix $SHELL present (even unsupported) means we are not on a bare Windows shell.
+    monkeypatch.setattr(install_mod, "_is_windows", lambda: True)
+    monkeypatch.setenv("SHELL", "/usr/bin/tcsh")
+    assert install_mod.detect_shell() is None
+
+
+def test_detect_shell_bash_still_works_on_windows(isolated_paths, monkeypatch):
+    # Git-Bash / WSL: $SHELL set -> keep the Unix alias, no PowerShell regression.
+    monkeypatch.setattr(install_mod, "_is_windows", lambda: True)
+    monkeypatch.setenv("SHELL", "/bin/bash")
+    shell = install_mod.detect_shell()
+    assert shell is not None
+    assert shell.name == "bash"
+    assert shell.snippet == ""
+    assert shell.alias_line.startswith("alias claudeskill=")
+
+
+def test_powershell_function_written_between_markers(isolated_paths, monkeypatch):
+    monkeypatch.setattr(install_mod, "_is_windows", lambda: True)
+    monkeypatch.delenv("SHELL", raising=False)
+    monkeypatch.setenv("USERPROFILE", str(isolated_paths["home"]))
+    shell = install_mod.detect_shell()
+
+    changed = install_mod.install_alias(shell)
+    assert changed is True
+    content = shell.rc_file.read_text(encoding="utf-8")
+    assert content.count(install_mod.ALIAS_BEGIN) == 1
+    assert content.count(install_mod.ALIAS_END) == 1
+    assert "function claudeskill" in content
+    assert str(paths.settings_file()) in content
+
+    # Idempotent re-install, then clean removal.
+    assert install_mod.install_alias(shell) is False
+    assert install_mod.uninstall_alias(shell) is True
+    assert "function claudeskill" not in shell.rc_file.read_text(encoding="utf-8")
+
+
+def test_ps_single_quote_escapes_quotes():
+    assert install_mod.ps_single_quote("a'b") == "'a''b'"
+    assert install_mod.ps_single_quote(r"C:\Users\you") == r"'C:\Users\you'"
+
+
+def test_ps_single_quote_rejects_newline():
+    with pytest.raises(install_mod.AliasQuotingError):
+        install_mod.ps_single_quote("a" + chr(10) + "b")
+
+
+def test_powershell_function_quotes_path_with_quote(isolated_paths, monkeypatch):
+    quoted_path = "C:\\Users\\o'brien\\set'tings.json"
+    monkeypatch.setattr(install_mod, "_is_windows", lambda: True)
+    monkeypatch.delenv("SHELL", raising=False)
+    monkeypatch.setenv("USERPROFILE", str(isolated_paths["home"]))
+    monkeypatch.setattr(install_mod.paths, "settings_file", lambda: quoted_path)
+    shell = install_mod.detect_shell()
+    # Each single quote in the path is doubled; nothing breaks the literal.
+    assert "set''tings.json" in shell.snippet
+    assert "o''brien" in shell.snippet
+
+
+def test_bash_alias_classic_format_for_clean_path(isolated_paths, monkeypatch):
+    clean = "/home/you/.config/skill-advisor/claudeskill-settings.json"
+    monkeypatch.setenv("SHELL", "/bin/bash")
+    monkeypatch.setattr(install_mod.paths, "settings_file", lambda: clean)
+    shell = install_mod.detect_shell()
+    expected = "alias claudeskill='claude --settings " + chr(34) + clean + chr(34) + "'"
+    assert shell.alias_line == expected
+
+
+def test_bash_alias_quotes_path_with_single_quote(isolated_paths, monkeypatch):
+    quoted_path = "/home/o'brien/claudeskill-settings.json"
+    monkeypatch.setenv("SHELL", "/bin/bash")
+    monkeypatch.setattr(install_mod.paths, "settings_file", lambda: quoted_path)
+    shell = install_mod.detect_shell()
+    # POSIX single-quote escape present; alias prefix intact; no raw break.
+    assert shell.alias_line.startswith("alias claudeskill=")
+    posix_escape = "'" + chr(92) + "''"
+    assert posix_escape in shell.alias_line
+
+
+def test_fish_alias_quotes_path_with_single_quote(isolated_paths, monkeypatch):
+    quoted_path = "/home/o'brien/claudeskill-settings.json"
+    monkeypatch.setenv("SHELL", "/usr/bin/fish")
+    monkeypatch.setattr(install_mod.paths, "settings_file", lambda: quoted_path)
+    shell = install_mod.detect_shell()
+    assert shell.name == "fish"
+    assert shell.alias_line.startswith("alias claudeskill ")
+    # fish single-quote escape: ' -> backslash-quote
+    assert (chr(92) + "'") in shell.alias_line
+
+
+def test_detect_shell_rejects_newline_path(isolated_paths, monkeypatch):
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    monkeypatch.setattr(install_mod.paths, "settings_file", lambda: "/tmp/a" + chr(10) + "b.json")
+    with pytest.raises(install_mod.AliasQuotingError):
+        install_mod.detect_shell()
+
+
+# --- INST-002: platform-neutral, idempotent advisor-command detection ---
+
+def test_is_advisor_command_recognizes_windows_exe():
+    """A Windows `.exe` with backslash separators is an advisor command."""
+    assert install_mod._is_advisor_command(r"C:\Tools\skill-advisor.exe hook", "hook")
+
+
+def test_is_advisor_command_recognizes_windows_exe_path_with_spaces():
+    """Backslash path containing spaces (quoted or bare) is still recognised."""
+    assert install_mod._is_advisor_command(
+        r'"C:\Program Files\skill-advisor\skill-advisor.exe" stop', "stop"
+    )
+    assert install_mod._is_advisor_command(
+        r"C:\Program Files\skill-advisor.exe posttooluse", "posttooluse"
+    )
+
+
+def test_is_advisor_command_posix_still_matches():
+    """Regression: POSIX `/path/skill-advisor` and the bare form keep matching."""
+    assert install_mod._is_advisor_command("/usr/local/bin/skill-advisor hook", "hook")
+    assert install_mod._is_advisor_command("skill-advisor stop", "stop")
+
+
+def test_is_advisor_command_rejects_foreign_and_mismatched():
+    assert not install_mod._is_advisor_command("/usr/bin/other-tool hook", "hook")
+    assert not install_mod._is_advisor_command(r"C:\Tools\skill-advisor.exe hook", "stop")
+    assert not install_mod._is_advisor_command("", "hook")
+    assert not install_mod._is_advisor_command("hook", "hook")
+
+
+def test_render_settings_idempotent_on_windows_exe_path(isolated_paths, monkeypatch):
+    """2x render on a Windows .exe path -> exactly one advisor hook (no duplicate)."""
+    win_exe = r"C:\Tools\skill-advisor.exe"
+    monkeypatch.setattr("skill_advisor.install.shutil.which", lambda name: win_exe)
+
+    install_mod.render_settings()
+    install_mod.render_settings()
+
+    data = json.loads(paths.settings_file().read_text(encoding="utf-8"))
+    for event, sub in (
+        ("UserPromptSubmit", "hook"),
+        ("PostToolUse", "posttooluse"),
+        ("Stop", "stop"),
+    ):
+        hooks = [h for block in data["hooks"][event] for h in block.get("hooks", [])]
+        advisor_cmds = [h["command"] for h in hooks if "skill-advisor" in h["command"]]
+        assert advisor_cmds == [f"{win_exe} {sub}"]
