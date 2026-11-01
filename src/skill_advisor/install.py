@@ -26,38 +26,156 @@ class RenderSettingsError(RuntimeError):
     """
 
 
+class AliasQuotingError(ValueError):
+    """A settings path can't be safely embedded in a shell alias/function (SEC-MIT-001)."""
+
+
+def _reject_newline(value: str) -> None:
+    if "\n" in value or "\r" in value:
+        raise AliasQuotingError(
+            "settings path contains a newline and cannot be safely quoted into a "
+            "shell alias/function"
+        )
+
+
+def ps_single_quote(value: str) -> str:
+    """Quote `value` as a PowerShell single-quoted string literal (SEC-MIT-001).
+
+    PowerShell single-quoted strings are fully literal — the only metacharacter is
+    the single quote itself, escaped by doubling it (`'` → `''`). A single-line
+    statement can't carry a newline, so such a path is rejected rather than written
+    as a broken function body.
+    """
+    _reject_newline(value)
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _posix_double_quote(value: str) -> str:
+    """Quote `value` for the inner double-quoted argument of a POSIX command.
+
+    Escapes the four characters that stay special inside double quotes so a path
+    with spaces, quotes, `$` or backticks survives intact at runtime.
+    """
+    for ch in ("\\", '"', "$", "`"):
+        value = value.replace(ch, "\\" + ch)
+    return '"' + value + '"'
+
+
+def _posix_single_quote(value: str) -> str:
+    """Wrap `value` in POSIX single quotes (bash/zsh): close, escaped quote, reopen."""
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def _fish_single_quote(value: str) -> str:
+    """Wrap `value` in fish single quotes — only `\\` and `'` are special inside."""
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
 @dataclass(frozen=True)
 class ShellTarget:
-    name: str  # "bash" | "zsh" | "fish"
+    name: str  # "bash" | "zsh" | "fish" | "powershell"
     rc_file: Path
     alias_line: str
+    # PowerShell (and any non-alias target) carries its block body here instead of
+    # `alias_line`; `install_alias` writes `snippet` verbatim when it's non-empty.
+    snippet: str = ""
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _documents_dir() -> Path:
+    """The user's real Documents folder, honouring OneDrive Known Folder Move.
+
+    `$USERPROFILE/Documents` is WRONG on any machine where OneDrive has taken
+    over the Documents known folder — the real path is then something like
+    `C:/Users/<user>/OneDrive/05 - Dokumente`, localised folder name and all.
+    Writing the `claudeskill` function into the literal `Documents` path there
+    produces a file PowerShell never loads: install reports success and nothing
+    happens, which is worse than failing.
+
+    The registry's `User Shell Folders\\Personal` value is the authority Windows
+    itself consults, so read that first and expand its embedded `%USERPROFILE%`.
+    Falls back to the literal path when the registry is unavailable (non-Windows
+    hosts running the test suite, a stripped-down image, a permission error).
+
+    `SKILL_ADVISOR_PS_PROFILE` overrides everything — the escape hatch for a
+    machine whose profile lives somewhere neither heuristic finds.
+    """
+    override = os.environ.get("SKILL_ADVISOR_PS_PROFILE")
+    if override:
+        return Path(override).parent
+
+    userprofile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    if _is_windows():
+        try:
+            import winreg
+
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+            )
+            try:
+                raw, _ = winreg.QueryValueEx(key, "Personal")
+            finally:
+                winreg.CloseKey(key)
+            expanded = os.path.expandvars(str(raw)).strip()
+            if expanded and "%" not in expanded:
+                return Path(expanded)
+        except OSError:
+            pass
+    return Path(userprofile) / "Documents"
+
+
+def _powershell_profile_path() -> Path:
+    """pwsh 7 profile path, resolved against the REAL Documents folder."""
+    override = os.environ.get("SKILL_ADVISOR_PS_PROFILE")
+    if override:
+        return Path(override)
+    return _documents_dir() / "PowerShell" / "Microsoft.PowerShell_profile.ps1"
 
 
 def detect_shell() -> ShellTarget | None:
     home = Path(os.environ.get("HOME") or os.path.expanduser("~"))
     shell = (os.environ.get("SHELL") or "").split("/")[-1]
-    settings_path = paths.settings_file()
+    settings_path = str(paths.settings_file())
+    _reject_newline(settings_path)
 
     if shell == "fish":
+        body = "claude --settings " + _posix_double_quote(settings_path)
         return ShellTarget(
             name="fish",
             rc_file=home / ".config" / "fish" / "config.fish",
-            alias_line=f'alias claudeskill "claude --settings \\"{settings_path}\\""',
+            alias_line="alias claudeskill " + _fish_single_quote(body),
         )
     if shell == "zsh":
+        body = "claude --settings " + _posix_double_quote(settings_path)
         return ShellTarget(
             name="zsh",
             rc_file=home / ".zshrc",
-            alias_line=f"alias claudeskill='claude --settings \"{settings_path}\"'",
+            alias_line="alias claudeskill=" + _posix_single_quote(body),
         )
     if shell == "bash":
         # macOS uses .bash_profile; Linux uses .bashrc.
         bashrc = home / ".bashrc"
         rc = bashrc if bashrc.exists() else home / ".bash_profile"
+        body = "claude --settings " + _posix_double_quote(settings_path)
         return ShellTarget(
             name="bash",
             rc_file=rc,
-            alias_line=f"alias claudeskill='claude --settings \"{settings_path}\"'",
+            alias_line="alias claudeskill=" + _posix_single_quote(body),
+        )
+    # Windows without a Unix `$SHELL` → a PowerShell profile function (pwsh 7).
+    if _is_windows() and not shell:
+        return ShellTarget(
+            name="powershell",
+            rc_file=_powershell_profile_path(),
+            alias_line="",
+            snippet=(
+                "function claudeskill { claude --settings "
+                f"{ps_single_quote(settings_path)} @args }}"
+            ),
         )
     return None
 
@@ -72,15 +190,39 @@ def _advisor_command() -> str:
 
 
 _ADVISOR_SUBCOMMANDS = ("hook", "posttooluse", "stop")
+_ADVISOR_BASENAMES = {"skill-advisor", "skill-advisor.exe"}
+
+
+def _advisor_basename(binary: str) -> str:
+    """Separator-agnostic, lowercased basename of a binary path.
+
+    Splits on both `/` and `\\` so a Windows path (`C:\\Tools\\skill-advisor.exe`)
+    resolves identically on POSIX test hosts, then strips any surrounding quotes
+    left over from a quoted command string.
+    """
+    binary = binary.strip()
+    if len(binary) >= 2 and binary[0] == binary[-1] and binary[0] in ("'", '"'):
+        binary = binary[1:-1]
+    return binary.replace("\\", "/").rsplit("/", 1)[-1].lower()
 
 
 def _is_advisor_command(command: str, subcommand: str) -> bool:
-    """True if `command` ends with `<path>/skill-advisor <subcommand>` or bare form."""
-    parts = (command or "").split()
-    if len(parts) < 2 or parts[-1] != subcommand:
+    """True if `command` is `<path>/skill-advisor <subcommand>` (or the bare form).
+
+    Platform-neutral: a Windows `skill-advisor.exe` with backslash separators and
+    a path containing spaces (quoted or not) is recognised the same as a POSIX
+    `/usr/bin/skill-advisor`. Detection works off the trailing subcommand token
+    plus the basename of everything before it, so it never naively `split()`s a
+    path that contains spaces.
+    """
+    command = (command or "").strip()
+    suffix = " " + subcommand
+    if subcommand not in _ADVISOR_SUBCOMMANDS or not command.endswith(suffix):
         return False
-    binary = parts[-2]
-    return binary == "skill-advisor" or binary.endswith("/skill-advisor")
+    binary = command[: -len(suffix)].strip()
+    if not binary:
+        return False
+    return _advisor_basename(binary) in _ADVISOR_BASENAMES
 
 
 def _merge_hook_entry(
@@ -234,6 +376,13 @@ min_embedding_score = 0.35
 extra_roots = []
 # Catalog names to suppress (noisy or irrelevant skills).
 exclude_names = []
+# Optional path to a curated catalog manifest (JSON). Leave empty to keep the
+# default behaviour — the catalog scans everything and only exclude_names applies.
+# When set, the manifest is the structural source of truth for exclusions
+# (excluded sub-skills/sub-agents, plugin whitelist); exclude_names stays additive.
+# A missing or malformed manifest never breaks the advisor (fail-soft).
+# catalog_manifest = "~/.claude/skill-advisor-manifest.json"
+catalog_manifest = ""
 
 [triage]
 # Prompts shorter than this (in words) are skipped unless they contain technical keywords.
@@ -373,7 +522,10 @@ def install_alias(shell: ShellTarget) -> bool:
     shell.rc_file.parent.mkdir(parents=True, exist_ok=True)
     original = _read_rc(shell.rc_file)
     stripped = _strip_block(original)
-    block = f"\n{ALIAS_BEGIN}\n{shell.alias_line}\n{ALIAS_END}\n"
+    # `snippet` (PowerShell function) wins over `alias_line` when present; the
+    # block mechanism stays content-agnostic either way.
+    block_body = shell.snippet if shell.snippet else shell.alias_line
+    block = f"\n{ALIAS_BEGIN}\n{block_body}\n{ALIAS_END}\n"
     updated = (
         (stripped.rstrip("\n") + "\n" + block)
         if stripped.strip()

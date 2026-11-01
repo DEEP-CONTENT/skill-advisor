@@ -220,10 +220,30 @@ Check `~/.cache/skill-advisor/advisor.log`. Common causes:
 
 ### Model keeps suggesting the wrong skill
 
-Bump `matcher.model` to `claude-opus-4-7` in `config.toml` for better
+Bump `matcher.model` to `claude-opus-4-8` in `config.toml` for better
 ranking quality (at the cost of latency).
 
 ### Windows
 
-Not supported in v1. Use WSL2, or open a PR wiring PowerShell profile editing
-into `install.py`.
+Supported via PowerShell 7 (`pwsh`). When no Unix `$SHELL` is set, the installer
+targets your PowerShell profile instead of a shell rc file:
+
+```powershell
+skill-advisor install --write-alias
+. $PROFILE        # reload so the claudeskill function is defined
+claudeskill
+```
+
+`--write-alias` writes a `claudeskill` **function** between sentinel markers in
+`$USERPROFILE\Documents\PowerShell\Microsoft.PowerShell_profile.ps1`. The `--settings`
+path is single-quoted (PowerShell-literal), so paths with spaces are safe.
+
+If PowerShell refuses to load your profile, your ExecutionPolicy is likely
+`Restricted`. Allow local scripts **yourself**, e.g.:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+skill-advisor never changes your ExecutionPolicy for you. WSL2 also works (bash/zsh/fish
+alias path).

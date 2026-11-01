@@ -12,11 +12,32 @@ from typing import Iterable
 import yaml
 
 from . import builtins as builtin_entries
+from . import manifest as manifest_loader
 from . import overrides
 from . import paths
 from .config import Config, load as load_config
 
 _FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+
+
+def _norm_name(name: str) -> str:
+    """Normalize a name for slash-insensitive exclusion matching.
+
+    Commands carry a leading slash (``/loop``) while a config or manifest may
+    name them bare (``loop``); stripping a single leading slash lets either form
+    exclude the other. Only one leading slash is removed — names never legitimately
+    start with two.
+    """
+    name = name.strip()
+    return name[1:] if name.startswith("/") else name
+
+# Subdirectory under agent roots whose files are helper definitions, not
+# standalone subagents (e.g. `agents/reviewers/*.md`). This constant is the
+# structural default that hides the whole subtree by path. A manifest adds a
+# complementary, name-based layer: `excluded_subagents` entries are unioned into
+# the exclusion set in `scan()` (slash-insensitive), so teams can hide further
+# agents/skills by name without editing this constant.
+_REVIEWERS_SUBDIR = "reviewers"
 
 
 @dataclass(frozen=True)
@@ -99,6 +120,99 @@ def _entries_from_skill_file(
     )
 
 
+def _entry_from_md_file(
+    path: Path,
+    kind: str,
+    namespace: str,
+    *,
+    name_from_stem: bool = False,
+) -> CatalogEntry | None:
+    """Build a catalog entry from a single Markdown definition file.
+
+    `description` is mandatory (missing → entry rejected). The name is taken
+    from frontmatter `name` with a stem fallback for agents; when
+    `name_from_stem` is set (commands) the name is the slash-prefixed file stem
+    `/{stem}` for consistency with the built-in command names (`/loop` etc.).
+    """
+    fm = parse_frontmatter(path)
+    if not fm:
+        return None
+    description = fm.get("description")
+    if not description:
+        return None
+    if name_from_stem:
+        name = f"/{path.stem}"
+    else:
+        raw_name = fm.get("name")
+        name = str(raw_name).strip() if raw_name else path.stem
+    name = str(name).strip()
+    if not name or name == "/":
+        return None
+    return CatalogEntry(
+        kind=kind,
+        name=name,
+        namespace=namespace,
+        description=str(description).strip(),
+        path=str(path),
+    )
+
+
+def _symlink_escapes(path: Path, root: Path) -> bool:
+    """True if `path` is a symlink resolving outside `root` (SEC-MIT-005).
+
+    Non-symlinks are always safe. A symlink is only accepted when its target
+    stays within the scanned root; anything pointing elsewhere (or unresolvable)
+    is treated as an escape and skipped by the caller.
+    """
+    if not path.is_symlink():
+        return False
+    try:
+        resolved = path.resolve()
+        root_resolved = root.resolve()
+    except OSError:
+        return True
+    return not (resolved == root_resolved or root_resolved in resolved.parents)
+
+
+def _scan_md_agents(root: Path) -> Iterable[CatalogEntry]:
+    """Scan a `agents/` root for subagent definitions.
+
+    Uses `rglob('*.md')` so namespaced agents (`agents/sub/x.md`) are found,
+    but skips the `reviewers/` helper subtree and symlinks that escape the root.
+    """
+    if not root.is_dir():
+        return
+    for md in sorted(root.rglob("*.md")):
+        rel = md.relative_to(root)
+        if _REVIEWERS_SUBDIR in rel.parts:
+            continue
+        if _symlink_escapes(md, root):
+            continue
+        entry = _entry_from_md_file(md, kind="subagent", namespace="user")
+        if entry:
+            yield entry
+
+
+def _scan_md_commands(root: Path) -> Iterable[CatalogEntry]:
+    """Scan a `commands/` root for slash-command definitions.
+
+    Uses `rglob('*.md')` so namespaced commands (`commands/sub/x.md`) are found
+    and skips symlinks that escape the root. Unlike agents there is no helper
+    subtree to exclude. The command name is the slash-prefixed file stem
+    (`/{stem}`) for consistency with the built-in command names (`/loop` etc.).
+    """
+    if not root.is_dir():
+        return
+    for md in sorted(root.rglob("*.md")):
+        if _symlink_escapes(md, root):
+            continue
+        entry = _entry_from_md_file(
+            md, kind="command", namespace="user", name_from_stem=True
+        )
+        if entry:
+            yield entry
+
+
 def _scan_user_skills(root: Path, table: dict[str, str]) -> Iterable[CatalogEntry]:
     if not root.is_dir():
         return
@@ -108,7 +222,17 @@ def _scan_user_skills(root: Path, table: dict[str, str]) -> Iterable[CatalogEntr
             yield entry
 
 
-def _scan_plugin_skills(root: Path, table: dict[str, str]) -> Iterable[CatalogEntry]:
+def _scan_plugin_skills(
+    root: Path,
+    table: dict[str, str],
+    plugin_whitelist: tuple[str, ...] | None = None,
+) -> Iterable[CatalogEntry]:
+    """Scan a plugin marketplaces root for SKILL.md files.
+
+    `plugin_whitelist` is Tri-State (see manifest.ManifestFilter): ``None`` keeps
+    the default "scan every plugin" behaviour, while a tuple (possibly empty) gates
+    the scan to only those plugin names — an empty tuple therefore yields nothing.
+    """
     if not root.is_dir():
         return
     # Pattern: <marketplace>/plugins/<plugin>/skills/<skill>/SKILL.md
@@ -117,6 +241,8 @@ def _scan_plugin_skills(root: Path, table: dict[str, str]) -> Iterable[CatalogEn
             plugin_name = skill_md.parents[2].name
         except IndexError:
             plugin_name = "unknown"
+        if plugin_whitelist is not None and plugin_name not in plugin_whitelist:
+            continue
         entry = _entries_from_skill_file(
             skill_md, namespace=f"plugin:{plugin_name}", table=table
         )
@@ -143,13 +269,20 @@ def _version_sort_key(version: str) -> tuple:
 
 
 def _scan_plugin_cache_skills(
-    root: Path, table: dict[str, str]
+    root: Path,
+    table: dict[str, str],
+    plugin_whitelist: tuple[str, ...] | None = None,
 ) -> Iterable[CatalogEntry]:
     """Installed-plugin layout: <marketplace>/<plugin>/<version>/skills/<skill>/SKILL.md.
 
     Distinct from `plugins/marketplaces/`, which is the *catalogue* of available
     plugins. The cache is what is actually installed and invocable, and it
     interposes a version segment — so the marketplaces glob misses it entirely.
+
+    `plugin_whitelist` is the same Tri-State gate `_scan_plugin_skills` applies
+    (see `manifest.ManifestFilter`): ``None`` scans every plugin, a tuple gates
+    to those plugin names, and an empty tuple therefore yields nothing. Applied
+    BEFORE the version tournament so a gated-out plugin never competes.
 
     When multiple versions of the same plugin skill are installed side by
     side, the highest version wins. This is decided HERE, by tracking the
@@ -168,6 +301,8 @@ def _scan_plugin_cache_skills(
         except IndexError:
             plugin_name = "unknown"
             version = ""
+        if plugin_whitelist is not None and plugin_name not in plugin_whitelist:
+            continue
         key = (plugin_name, skill_md.parent.name)
         vkey = _version_sort_key(version)
         current = best.get(key)
@@ -221,13 +356,32 @@ def scan(
 ) -> list[CatalogEntry]:
     cfg = config or load_config()
     table = overrides_table if overrides_table is not None else overrides.read()
-    exclude = set(cfg.catalog.exclude_names)
+
+    # The manifest (when configured) is the structural SSoT for exclusions and
+    # plugin gating; it loads fail-soft to a neutral filter, so an unset/broken
+    # manifest leaves scan behaviour exactly as it was before MAN-003.
+    manifest_filter = manifest_loader.load_manifest(
+        cfg.catalog.catalog_manifest, paths.claude_home()
+    )
+
+    # Union of config excludes and manifest excludes, normalized for
+    # slash-insensitive matching so "loop" and "/loop" exclude each other.
+    exclude = {
+        _norm_name(name)
+        for name in (*cfg.catalog.exclude_names, *manifest_filter.excluded_names)
+    }
+    plugin_whitelist = manifest_filter.plugin_whitelist
+
     seen: set[tuple[str, str]] = set()
     out: list[CatalogEntry] = []
 
     def _accept(entry: CatalogEntry) -> None:
+        # Exclusion and dedup both key on the INVOCABLE name (what the Skill
+        # tool accepts), not the frontmatter name — they differ whenever a
+        # skill's directory disagrees with its `name:`. Normalised on top so a
+        # bare `loop` and a slash-prefixed `/loop` still exclude each other.
         invocable = entry.invoke_name or entry.name
-        if invocable in exclude:
+        if _norm_name(invocable) in exclude:
             return
         key = (entry.kind, invocable)
         if key in seen:
@@ -244,11 +398,24 @@ def scan(
             for entry in _scan_user_skills(root, table):
                 _accept(entry)
         elif root.name == "marketplaces":
-            for entry in _scan_plugin_skills(root, table):
+            for entry in _scan_plugin_skills(root, table, plugin_whitelist):
                 _accept(entry)
         elif root.name == "cache":
-            for entry in _scan_plugin_cache_skills(root, table):
+            # The whitelist gates this root too. The installed-plugin cache is a
+            # SECOND channel for the same plugin skills the marketplaces root
+            # already gates; leaving it ungated would let every installed plugin
+            # in through the back door and silently void the manifest's
+            # `plugin_whitelist` the moment upstream added this scanner.
+            for entry in _scan_plugin_cache_skills(root, table, plugin_whitelist):
                 _accept(entry)
+
+    for root in paths.agent_roots():
+        for entry in _scan_md_agents(root):
+            _accept(entry)
+
+    for root in paths.command_roots():
+        for entry in _scan_md_commands(root):
+            _accept(entry)
 
     for extra in cfg.catalog.extra_roots:
         for entry in _scan_extra_root(Path(extra).expanduser(), table):

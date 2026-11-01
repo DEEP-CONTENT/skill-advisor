@@ -1125,10 +1125,14 @@ hook failure.
 
 ### Safety rails
 
-- **`signal.alarm(hook.alarm_seconds(cfg))`**, i.e. `max(int(budget_seconds + 0.5), 1)`
-  — hard wall-clock budget, rounded to a whole second since `signal.alarm()` only
-  takes an int; any overrun exits 0 silent via a `_BudgetExceeded` exception caught
-  in `hook.run()`.
+- **`threading.Thread(daemon=True)` + `join(timeout=hook.alarm_seconds(cfg))`**, i.e.
+  `max(int(budget_seconds + 0.5), 1)` — hard wall-clock budget, rounded to a whole
+  second. Enforced by a thread join rather than `signal.alarm()` because
+  `signal.SIGALRM` is POSIX-only and this tool also runs on Windows; the formula and
+  its ordering invariant against the judge's own subprocess timeout are unchanged.
+  On overrun the daemon worker is left running and `hook.run()` exits 0 silent.
+  The budget covers the centroid sketch update too, but overrunning *there* is not
+  reported as a budget failure — the picks are already in hand and get emitted.
 - **Broad try/except in `hook.run()`** — any unexpected error exits 0 silent and logs
   to `advisor.log`.
 - **Hallucination guard in `judge._parse_judge_reply()`** — LLM-returned names are
@@ -2045,7 +2049,35 @@ expect auto-rebuild, there is none by design — rebuild is always explicit.
 
 ### Windows
 
-Not supported in v1. Use WSL2 or adapt `install.py`'s shell detection to PowerShell.
+Supported via PowerShell 7 (`pwsh`). On Windows with no Unix `$SHELL`, the installer
+targets your PowerShell profile instead of a shell rc file:
+
+```powershell
+skill-advisor install --write-alias
+. $PROFILE        # reload the profile so the function is defined
+claudeskill       # Claude Code with the advisor active
+```
+
+`--write-alias` writes a `claudeskill` **function** (not an alias) between the sentinel
+markers in `$USERPROFILE\Documents\PowerShell\Microsoft.PowerShell_profile.ps1`:
+
+```powershell
+function claudeskill { claude --settings 'C:\Users\you\AppData\...\claudeskill-settings.json' @args }
+```
+
+The settings path is single-quoted (PowerShell-literal), so spaces and other special
+characters in the path are safe.
+
+**ExecutionPolicy.** If PowerShell refuses to load your profile (`Restricted`,
+`AllSigned`, or a locked-down Group Policy), `claudeskill` won't be defined. Allow local
+scripts **yourself** — for example:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+skill-advisor **never** changes your ExecutionPolicy for you. Alternatively, run inside
+WSL2, where the normal bash/zsh/fish alias path applies.
 
 ---
 
