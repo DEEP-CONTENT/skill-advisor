@@ -49,21 +49,26 @@ def test_hook_silent_on_matcher_exception():
 
 
 def test_hook_silent_on_budget_timeout(isolated_paths):
-    """matcher.pick exceeding the budget -> silent exit 0, no additionalContext."""
+    """matcher.pick exceeding the effective alarm budget -> silent exit 0."""
     import time as _time
 
     cfg = isolated_paths["config_home"] / "config.toml"
     cfg.parent.mkdir(parents=True, exist_ok=True)
-    cfg.write_text("[matcher]\nbudget_seconds = 0.3\n")
+    cfg.write_text("[matcher]\nbudget_seconds = 0.1\n")
+    loaded_cfg = hook_mod.load_config()
+    effective_budget = hook_mod.alarm_seconds(loaded_cfg)
 
     entry = CatalogEntry(kind="skill", name="brainstorming", namespace="user", description="...")
     result = PickResult(picks=[ResolvedPick(entry=entry, reason="too late")], state=None)
 
     def _slow_pick(*args, **kwargs):
-        _time.sleep(1.0)  # well past the 0.3s budget
+        # budget_seconds=0.1 rounds up to a 1s alarm_seconds() join budget;
+        # sleep past the real formula, not the raw config value.
+        _time.sleep(effective_budget + 0.25)
         return result
 
-    with patch("skill_advisor.hook.matcher.pick", side_effect=_slow_pick):
+    with patch("skill_advisor.hook.load_config", return_value=loaded_cfg), \
+         patch("skill_advisor.hook.matcher.pick", side_effect=_slow_pick):
         out = _run_with_stdin({"prompt": "let's design a new feature for session replay"})
 
     # Timeout path returns 0 without emitting any context.
