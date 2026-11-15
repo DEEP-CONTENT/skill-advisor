@@ -123,7 +123,9 @@ def _documents_dir() -> Path:
             expanded = os.path.expandvars(str(raw)).strip()
             if expanded and "%" not in expanded:
                 return Path(expanded)
-        except OSError:
+        except (OSError, ImportError):
+            # ImportError: `winreg` does not exist off Windows. The test suite
+            # simulates Windows on Linux and macOS and must land in the fallback.
             pass
     return Path(userprofile) / "Documents"
 
