@@ -17,7 +17,7 @@ def test_user_overrides_applied(isolated_paths):
     paths.config_file().write_text(
         """
 [matcher]
-model = "claude-opus-4-7"
+model = "claude-opus-4-8"
 max_candidates = 8
 budget_seconds = 4.0
 
@@ -32,13 +32,51 @@ extra_skip_patterns = ["^wip:"]
         encoding="utf-8",
     )
     cfg = config.load()
-    assert cfg.matcher.model == "claude-opus-4-7"
+    assert cfg.matcher.model == "claude-opus-4-8"
     assert cfg.matcher.max_candidates == 8
     assert cfg.matcher.budget_seconds == 4.0
     assert cfg.catalog.extra_roots == ("/tmp/team-skills",)
     assert cfg.catalog.exclude_names == ("noisy-skill",)
     assert cfg.triage.skip_if_shorter_than == 3
     assert cfg.triage.extra_skip_patterns == ("^wip:",)
+
+
+def test_catalog_manifest_defaults_to_empty(isolated_paths):
+    cfg = config.load()
+    assert cfg.catalog.catalog_manifest == ""
+
+
+def test_catalog_manifest_parses_toml(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        """
+[catalog]
+catalog_manifest = "~/.claude/skill-advisor-manifest.json"
+""",
+        encoding="utf-8",
+    )
+    cfg = config.load(path)
+    assert cfg.catalog.catalog_manifest == "~/.claude/skill-advisor-manifest.json"
+
+
+def test_catalog_manifest_coerced_to_str(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        """
+[catalog]
+catalog_manifest = 123
+""",
+        encoding="utf-8",
+    )
+    cfg = config.load(path)
+    assert cfg.catalog.catalog_manifest == "123"
+
+
+def test_default_config_text_documents_catalog_manifest():
+    from skill_advisor.install import _default_config_text
+
+    text = _default_config_text()
+    assert "catalog_manifest" in text
 
 
 def test_parallelization_config_defaults(isolated_paths):

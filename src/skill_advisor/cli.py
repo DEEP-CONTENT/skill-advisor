@@ -50,8 +50,9 @@ def _cmd_install(args: argparse.Namespace) -> int:
     if args.write_alias:
         if shell is None:
             print(
-                "error: --write-alias given but shell could not be detected "
-                "from $SHELL (supported: bash, zsh, fish).",
+                "error: --write-alias given but no shell target could be detected "
+                "(supported: bash, zsh, fish via $SHELL; PowerShell on Windows when "
+                "$SHELL is unset).",
                 file=sys.stderr,
             )
             return 2
@@ -1730,9 +1731,19 @@ def _print_activation_hint(
 
     if alias_written and shell is not None:
         print()
-        print(f"An alias was written to {shell.rc_file}.")
-        print(f"Reload it:   source {shell.rc_file}")
-        print("Then run:    claudeskill")
+        if shell.name == "powershell":
+            print(f"A `claudeskill` function was written to {shell.rc_file}.")
+            print("Reload it:   . $PROFILE")
+            print("Then run:    claudeskill")
+            print()
+            print("If PowerShell refuses to run your profile, your ExecutionPolicy is")
+            print("likely Restricted. Allow local scripts yourself, e.g.:")
+            print("  Set-ExecutionPolicy -Scope CurrentUser RemoteSigned")
+            print("skill-advisor never changes your ExecutionPolicy for you.")
+        else:
+            print(f"An alias was written to {shell.rc_file}.")
+            print(f"Reload it:   source {shell.rc_file}")
+            print("Then run:    claudeskill")
 
     if existing:
         print()
