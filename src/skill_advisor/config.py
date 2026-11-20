@@ -14,8 +14,11 @@ class MatcherConfig:
     model: str = "claude-haiku-4-5-20251001"
     max_candidates: int = 15
     max_picks: int = 3
-    # Whole-hook budget. hook.py arms SIGALRM at int(budget_seconds + 0.5) around
-    # the entire matcher; judge.py gives its subprocess budget_seconds - 0.5, so
+    # Whole-hook budget. hook.py joins its matcher thread at
+    # hook.alarm_seconds(cfg) = int(budget_seconds + 0.5) around the entire
+    # matcher — a thread join, not SIGALRM, which is POSIX-only and unavailable
+    # on Windows; the formula and its ordering are unchanged. judge.py gives
+    # its subprocess budget_seconds - 0.5, so
     # the judge always loses the race and matcher.py's embedding fallback is
     # reachable. Measured 2026-07-29: the judge answers usefully under 15 s or
     # not at all (the >=24 s band produced 14 picks against 432 nothings), so a
@@ -33,6 +36,10 @@ class MatcherConfig:
 class CatalogConfig:
     extra_roots: tuple[str, ...] = ()
     exclude_names: tuple[str, ...] = ()
+    # Optional path to a curated catalog manifest (JSON). Empty → no manifest;
+    # the catalog behaves exactly as before. When set, the manifest is the
+    # structural source of truth for exclusions (see manifest.py).
+    catalog_manifest: str = ""
 
 
 @dataclass(frozen=True)
@@ -236,6 +243,7 @@ def load(path: Path | None = None) -> Config:
         catalog=CatalogConfig(
             extra_roots=_as_tuple(catalog.get("extra_roots")),
             exclude_names=_as_tuple(catalog.get("exclude_names")),
+            catalog_manifest=str(catalog.get("catalog_manifest", CatalogConfig.catalog_manifest)),
         ),
         triage=TriageConfig(
             skip_if_shorter_than=int(

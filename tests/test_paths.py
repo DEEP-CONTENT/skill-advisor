@@ -1,4 +1,25 @@
+import shutil
+from pathlib import Path
+
+import pytest
+
 from skill_advisor import paths
+
+
+@pytest.fixture
+def symlink_capable(tmp_path_factory):
+    probe_dir = tmp_path_factory.mktemp("symlink-capability")
+    try:
+        target = probe_dir / "target"
+        target.mkdir()
+        (probe_dir / "link").symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(
+            "missing symlink privilege "
+            f"(SeCreateSymbolicLinkPrivilege or Developer Mode): {exc}"
+        )
+    finally:
+        shutil.rmtree(probe_dir, ignore_errors=True)
 
 
 def test_overrides_via_env(isolated_paths):
@@ -75,6 +96,63 @@ def test_skill_roots_no_duplicate_when_primary_equals_default(monkeypatch, tmp_p
     ]
 
 
+def test_agent_and_command_roots_relative_to_claude_home(isolated_paths):
+    agents = paths.agent_roots()
+    commands = paths.command_roots()
+    assert isinstance(agents, list)
+    assert isinstance(commands, list)
+    assert all(isinstance(p, Path) for p in agents)
+    assert all(isinstance(p, Path) for p in commands)
+    assert agents[0] == isolated_paths["claude_home"] / "agents"
+    assert commands[0] == isolated_paths["claude_home"] / "commands"
+
+
+def test_agent_command_roots_include_default_fallback_when_primary_differs(monkeypatch, tmp_path):
+    primary = tmp_path / "work"
+    primary.mkdir()
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.delenv("CLAUDE_HOME", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(primary))
+    monkeypatch.setenv("HOME", str(home))
+
+    agents = paths.agent_roots()
+    assert agents[0] == primary / "agents"
+    assert (home / ".claude" / "agents") in agents
+
+    commands = paths.command_roots()
+    assert commands[0] == primary / "commands"
+    assert (home / ".claude" / "commands") in commands
+
+
+def test_agent_command_roots_no_duplicate_when_primary_equals_default(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.delenv("CLAUDE_HOME", raising=False)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    assert paths.agent_roots() == [home / ".claude" / "agents"]
+    assert paths.command_roots() == [home / ".claude" / "commands"]
+
+
+def test_fastembed_cache_dir_returns_path(isolated_paths):
+    assert isinstance(paths.fastembed_cache_dir(), Path)
+
+
+def test_fastembed_cache_dir_default_under_cache(isolated_paths, monkeypatch):
+    monkeypatch.delenv("SKILL_ADVISOR_FASTEMBED_CACHE", raising=False)
+    result = paths.fastembed_cache_dir()
+    # Default lives inside the (isolated) cache dir, never the real user cache.
+    assert result == paths.cache_dir() / "fastembed"
+    assert result.parent == isolated_paths["cache_home"]
+
+
+def test_fastembed_cache_dir_env_override(monkeypatch, tmp_path):
+    forced = tmp_path / "custom-fastembed"
+    monkeypatch.setenv("SKILL_ADVISOR_FASTEMBED_CACHE", str(forced))
+    assert paths.fastembed_cache_dir() == forced
+
+
 def test_xdg_fallback_without_override(monkeypatch, tmp_path):
     home = tmp_path / "fallback-home"
     home.mkdir()
@@ -148,6 +226,7 @@ def test_ensure_dirs_creates_override_settings_parent(monkeypatch, tmp_path):
     assert override.parent.is_dir()
 
 
+@pytest.mark.usefixtures("symlink_capable")
 def test_skill_roots_dedupes_symlinked_subdirectories(monkeypatch, tmp_path):
     """When primary home's subdirs are symlinks to default home's subdirs,
     skill_roots() should return resolved paths only once."""
@@ -162,8 +241,12 @@ def test_skill_roots_dedupes_symlinked_subdirectories(monkeypatch, tmp_path):
 
     work_claude = home / ".claude-work"
     work_claude.mkdir()
-    (work_claude / "skills").symlink_to(default_claude / "skills")
-    (work_claude / "plugins").symlink_to(default_claude / "plugins")
+    (work_claude / "skills").symlink_to(
+        default_claude / "skills", target_is_directory=True
+    )
+    (work_claude / "plugins").symlink_to(
+        default_claude / "plugins", target_is_directory=True
+    )
 
     monkeypatch.delenv("CLAUDE_HOME", raising=False)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(work_claude))

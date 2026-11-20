@@ -72,6 +72,42 @@ def skill_roots() -> list[Path]:
     return roots
 
 
+def _dual_roots(*subparts: str) -> list[Path]:
+    """Primary-home roots with `~/.claude` fallback appended when they differ.
+
+    Mirrors `skill_roots()`'s fallback contract for any subdir under the Claude
+    home: the primary home (honouring `CLAUDE_CONFIG_DIR`) is listed first; when
+    that's different from `$HOME/.claude` the default location is appended so the
+    scan isn't blind to it. Never emits duplicates.
+    """
+    primary = claude_home()
+    default = _home() / ".claude"
+    roots = [primary.joinpath(*subparts)]
+    if primary.resolve() != default.resolve():
+        extra = default.joinpath(*subparts)
+        if extra not in roots:
+            roots.append(extra)
+    return roots
+
+
+def agent_roots() -> list[Path]:
+    """Roots scanned for subagent definition files (`agents/*.md`).
+
+    Same primary/default-fallback logic as `skill_roots()`: the active Claude
+    home's `agents/` first, then `~/.claude/agents` as fallback when the primary
+    home differs (e.g. under a work `CLAUDE_CONFIG_DIR`).
+    """
+    return _dual_roots("agents")
+
+
+def command_roots() -> list[Path]:
+    """Roots scanned for slash-command definition files (`commands/*.md`).
+
+    Same primary/default-fallback logic as `agent_roots()`.
+    """
+    return _dual_roots("commands")
+
+
 def config_dir() -> Path:
     override = os.environ.get("SKILL_ADVISOR_CONFIG_HOME")
     if override:
@@ -86,6 +122,24 @@ def cache_dir() -> Path:
         return Path(override)
     base = os.environ.get("XDG_CACHE_HOME") or str(_home() / ".cache")
     return Path(base) / "skill-advisor"
+
+
+def fastembed_cache_dir() -> Path:
+    """Persistent cache dir for the fastembed model weights (BGE-small ONNX).
+
+    Pinning this keeps the ~15 MB model out of `~/.cache/fastembed` and off the
+    OS temp dir, so it survives temp cleanup instead of re-downloading on every
+    cold start. `index._embed_model()` passes it to `TextEmbedding(cache_dir=...)`.
+
+    Precedence:
+      1. `SKILL_ADVISOR_FASTEMBED_CACHE` — explicit override.
+      2. `cache_dir() / 'fastembed'`     — default, inside our XDG cache so test
+         isolation (`SKILL_ADVISOR_CACHE_HOME`) redirects it too.
+    """
+    override = os.environ.get("SKILL_ADVISOR_FASTEMBED_CACHE")
+    if override:
+        return Path(override)
+    return cache_dir() / "fastembed"
 
 
 def config_file() -> Path:
