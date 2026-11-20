@@ -123,7 +123,7 @@ def _documents_dir() -> Path:
             expanded = os.path.expandvars(str(raw)).strip()
             if expanded and "%" not in expanded:
                 return Path(expanded)
-        except OSError:
+        except (OSError, ImportError):
             pass
     return Path(userprofile) / "Documents"
 
