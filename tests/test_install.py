@@ -1,4 +1,5 @@
 import json
+import sys
 
 import pytest
 
@@ -311,6 +312,10 @@ def test_render_settings_honors_settings_file_override_for_statusline(isolated_p
     assert "UserPromptSubmit" in data["hooks"]
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="chmod 0o500 does not block mkdir of a child directory on Windows",
+)
 def test_render_settings_raises_clean_error_on_unwritable_override(monkeypatch, tmp_path):
     """A bad SKILL_ADVISOR_SETTINGS_FILE (typo, permission-restricted parent)
     must fail with a message naming the path and the env var — not a raw
